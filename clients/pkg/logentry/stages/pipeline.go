@@ -7,20 +7,27 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/util"
 )
 
 // PipelineStages contains configuration for each stage within a pipeline
 type PipelineStages = []interface{}
 
 // PipelineStage contains configuration for a single pipeline stage
-type PipelineStage = map[interface{}]interface{}
+type PipelineStage = map[string]interface{}
 
 // Pipeline pass down a log entry to each stage for mutation and/or label extraction.
 type Pipeline struct {
 	logger  log.Logger
 	stages  []Stage
 	jobName *string
+}
+
+// Cleanup implements Stage.
+func (p *Pipeline) Cleanup() {
+	for _, s := range p.stages {
+		s.Cleanup()
+	}
 }
 
 // NewPipeline creates a new log entry pipeline from a configuration
@@ -35,11 +42,7 @@ func NewPipeline(logger log.Logger, stgs PipelineStages, jobName *string, regist
 		if len(stage) > 1 {
 			return nil, errors.New("pipeline stage must contain only one key")
 		}
-		for key, config := range stage {
-			name, ok := key.(string)
-			if !ok {
-				return nil, errors.New("pipeline stage key must be a string")
-			}
+		for name, config := range stage {
 			newStage, err := New(logger, jobName, name, config, registerer)
 			if err != nil {
 				return nil, errors.Wrapf(err, "invalid %s stage config", name)
@@ -66,6 +69,42 @@ func RunWith(input chan Entry, process func(e Entry) Entry) chan Entry {
 	return out
 }
 
+// RunWithSkip same as RunWith, except it skip sending it to output channel, if `process` functions returns `skip` true.
+func RunWithSkip(input chan Entry, process func(e Entry) (Entry, bool)) chan Entry {
+	out := make(chan Entry)
+	go func() {
+		defer close(out)
+		for e := range input {
+			ee, skip := process(e)
+			if skip {
+				continue
+			}
+			out <- ee
+		}
+	}()
+
+	return out
+}
+
+// RunWithSkiporSendMany same as RunWithSkip, except it can either skip sending it to output channel, if `process` functions returns `skip` true. Or send many entries.
+func RunWithSkipOrSendMany(input chan Entry, process func(e Entry) ([]Entry, bool)) chan Entry {
+	out := make(chan Entry)
+	go func() {
+		defer close(out)
+		for e := range input {
+			results, skip := process(e)
+			if skip {
+				continue
+			}
+			for _, result := range results {
+				out <- result
+			}
+		}
+	}()
+
+	return out
+}
+
 // Run implements Stage
 func (p *Pipeline) Run(in chan Entry) chan Entry {
 	in = RunWith(in, func(e Entry) Entry {
@@ -88,9 +127,9 @@ func (p *Pipeline) Name() string {
 	return StageTypePipeline
 }
 
-// Wrap implements EntryMiddleware
-func (p *Pipeline) Wrap(next api.EntryHandler) api.EntryHandler {
-	handlerIn := make(chan api.Entry)
+// Wrap returns an EntryHandler that runs entries through the pipeline before forwarding them to next.
+func (p *Pipeline) Wrap(next util.EntryHandler) util.EntryHandler {
+	handlerIn := make(chan util.Entry)
 	nextChan := next.Chan()
 	wg, once := sync.WaitGroup{}, sync.Once{}
 	pipelineIn := make(chan Entry)
@@ -112,9 +151,10 @@ func (p *Pipeline) Wrap(next api.EntryHandler) api.EntryHandler {
 			}
 		}
 	}()
-	return api.NewEntryHandler(handlerIn, func() {
+	return util.NewEntryHandler(handlerIn, func() {
 		once.Do(func() { close(handlerIn) })
 		wg.Wait()
+		p.Cleanup()
 	})
 }
 

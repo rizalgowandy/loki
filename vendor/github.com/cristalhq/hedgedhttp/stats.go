@@ -16,6 +16,8 @@ type Stats struct {
 	requestedRoundTrips      atomicCounter
 	actualRoundTrips         atomicCounter
 	failedRoundTrips         atomicCounter
+	originalRequestWins      atomicCounter
+	hedgedRequestWins        atomicCounter
 	canceledByUserRoundTrips atomicCounter
 	canceledSubRequests      atomicCounter
 	_                        cacheLine
@@ -24,6 +26,8 @@ type Stats struct {
 func (s *Stats) requestedRoundTripsInc()      { atomic.AddUint64(&s.requestedRoundTrips.count, 1) }
 func (s *Stats) actualRoundTripsInc()         { atomic.AddUint64(&s.actualRoundTrips.count, 1) }
 func (s *Stats) failedRoundTripsInc()         { atomic.AddUint64(&s.failedRoundTrips.count, 1) }
+func (s *Stats) originalRequestWinsInc()      { atomic.AddUint64(&s.originalRequestWins.count, 1) }
+func (s *Stats) hedgedRequestWinsInc()        { atomic.AddUint64(&s.hedgedRequestWins.count, 1) }
 func (s *Stats) canceledByUserRoundTripsInc() { atomic.AddUint64(&s.canceledByUserRoundTrips.count, 1) }
 func (s *Stats) canceledSubRequestsInc()      { atomic.AddUint64(&s.canceledSubRequests.count, 1) }
 
@@ -42,6 +46,16 @@ func (s *Stats) FailedRoundTrips() uint64 {
 	return atomic.LoadUint64(&s.failedRoundTrips.count)
 }
 
+// OriginalRequestWins returns count of original requests that were faster than the original.
+func (s *Stats) OriginalRequestWins() uint64 {
+	return atomic.LoadUint64(&s.originalRequestWins.count)
+}
+
+// HedgedRequestWins returns count of hedged requests that were faster than the original.
+func (s *Stats) HedgedRequestWins() uint64 {
+	return atomic.LoadUint64(&s.hedgedRequestWins.count)
+}
+
 // CanceledByUserRoundTrips returns count of requests that were canceled by user, using request context.
 func (s *Stats) CanceledByUserRoundTrips() uint64 {
 	return atomic.LoadUint64(&s.canceledByUserRoundTrips.count)
@@ -50,24 +64,4 @@ func (s *Stats) CanceledByUserRoundTrips() uint64 {
 // CanceledSubRequests returns count of hedged sub-requests that were canceled by transport.
 func (s *Stats) CanceledSubRequests() uint64 {
 	return atomic.LoadUint64(&s.canceledSubRequests.count)
-}
-
-// StatsSnapshot is a snapshot of Stats.
-type StatsSnapshot struct {
-	RequestedRoundTrips      uint64 // count of requests that were requested by client
-	ActualRoundTrips         uint64 // count of requests that were actually sent
-	FailedRoundTrips         uint64 // count of requests that failed
-	CanceledByUserRoundTrips uint64 // count of requests that were canceled by user, using request context
-	CanceledSubRequests      uint64 // count of hedged sub-requests that were canceled by transport
-}
-
-// Snapshot of the stats.
-func (s *Stats) Snapshot() StatsSnapshot {
-	return StatsSnapshot{
-		RequestedRoundTrips:      s.RequestedRoundTrips(),
-		ActualRoundTrips:         s.ActualRoundTrips(),
-		FailedRoundTrips:         s.FailedRoundTrips(),
-		CanceledByUserRoundTrips: s.CanceledByUserRoundTrips(),
-		CanceledSubRequests:      s.CanceledSubRequests(),
-	}
 }

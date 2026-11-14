@@ -1,69 +1,35 @@
-# ⚠️  DEPRECATED - Loki Helm Chart
+# loki
 
-This chart was moved to <https://github.com/grafana/helm-charts>.
+![Version: 7.6.0](https://img.shields.io/badge/Version-7.6.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 3.6.18](https://img.shields.io/badge/AppVersion-3.6.18-informational?style=flat-square) 
 
-## Prerequisites
+Helm chart for Grafana Enterprise Logs supporting monolithic, simple scalable, and microservices modes.
 
-Make sure you have Helm [installed](https://helm.sh/docs/using_helm/#installing-helm) and
-[deployed](https://helm.sh/docs/using_helm/#installing-tiller) to your cluster. Then add
-Loki's chart repository to Helm:
+## ⚠️ Helm Chart Migration
+As of March 16, 2026, the Grafana Loki Helm chart for OSS users has moved to [grafana-community/helm-charts](https://github.com/grafana-community/helm-charts) (forked at chart version 6.55.0). OSS users are encouraged to migrate to the community-maintained chart. The chart in this repository is now maintained for Grafana Enterprise Logs (GEL) users only. See [#20705](https://github.com/grafana/loki/issues/20705) for details.
 
-```bash
-$ helm repo add loki https://grafana.github.io/loki/charts
-```
+## Source Code
 
-You can update the chart repository by running:
+* <https://github.com/grafana/loki>
+* <https://grafana.com/oss/loki/>
+* <https://grafana.com/docs/loki/latest/>
 
-```bash
-$ helm repo update
-```
+## Requirements
 
-## Deploy Loki only
+| Repository | Name | Version |
+|------------|------|---------|
+| https://github.com/pgsty/silo | minio(minio) | 5.4.0 |
+| https://grafana.github.io/helm-charts | grafana-agent-operator(grafana-agent-operator) | 0.5.2 |
+| https://grafana.github.io/helm-charts | rollout_operator(rollout-operator) | 0.47.0 |
 
-```bash
-$ helm upgrade --install loki loki/loki
-```
+Find more information in the Loki Helm Chart [documentation](https://grafana.com/docs/loki/latest/setup/install/helm/).
 
-## Run Loki behind https ingress
+## Contributing
 
-If Loki and Promtail are deployed on different clusters you can add an Ingress in front of Loki.
-By adding a certificate you create an https endpoint. For extra security enable basic authentication on the Ingress.
+Please see our [Helm Contributing Guidelines](./CONTRIBUTING.md) for detailed information about contributing to the Loki Helm Chart.
 
-In Promtail set the following values to communicate with https and basic auth
+## Releases
 
-```
-loki:
-  serviceScheme: https
-  user: user
-  password: pass
-```
-
-Sample helm template for ingress:
-```
-apiVersion: extensions/v1beta1
-kind: Ingress
-metadata:
-annotations:
-    kubernetes.io/ingress.class: {{ .Values.ingress.class }}
-    ingress.kubernetes.io/auth-type: "basic"
-    ingress.kubernetes.io/auth-secret: {{ .Values.ingress.basic.secret }}
-name: loki
-spec:
-rules:
-- host: {{ .Values.ingress.host }}
-    http:
-    paths:
-    - backend:
-        serviceName: loki
-        servicePort: 3100
-tls:
-- secretName: {{ .Values.ingress.cert }}
-    hosts:
-    - {{ .Values.ingress.host }}
-```
-
-## Use Loki Alerting
-
-You can add your own alerting rules with `alerting_groups` in `values.yaml`. This will create a ConfigMap with your rules and additional volumes and mounts for Loki.
-
-This does **not** enable the Loki `ruler` component which does the evaluation of your rules. The `values.yaml` file does contain a simple example. For more details take a look at the official [alerting docs](https://grafana.com/docs/loki/latest/alerting/).
+Normally, contributors need _not_ bump the Chart version. A new version of the Chart will follow this cadence:
+- Automatic weekly releases
+- Releases that coincide with Loki/GEL releases
+- Manual releases when necessary (ie. to address a CVE or critical bug)

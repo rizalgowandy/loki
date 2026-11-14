@@ -2,60 +2,25 @@ package ring
 
 import (
 	"context"
-	"fmt"
-	"math/rand"
-	"net"
+	"math"
+	"slices"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 
 	"github.com/grafana/dskit/backoff"
+	"github.com/grafana/dskit/netutil"
 )
-
-// GenerateTokens make numTokens unique random tokens, none of which clash
-// with takenTokens. Generated tokens are sorted.
-func GenerateTokens(numTokens int, takenTokens []uint32) []uint32 {
-	if numTokens <= 0 {
-		return []uint32{}
-	}
-
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	used := make(map[uint32]bool, len(takenTokens))
-	for _, v := range takenTokens {
-		used[v] = true
-	}
-
-	tokens := make([]uint32, 0, numTokens)
-	for i := 0; i < numTokens; {
-		candidate := r.Uint32()
-		if used[candidate] {
-			continue
-		}
-		used[candidate] = true
-		tokens = append(tokens, candidate)
-		i++
-	}
-
-	// Ensure returned tokens are sorted.
-	sort.Slice(tokens, func(i, j int) bool {
-		return tokens[i] < tokens[j]
-	})
-
-	return tokens
-}
 
 // GetInstanceAddr returns the address to use to register the instance
 // in the ring.
-func GetInstanceAddr(configAddr string, netInterfaces []string, logger log.Logger) (string, error) {
+func GetInstanceAddr(configAddr string, netInterfaces []string, logger log.Logger, enableInet6 bool) (string, error) {
 	if configAddr != "" {
 		return configAddr, nil
 	}
 
-	addr, err := getFirstAddressOf(netInterfaces, logger)
+	addr, err := netutil.GetFirstAddressOf(netInterfaces, logger, enableInet6)
 	if err != nil {
 		return "", err
 	}
@@ -95,7 +60,20 @@ func WaitInstanceState(ctx context.Context, r ReadRing, instanceID string, state
 
 // WaitRingStability monitors the ring topology for the provided operation and waits until it
 // keeps stable for at least minStability.
-func WaitRingStability(ctx context.Context, r *Ring, op Operation, minStability, maxWaiting time.Duration) error {
+func WaitRingStability(ctx context.Context, r ReadRing, op Operation, minStability, maxWaiting time.Duration) error {
+	return waitStability(ctx, r, op, minStability, maxWaiting, HasReplicationSetChanged)
+}
+
+// WaitRingTokensStability waits for the Ring to be unchanged at
+// least for minStability time period, excluding transitioning between
+// allowed states (e.g. JOINING->ACTIVE if allowed by op).
+// This can be used to avoid wasting resources on moving data around
+// due to multiple changes in the Ring.
+func WaitRingTokensStability(ctx context.Context, r ReadRing, op Operation, minStability, maxWaiting time.Duration) error {
+	return waitStability(ctx, r, op, minStability, maxWaiting, HasReplicationSetChangedWithoutState)
+}
+
+func waitStability(ctx context.Context, r ReadRing, op Operation, minStability, maxWaiting time.Duration, isChanged func(ReplicationSet, ReplicationSet) bool) error {
 	// Configure the max waiting time as a context deadline.
 	ctx, cancel := context.WithTimeout(ctx, maxWaiting)
 	defer cancel()
@@ -117,7 +95,7 @@ func WaitRingStability(ctx context.Context, r *Ring, op Operation, minStability,
 			// replication set which we use to compare with the previous state.
 			currRingState, _ := r.GetAllHealthy(op) // nolint:errcheck
 
-			if HasReplicationSetChanged(ringLastState, currRingState) {
+			if isChanged(ringLastState, currRingState) {
 				ringLastState = currRingState
 				ringLastStateTs = time.Now()
 			} else if time.Since(ringLastStateTs) >= minStability {
@@ -150,62 +128,80 @@ func getZones(tokens map[string][]uint32) []string {
 
 // searchToken returns the offset of the tokens entry holding the range for the provided key.
 func searchToken(tokens []uint32, key uint32) int {
-	i := sort.Search(len(tokens), func(x int) bool {
-		return tokens[x] > key
-	})
+	i, found := slices.BinarySearch(tokens, key)
+	if found {
+		// we want the first token > key, not >= key
+		i = i + 1
+	}
 	if i >= len(tokens) {
 		i = 0
 	}
 	return i
 }
 
-// GetFirstAddressOf returns the first IPv4 address of the supplied interface names, omitting any 169.254.x.x automatic private IPs if possible.
-func getFirstAddressOf(names []string, logger log.Logger) (string, error) {
-	var ipAddr string
-	for _, name := range names {
-		inf, err := net.InterfaceByName(name)
-		if err != nil {
-			level.Warn(logger).Log("msg", "error getting interface", "inf", name, "err", err)
-			continue
-		}
-		addrs, err := inf.Addrs()
-		if err != nil {
-			level.Warn(logger).Log("msg", "error getting addresses for interface", "inf", name, "err", err)
-			continue
-		}
-		if len(addrs) <= 0 {
-			level.Warn(logger).Log("msg", "no addresses found for interface", "inf", name, "err", err)
-			continue
-		}
-		if ip := filterIPs(addrs); ip != "" {
-			ipAddr = ip
-		}
-		if strings.HasPrefix(ipAddr, `169.254.`) || ipAddr == "" {
-			continue
-		}
-		return ipAddr, nil
+// tokenDistance returns the distance between the given tokens from and to.
+// The distance between a token and itself is the whole ring, i.e., math.MaxUint32 + 1.
+func tokenDistance(from, to uint32) int64 {
+	if from < to {
+		return int64(to - from)
 	}
-	if ipAddr == "" {
-		return "", fmt.Errorf("No address found for %s", names)
-	}
-	if strings.HasPrefix(ipAddr, `169.254.`) {
-		level.Warn(logger).Log("msg", "using automatic private ip", "address", ipAddr)
-	}
-	return ipAddr, nil
+	// the trailing +1 is needed to ensure that token 0 is counted
+	return math.MaxUint32 - int64(from) + int64(to) + 1
 }
 
-// filterIPs attempts to return the first non automatic private IP (APIPA / 169.254.x.x) if possible, only returning APIPA if available and no other valid IP is found.
-func filterIPs(addrs []net.Addr) string {
-	var ipAddr string
-	for _, addr := range addrs {
-		if v, ok := addr.(*net.IPNet); ok {
-			if ip := v.IP.To4(); ip != nil {
-				ipAddr = v.IP.String()
-				if !strings.HasPrefix(ipAddr, `169.254.`) {
-					return ipAddr
-				}
-			}
-		}
+// stringSet is a set of strings optimized for both small and large sizes.
+// It uses a slice for small sets (zero allocations when using a pre-allocated buffer)
+// and automatically switches to a map when the slice is full.
+//
+// The rationale is that looking for a string in a small slice is faster than in a map: the
+// map implementation becomes faster – compared to a slice – the more the slice
+// gets bigger, so we switch to a map only when the slice is full.
+type stringSet struct {
+	setSlice []string
+	setMap   map[string]struct{}
+	count    int
+}
+
+func newStringSet(sliceBuf []string) *stringSet {
+	return &stringSet{
+		setSlice: sliceBuf[:0],
+		setMap:   nil,
 	}
-	return ipAddr
+}
+
+// contains returns true if the set contains the given string.
+func (s *stringSet) contains(str string) bool {
+	if s.setMap != nil {
+		_, ok := s.setMap[str]
+		return ok
+	}
+	return slices.Contains(s.setSlice, str)
+}
+
+// add adds a string to the set. This function does NOT check if the string is already present:
+// the caller MUST ensure that by calling contains() before add().
+func (s *stringSet) add(str string) {
+	s.count++
+
+	if s.setMap != nil {
+		s.setMap[str] = struct{}{}
+	} else if len(s.setSlice) < cap(s.setSlice) {
+		s.setSlice = append(s.setSlice, str)
+	} else {
+		// Slice is full, switch to map.
+		s.setMap = make(map[string]struct{}, len(s.setSlice)*2)
+
+		// Copy the data from the slice to the map.
+		for _, h := range s.setSlice {
+			s.setMap[h] = struct{}{}
+		}
+
+		// Add the new string to the map.
+		s.setMap[str] = struct{}{}
+	}
+}
+
+// len returns the number of strings in the set.
+func (s *stringSet) len() int {
+	return s.count
 }

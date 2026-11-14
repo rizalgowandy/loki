@@ -5,26 +5,49 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
-	"github.com/opentracing/opentracing-go"
-	otlog "github.com/opentracing/opentracing-go/log"
+	"github.com/grafana/dskit/httpgrpc"
+	"github.com/grafana/dskit/tenant"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/weaveworks/common/httpgrpc"
+	"github.com/prometheus/common/model"
+	attribute "go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
-	"github.com/grafana/loki/pkg/tenant"
-
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/model/stats"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/v3/pkg/storage/config"
+	"github.com/grafana/loki/v3/pkg/util/constants"
+	"github.com/grafana/loki/v3/pkg/util/validation"
 )
 
 type lokiResult struct {
-	req queryrange.Request
+	req queryrangebase.Request
 	ch  chan *packedResp
 }
 
 type packedResp struct {
-	resp queryrange.Response
+	resp queryrangebase.Response
 	err  error
+}
+
+func statisticsFromResponse(resp queryrangebase.Response) (stats.Result, bool) {
+	switch r := resp.(type) {
+	case *LokiResponse:
+		return r.Statistics, true
+	case *LokiPromResponse:
+		return r.Statistics, true
+	case *LokiSeriesResponse:
+		return r.Statistics, true
+	case *LokiLabelNamesResponse:
+		return r.Statistics, true
+	case *DetectedFieldsResponse:
+		return r.Statistics, true
+	default:
+		return stats.Result{}, false
+	}
 }
 
 type SplitByMetrics struct {
@@ -34,7 +57,7 @@ type SplitByMetrics struct {
 func NewSplitByMetrics(r prometheus.Registerer) *SplitByMetrics {
 	return &SplitByMetrics{
 		splits: promauto.With(r).NewHistogram(prometheus.HistogramOpts{
-			Namespace: "loki",
+			Namespace: constants.Loki,
 			Name:      "query_frontend_partitions",
 			Help:      "Number of time-based partitions (sub-requests) per request",
 			Buckets:   prometheus.ExponentialBuckets(1, 4, 5), // 1 -> 1024
@@ -43,19 +66,23 @@ func NewSplitByMetrics(r prometheus.Registerer) *SplitByMetrics {
 }
 
 type splitByInterval struct {
-	next     queryrange.Handler
+	configs  []config.PeriodConfig
+	next     queryrangebase.Handler
 	limits   Limits
-	merger   queryrange.Merger
+	merger   queryrangebase.Merger
 	metrics  *SplitByMetrics
-	splitter Splitter
+	splitter splitter
 }
 
-type Splitter func(req queryrange.Request, interval time.Duration) []queryrange.Request
-
 // SplitByIntervalMiddleware creates a new Middleware that splits log requests by a given interval.
-func SplitByIntervalMiddleware(limits Limits, merger queryrange.Merger, splitter Splitter, metrics *SplitByMetrics) queryrange.Middleware {
-	return queryrange.MiddlewareFunc(func(next queryrange.Handler) queryrange.Handler {
+func SplitByIntervalMiddleware(configs []config.PeriodConfig, limits Limits, merger queryrangebase.Merger, splitter splitter, metrics *SplitByMetrics) queryrangebase.Middleware {
+	if metrics == nil {
+		metrics = NewSplitByMetrics(nil)
+	}
+
+	return queryrangebase.MiddlewareFunc(func(next queryrangebase.Handler) queryrangebase.Handler {
 		return &splitByInterval{
+			configs:  configs,
 			next:     next,
 			limits:   limits,
 			merger:   merger,
@@ -83,44 +110,70 @@ func (h *splitByInterval) Feed(ctx context.Context, input []*lokiResult) chan *l
 	return ch
 }
 
+// Process returns one complete response on success and nil on error.
 func (h *splitByInterval) Process(
 	ctx context.Context,
 	parallelism int,
 	threshold int64,
 	input []*lokiResult,
-	userID string,
-) ([]queryrange.Response, error) {
-	var responses []queryrange.Response
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	maxSeries int,
+) (queryrangebase.Response, error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	discardedUsage := &discardedResponseUsageTracker{}
+	var responses []queryrangebase.Response
+
+	finishResponses := func(queryErr error) (queryrangebase.Response, error) {
+		cancel(errors.New("split by interval process canceled"))
+		var response queryrangebase.Response
+		if queryErr == nil {
+			// Early log exits already compacted their responses. Merge normal
+			// completion here as well, before attaching discarded statistics.
+			if len(responses) == 1 {
+				response = responses[0]
+			} else {
+				response, queryErr = h.merger.MergeResponse(responses...)
+			}
+		}
+		if queryErr != nil {
+			// Both collection and merge failures must retain the original usage.
+			discardedUsage.finalizeFailedResponseUsage(ctx, responses)
+			return nil, queryErr
+		}
+		return discardedUsage.finalizeSuccessfulResponseUsage(response), nil
+	}
 
 	ch := h.Feed(ctx, input)
 
 	// queries with 0 limits should not be exited early
-	var unlimited bool
-	if threshold == 0 {
-		unlimited = true
-	}
+	unlimited := threshold == 0
 
+	// Parallelism will be at least 1
+	p := max(parallelism, 1)
 	// don't spawn unnecessary goroutines
-	var p = parallelism
 	if len(input) < parallelism {
 		p = len(input)
 	}
 
 	// per request wrapped handler for limiting the amount of series.
-	next := newSeriesLimiter(h.limits.MaxQuerySeries(userID)).Wrap(h.next)
+	next := newSeriesLimiter(maxSeries).Wrap(h.next)
 	for i := 0; i < p; i++ {
-		go h.loop(ctx, ch, next)
+		go h.loop(ctx, ch, next, discardedUsage)
 	}
 
 	for _, x := range input {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			// Finalization preserves collected and uncollected usage. Keep the original
+			// cause so a real failure wins over a generic cancellation.
+			return finishResponses(context.Cause(ctx))
 		case data := <-x.ch:
+			discardedUsage.markResponseCollected(x)
 			if data.err != nil {
-				return nil, data.err
+				// Cancel the siblings with this failure as the cause, so it is not
+				// lost behind a generic cancellation.
+				cancel(data.err)
+				return finishResponses(data.err)
 			}
 
 			responses = append(responses, data.resp)
@@ -130,7 +183,19 @@ func (h *splitByInterval) Process(
 				threshold -= casted.Count()
 
 				if threshold <= 0 {
-					return responses, nil
+					// Stop in-flight splits before compacting; merge can take
+					// long enough that the next interval would otherwise start.
+					cancel(errors.New("split by interval process canceled"))
+
+					// Each split still carries the original line limit, so holding
+					// every sub-response until a final merge is O(splits × limit).
+					// Compact immediately so oversized splits can be GC'd and so a
+					// single result preserves the number of responses merged here.
+					if allLokiResponses(responses) {
+						responses = []queryrangebase.Response{mergeLokiResponse(responses...)}
+					}
+
+					return finishResponses(nil)
 				}
 
 			}
@@ -138,40 +203,49 @@ func (h *splitByInterval) Process(
 		}
 	}
 
-	return responses, nil
+	return finishResponses(nil)
 }
 
-func (h *splitByInterval) loop(ctx context.Context, ch <-chan *lokiResult, next queryrange.Handler) {
+func (h *splitByInterval) loop(ctx context.Context, ch <-chan *lokiResult, next queryrangebase.Handler, discardedUsage *discardedResponseUsageTracker) {
 	for data := range ch {
 
-		sp, ctx := opentracing.StartSpanFromContext(ctx, "interval")
-		data.req.LogToSpan(sp)
+		ctx, sp := tracer.Start(ctx, "interval")
+		if sp.SpanContext().IsSampled() {
+			data.req.LogToSpan(sp)
+		}
 
 		resp, err := next.Do(ctx, data.req)
+		if err == nil {
+			discardedUsage.recordResponse(data, resp)
+		}
+		sp.End()
 
 		select {
 		case <-ctx.Done():
-			sp.Finish()
 			return
 		case data.ch <- &packedResp{resp, err}:
-			sp.Finish()
+			// The parent Process method will return on the first error. So stop
+			// processng.
+			if err != nil {
+				return
+			}
 		}
 	}
 }
 
-func (h *splitByInterval) Do(ctx context.Context, r queryrange.Request) (queryrange.Response, error) {
-	userid, err := tenant.TenantID(ctx)
+func (h *splitByInterval) Do(ctx context.Context, r queryrangebase.Request) (queryrangebase.Response, error) {
+	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 
-	interval := h.limits.QuerySplitDuration(userid)
+	intervals, enabled := h.splitter.split(time.Now().UTC(), tenantIDs, r)
+
 	// skip split by if unset
-	if interval == 0 {
+	if !enabled {
 		return h.next.Do(ctx, r)
 	}
 
-	intervals := h.splitter(r, interval)
 	h.metrics.splits.Observe(float64(len(intervals)))
 
 	// no interval should not be processed by the frontend.
@@ -179,8 +253,10 @@ func (h *splitByInterval) Do(ctx context.Context, r queryrange.Request) (queryra
 		return h.next.Do(ctx, r)
 	}
 
-	if sp := opentracing.SpanFromContext(ctx); sp != nil {
-		sp.LogFields(otlog.Int("n_intervals", len(intervals)))
+	trace.SpanFromContext(ctx).SetAttributes(attribute.Int("n_intervals", len(intervals)))
+
+	if len(intervals) == 1 {
+		return h.next.Do(ctx, intervals[0])
 	}
 
 	var limit int64
@@ -192,8 +268,13 @@ func (h *splitByInterval) Do(ctx context.Context, r queryrange.Request) (queryra
 				intervals[i], intervals[j] = intervals[j], intervals[i]
 			}
 		}
-	case *LokiSeriesRequest, *LokiLabelNamesRequest:
-		// Set this to 0 since this is not used in Series/Labels Request.
+	case *DetectedFieldsRequest:
+		limit = int64(req.LineLimit)
+		for i, j := 0, len(intervals)-1; i < j; i, j = i+1, j-1 {
+			intervals[i], intervals[j] = intervals[j], intervals[i]
+		}
+	case *LokiSeriesRequest, *LabelRequest, *logproto.IndexStatsRequest, *logproto.VolumeRequest, *logproto.ShardsRequest, *DetectedLabelsRequest:
+		// Set this to 0 since this is not used in Series/Labels/Index Request.
 		limit = 0
 	default:
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, "unknown request type")
@@ -207,93 +288,38 @@ func (h *splitByInterval) Do(ctx context.Context, r queryrange.Request) (queryra
 		})
 	}
 
-	resps, err := h.Process(ctx, h.limits.MaxQueryParallelism(userid), limit, input, userid)
-	if err != nil {
-		return nil, err
-	}
-	return h.merger.MergeResponse(resps...)
+	maxSeries := validation.SmallestPositiveIntPerTenant(tenantIDs, h.limits.MaxQuerySeries)
+	maxParallelism := MinWeightedParallelism(ctx, tenantIDs, h.configs, h.limits, model.Time(r.GetStart().UnixMilli()), model.Time(r.GetEnd().UnixMilli()))
+	// Process returns the final response; merging it again would reset its split count.
+	return h.Process(ctx, maxParallelism, limit, input, maxSeries)
 }
 
-func splitByTime(req queryrange.Request, interval time.Duration) []queryrange.Request {
-	var reqs []queryrange.Request
-
-	switch r := req.(type) {
-	case *LokiRequest:
-		forInterval(interval, r.StartTs, r.EndTs, func(start, end time.Time) {
-			reqs = append(reqs, &LokiRequest{
-				Query:     r.Query,
-				Limit:     r.Limit,
-				Step:      r.Step,
-				Direction: r.Direction,
-				Path:      r.Path,
-				StartTs:   start,
-				EndTs:     end,
-			})
-		})
-	case *LokiSeriesRequest:
-		forInterval(interval, r.StartTs, r.EndTs, func(start, end time.Time) {
-			reqs = append(reqs, &LokiSeriesRequest{
-				Match:   r.Match,
-				Path:    r.Path,
-				StartTs: start,
-				EndTs:   end,
-				Shards:  r.Shards,
-			})
-		})
-	case *LokiLabelNamesRequest:
-		forInterval(interval, r.StartTs, r.EndTs, func(start, end time.Time) {
-			reqs = append(reqs, &LokiLabelNamesRequest{
-				Path:    r.Path,
-				StartTs: start,
-				EndTs:   end,
-			})
-		})
-	default:
-		return nil
-	}
-	return reqs
-}
-
-func forInterval(interval time.Duration, start, end time.Time, callback func(start, end time.Time)) {
-	for start := start; start.Before(end); start = start.Add(interval) {
-		newEnd := start.Add(interval)
-		if newEnd.After(end) {
-			newEnd = end
+func allLokiResponses(responses []queryrangebase.Response) bool {
+	for _, r := range responses {
+		if _, ok := r.(*LokiResponse); !ok {
+			return false
 		}
-		callback(start, newEnd)
 	}
+	return true
 }
 
-func splitMetricByTime(r queryrange.Request, interval time.Duration) []queryrange.Request {
-	var reqs []queryrange.Request
-	lokiReq := r.(*LokiRequest)
-	for start := lokiReq.StartTs; start.Before(lokiReq.EndTs); start = nextIntervalBoundary(start, r.GetStep(), interval).Add(time.Duration(r.GetStep()) * time.Millisecond) {
-		end := nextIntervalBoundary(start, r.GetStep(), interval)
-		if end.Add(time.Duration(r.GetStep())*time.Millisecond).After(lokiReq.EndTs) || end.Add(time.Duration(r.GetStep())*time.Millisecond) == lokiReq.EndTs {
-			end = lokiReq.EndTs
+// maxRangeVectorAndOffsetDuration returns the maximum range vector and offset duration within a LogQL query.
+func maxRangeVectorAndOffsetDuration(expr syntax.Expr) (time.Duration, time.Duration) {
+	if _, ok := expr.(syntax.SampleExpr); !ok {
+		return 0, 0
+	}
+
+	var maxRVDuration, maxOffset time.Duration
+	expr.Walk(func(e syntax.Expr) bool {
+		if r, ok := e.(*syntax.LogRangeExpr); ok {
+			if r.Interval > maxRVDuration {
+				maxRVDuration = r.Interval
+			}
+			if r.Offset > maxOffset {
+				maxOffset = r.Offset
+			}
 		}
-		reqs = append(reqs, &LokiRequest{
-			Query:     lokiReq.Query,
-			Limit:     lokiReq.Limit,
-			Step:      lokiReq.Step,
-			Direction: lokiReq.Direction,
-			Path:      lokiReq.Path,
-			StartTs:   start,
-			EndTs:     end,
-		})
-	}
-	return reqs
-}
-
-// Round up to the step before the next interval boundary.
-func nextIntervalBoundary(t time.Time, step int64, interval time.Duration) time.Time {
-	stepNs := step * 1e6
-	nsPerInterval := interval.Nanoseconds()
-	startOfNextInterval := ((t.UnixNano() / nsPerInterval) + 1) * nsPerInterval
-	// ensure that target is a multiple of steps away from the start time
-	target := startOfNextInterval - ((startOfNextInterval - t.UnixNano()) % stepNs)
-	if target == startOfNextInterval {
-		target -= stepNs
-	}
-	return time.Unix(0, target)
+		return true
+	})
+	return maxRVDuration, maxOffset
 }

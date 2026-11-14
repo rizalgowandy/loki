@@ -7,7 +7,7 @@ import (
 	"bytes"
 	"io"
 
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v4"
 )
 
 // UnmarshalConfig unmarshals an instance config from a reader based on a
@@ -15,7 +15,7 @@ import (
 func UnmarshalConfig(r io.Reader) (*Config, error) {
 	var cfg Config
 	dec := yaml.NewDecoder(r)
-	dec.SetStrict(true)
+	dec.KnownFields(true)
 	err := dec.Decode(&cfg)
 	return &cfg, err
 }
@@ -28,7 +28,7 @@ func MarshalConfig(c *Config, scrubSecrets bool) ([]byte, error) {
 }
 
 // MarshalConfigToWriter marshals a config to an io.Writer.
-func MarshalConfigToWriter(c *Config, w io.Writer, scrubSecrets bool) error {
+func MarshalConfigToWriter(c *Config, w io.Writer, _ bool) error {
 	enc := yaml.NewEncoder(w)
 
 	type plain Config

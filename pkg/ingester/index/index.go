@@ -17,15 +17,23 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 
-	"github.com/cortexproject/cortex/pkg/cortexpb"
-	"github.com/cortexproject/cortex/pkg/querier/astmapper"
-
-	"github.com/grafana/loki/pkg/storage/chunk"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql"
+	"github.com/grafana/loki/v3/pkg/storage/stores/series"
+	"github.com/grafana/loki/v3/pkg/storage/stores/shipper/indexshipper/tsdb/index"
 )
 
 const DefaultIndexShards = 32
 
 var ErrInvalidShardQuery = errors.New("incompatible index shard query")
+
+type Interface interface {
+	Add(labels []logproto.LabelAdapter, fp model.Fingerprint) labels.Labels
+	Lookup(matchers []*labels.Matcher, shard *logql.Shard) ([]model.Fingerprint, error)
+	LabelNames(shard *logql.Shard) ([]string, error)
+	LabelValues(name string, shard *logql.Shard) ([]string, error)
+	Delete(labels labels.Labels, fp model.Fingerprint)
+}
 
 // InvertedIndex implements a in-memory inverted index from label pairs to fingerprints.
 // It is sharded to reduce lock contention on writes.
@@ -48,15 +56,15 @@ func NewWithShards(totalShards uint32) *InvertedIndex {
 	}
 }
 
-func (ii *InvertedIndex) getShards(shard *astmapper.ShardAnnotation) []*indexShard {
+func (ii *InvertedIndex) getShards(shard *index.ShardAnnotation) []*indexShard {
 	if shard == nil {
 		return ii.shards
 	}
 
-	totalRequested := int(ii.totalShards) / shard.Of
+	totalRequested := ii.totalShards / shard.Of
 	result := make([]*indexShard, totalRequested)
 	var j int
-	for i := 0; i < totalRequested; i++ {
+	for i := uint32(0); i < totalRequested; i++ {
 		subShard := ((shard.Shard) + (i * shard.Of))
 		result[j] = ii.shards[subShard]
 		j++
@@ -64,21 +72,27 @@ func (ii *InvertedIndex) getShards(shard *astmapper.ShardAnnotation) []*indexSha
 	return result
 }
 
-func validateShard(totalShards uint32, shard *astmapper.ShardAnnotation) error {
+func (ii *InvertedIndex) validateShard(shard *logql.Shard) (*index.ShardAnnotation, error) {
 	if shard == nil {
-		return nil
+		return nil, nil
 	}
-	if int(totalShards)%shard.Of != 0 || uint32(shard.Of) > totalShards {
-		return fmt.Errorf("%w index_shard:%d query_shard:%v", ErrInvalidShardQuery, totalShards, shard)
+
+	s := shard.PowerOfTwo
+	if s == nil {
+		return nil, errors.New("inverted index only supports shard annotations with `PowerOfTwo`")
 	}
-	return nil
+
+	if ii.totalShards%s.Of != 0 || s.Of > ii.totalShards {
+		return nil, fmt.Errorf("%w index_shard:%d query_shard:%v", ErrInvalidShardQuery, ii.totalShards, s)
+	}
+	return s, nil
 }
 
 // Add a fingerprint under the specified labels.
 // NOTE: memory for `labels` is unsafe; anything retained beyond the
 // life of this function must be copied
-func (ii *InvertedIndex) Add(labels []cortexpb.LabelAdapter, fp model.Fingerprint) labels.Labels {
-	shardIndex := labelsSeriesIDHash(cortexpb.FromLabelAdaptersToLabels(labels))
+func (ii *InvertedIndex) Add(labels []logproto.LabelAdapter, fp model.Fingerprint) labels.Labels {
+	shardIndex := labelsSeriesIDHash(logproto.FromLabelAdaptersToLabels(labels))
 	shard := ii.shards[shardIndex%ii.totalShards]
 	return shard.add(labels, fp) // add() returns 'interned' values so the original labels are not retained
 }
@@ -125,9 +139,9 @@ func labelsString(b *bytes.Buffer, ls labels.Labels) {
 	b.WriteString("logs")
 	b.WriteByte('{')
 	i := 0
-	for _, l := range ls {
-		if l.Name == labels.MetricName {
-			continue
+	ls.Range(func(l labels.Label) {
+		if l.Name == model.MetricNameLabel {
+			return
 		}
 		if i > 0 {
 			b.WriteByte(',')
@@ -138,13 +152,14 @@ func labelsString(b *bytes.Buffer, ls labels.Labels) {
 		var buf [1000]byte
 		b.Write(strconv.AppendQuote(buf[:0], l.Value))
 		i++
-	}
+	})
 	b.WriteByte('}')
 }
 
 // Lookup all fingerprints for the provided matchers.
-func (ii *InvertedIndex) Lookup(matchers []*labels.Matcher, shard *astmapper.ShardAnnotation) ([]model.Fingerprint, error) {
-	if err := validateShard(ii.totalShards, shard); err != nil {
+func (ii *InvertedIndex) Lookup(matchers []*labels.Matcher, s *logql.Shard) ([]model.Fingerprint, error) {
+	shard, err := ii.validateShard(s)
+	if err != nil {
 		return nil, err
 	}
 
@@ -168,14 +183,15 @@ func (ii *InvertedIndex) Lookup(matchers []*labels.Matcher, shard *astmapper.Sha
 }
 
 // LabelNames returns all label names.
-func (ii *InvertedIndex) LabelNames(shard *astmapper.ShardAnnotation) ([]string, error) {
-	if err := validateShard(ii.totalShards, shard); err != nil {
+func (ii *InvertedIndex) LabelNames(s *logql.Shard) ([]string, error) {
+	shard, err := ii.validateShard(s)
+	if err != nil {
 		return nil, err
 	}
 	shards := ii.getShards(shard)
 	results := make([][]string, 0, len(shards))
 	for i := range shards {
-		shardResult := shards[i].labelNames()
+		shardResult := shards[i].labelNames(nil)
 		results = append(results, shardResult)
 	}
 
@@ -183,15 +199,16 @@ func (ii *InvertedIndex) LabelNames(shard *astmapper.ShardAnnotation) ([]string,
 }
 
 // LabelValues returns the values for the given label.
-func (ii *InvertedIndex) LabelValues(name string, shard *astmapper.ShardAnnotation) ([]string, error) {
-	if err := validateShard(ii.totalShards, shard); err != nil {
+func (ii *InvertedIndex) LabelValues(name string, s *logql.Shard) ([]string, error) {
+	shard, err := ii.validateShard(s)
+	if err != nil {
 		return nil, err
 	}
 	shards := ii.getShards(shard)
 	results := make([][]string, 0, len(shards))
 
 	for i := range shards {
-		shardResult := shards[i].labelValues(name)
+		shardResult := shards[i].labelValues(name, nil)
 		results = append(results, shardResult)
 	}
 
@@ -218,8 +235,12 @@ type indexValueEntry struct {
 type unlockIndex map[string]indexEntry
 
 // This is the prevalent value for Intel and AMD CPUs as-at 2018.
+//
+//nolint:unused // used only by the cache-line padding field below, which is itself unused by design.
 const cacheLineSize = 64
 
+// Roughly
+// map[labelName] => map[labelValue] => []fingerprint
 type indexShard struct {
 	shard uint32
 	mtx   sync.RWMutex
@@ -235,13 +256,13 @@ func copyString(s string) string {
 // add metric to the index; return all the name/value pairs as a fresh
 // sorted slice, referencing 'interned' strings from the index so that
 // no references are retained to the memory of `metric`.
-func (shard *indexShard) add(metric []cortexpb.LabelAdapter, fp model.Fingerprint) labels.Labels {
+func (shard *indexShard) add(metric []logproto.LabelAdapter, fp model.Fingerprint) labels.Labels {
 	shard.mtx.Lock()
 	defer shard.mtx.Unlock()
 
-	internedLabels := make(labels.Labels, len(metric))
+	builder := labels.NewScratchBuilder(len(metric))
 
-	for i, pair := range metric {
+	for _, pair := range metric {
 		values, ok := shard.idx[pair.Name]
 		if !ok {
 			values = indexEntry{
@@ -264,10 +285,9 @@ func (shard *indexShard) add(metric []cortexpb.LabelAdapter, fp model.Fingerprin
 		copy(fingerprints.fps[j+1:], fingerprints.fps[j:])
 		fingerprints.fps[j] = fp
 		values.fps[fingerprints.value] = fingerprints
-		internedLabels[i] = labels.Label{Name: values.name, Value: fingerprints.value}
+		builder.Add(values.name, fingerprints.value)
 	}
-	sort.Sort(internedLabels)
-	return internedLabels
+	return builder.Labels()
 }
 
 func (shard *indexShard) lookup(matchers []*labels.Matcher) []model.Fingerprint {
@@ -289,9 +309,9 @@ func (shard *indexShard) lookup(matchers []*labels.Matcher) []model.Fingerprint 
 		if matcher.Type == labels.MatchEqual {
 			fps := values.fps[matcher.Value]
 			toIntersect = append(toIntersect, fps.fps...) // deliberate copy
-		} else if matcher.Type == labels.MatchRegexp && len(chunk.FindSetMatches(matcher.Value)) > 0 {
+		} else if matcher.Type == labels.MatchRegexp && len(series.FindSetMatches(matcher.Value)) > 0 {
 			// The lookup is of the form `=~"a|b|c|d"`
-			set := chunk.FindSetMatches(matcher.Value)
+			set := series.FindSetMatches(matcher.Value)
 			for _, value := range set {
 				toIntersect = append(toIntersect, values.fps[value].fps...)
 			}
@@ -330,7 +350,7 @@ func (shard *indexShard) allFPs() model.Fingerprints {
 	}
 
 	var result model.Fingerprints
-	var m = map[model.Fingerprint]struct{}{}
+	m := map[model.Fingerprint]struct{}{}
 	for _, fp := range fps {
 		if _, ok := m[fp]; !ok {
 			m[fp] = struct{}{}
@@ -340,20 +360,27 @@ func (shard *indexShard) allFPs() model.Fingerprints {
 	return result
 }
 
-func (shard *indexShard) labelNames() []string {
+func (shard *indexShard) labelNames(extractor func(unlockIndex) []string) []string {
 	shard.mtx.RLock()
 	defer shard.mtx.RUnlock()
 
 	results := make([]string, 0, len(shard.idx))
-	for name := range shard.idx {
-		results = append(results, name)
+	if extractor != nil {
+		results = append(results, extractor(shard.idx)...)
+	} else {
+		for name := range shard.idx {
+			results = append(results, name)
+		}
 	}
 
 	sort.Strings(results)
 	return results
 }
 
-func (shard *indexShard) labelValues(name string) []string {
+func (shard *indexShard) labelValues(
+	name string,
+	extractor func(indexEntry) []string,
+) []string {
 	shard.mtx.RLock()
 	defer shard.mtx.RUnlock()
 
@@ -362,28 +389,31 @@ func (shard *indexShard) labelValues(name string) []string {
 		return nil
 	}
 
-	results := make([]string, 0, len(values.fps))
-	for val := range values.fps {
-		results = append(results, val)
+	if extractor == nil {
+		results := make([]string, 0, len(values.fps))
+		for val := range values.fps {
+			results = append(results, val)
+		}
+		sort.Strings(results)
+		return results
 	}
 
-	sort.Strings(results)
-	return results
+	return extractor(values)
 }
 
-func (shard *indexShard) delete(labels labels.Labels, fp model.Fingerprint) {
+func (shard *indexShard) delete(lbls labels.Labels, fp model.Fingerprint) {
 	shard.mtx.Lock()
 	defer shard.mtx.Unlock()
 
-	for _, pair := range labels {
+	lbls.Range(func(pair labels.Label) {
 		name, value := pair.Name, pair.Value
 		values, ok := shard.idx[name]
 		if !ok {
-			continue
+			return
 		}
 		fingerprints, ok := values.fps[value]
 		if !ok {
-			continue
+			return
 		}
 
 		j := sort.Search(len(fingerprints.fps), func(i int) bool {
@@ -392,7 +422,7 @@ func (shard *indexShard) delete(labels labels.Labels, fp model.Fingerprint) {
 
 		// see if search didn't find fp which matches the condition which means we don't have to do anything.
 		if j >= len(fingerprints.fps) || fingerprints.fps[j] != fp {
-			continue
+			return
 		}
 		fingerprints.fps = fingerprints.fps[:j+copy(fingerprints.fps[j:], fingerprints.fps[j+1:])]
 
@@ -407,7 +437,7 @@ func (shard *indexShard) delete(labels labels.Labels, fp model.Fingerprint) {
 		} else {
 			shard.idx[name] = values
 		}
-	}
+	})
 }
 
 // intersect two sorted lists of fingerprints.  Assumes there are no duplicate

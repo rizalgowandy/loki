@@ -8,7 +8,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/querier/testutil"
 )
 
 func TestParseTailQuery(t *testing.T) {
@@ -38,6 +39,7 @@ func TestParseTailQuery(t *testing.T) {
 				DelayFor: 5,
 				Start:    time.Date(2017, 06, 10, 21, 42, 24, 760738998, time.UTC),
 				Limit:    1000,
+				Plan:     testutil.MustPlan(`{foo="bar"}`),
 			}, false},
 	}
 	for _, tt := range tests {

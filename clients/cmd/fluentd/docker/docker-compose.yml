@@ -1,18 +1,30 @@
-version: '3'
 services:
+  loki:
+    build:
+      context: ../../../../
+      dockerfile: ./cmd/loki/Dockerfile
+    image: grafana/loki:main
+    ports:
+      - 3100
+    volumes:
+    - ./fluentd.conf:/fluentd/etc/fluent.conf
+
   # Receive forwarded logs and send to /fluentd/logs/data.log and loki
   fluentd:
     build:
-      context: ../../../..
-      dockerfile: ../Dockerfile
-    image: fluentd:loki
+      context: ../../../../
+      dockerfile: ./clients/cmd/fluentd/Dockerfile
+    image: grafana/fluent-plugin-loki:main
     volumes:
     - ./fluentd.conf:/fluentd/etc/fluent.conf
     environment:
       - LOKI_URL
+    depends_on:
+    - loki
+
   # Read /var/log/syslog and send it to fluentd
   fluentbit:
-    image: fluent/fluent-bit:1.0
+    image: fluent/fluent-bit:5.2@sha256:a48190bf67679495a332fd61025421a46e7e4d168380185a8e16da2e9acc3126
     command: "/fluent-bit/bin/fluent-bit -c /srv/fluent-bit.conf"
     user: root
     volumes:
@@ -20,3 +32,4 @@ services:
     - /var/log/syslog:/var/log/syslog:ro
     depends_on:
     - fluentd
+    - loki

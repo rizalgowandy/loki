@@ -6,27 +6,36 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/cortexpb"
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
-	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/go-kit/log"
+	"github.com/grafana/dskit/user"
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/user"
 
-	"github.com/grafana/loki/pkg/loghttp"
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql"
-	"github.com/grafana/loki/pkg/storage/chunk"
+	"github.com/grafana/loki/v3/pkg/loghttp"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql"
+	"github.com/grafana/loki/v3/pkg/logql/model/stats"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/querier/plan"
+	"github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase/definitions"
+	"github.com/grafana/loki/v3/pkg/querier/testutil"
+	"github.com/grafana/loki/v3/pkg/storage/config"
+	"github.com/grafana/loki/v3/pkg/storage/types"
+	"github.com/grafana/loki/v3/pkg/util"
+	"github.com/grafana/loki/v3/pkg/util/constants"
 )
 
 var (
-	nilShardingMetrics = logql.NewShardingMetrics(nil)
+	nilShardingMetrics = logql.NewShardMapperMetrics(nil)
 	defaultReq         = func() *LokiRequest {
 		return &LokiRequest{
+			Step:      1000,
 			Limit:     100,
 			StartTs:   start,
 			EndTs:     end,
@@ -34,12 +43,15 @@ var (
 			Path:      "/loki/api/v1/query_range",
 		}
 	}
-	lokiResps = []queryrange.Response{
+	lokiResps = []queryrangebase.Response{
 		&LokiResponse{
 			Status:    loghttp.QueryStatusSuccess,
 			Direction: logproto.BACKWARD,
 			Limit:     defaultReq().Limit,
 			Version:   1,
+			Headers: []definitions.PrometheusResponseHeader{
+				{Name: "Header", Values: []string{"value"}},
+			},
 			Data: LokiData{
 				ResultType: loghttp.ResultTypeStream,
 				Result: []logproto.Stream{
@@ -58,6 +70,9 @@ var (
 			Direction: logproto.BACKWARD,
 			Limit:     100,
 			Version:   1,
+			Headers: []definitions.PrometheusResponseHeader{
+				{Name: "Header", Values: []string{"value"}},
+			},
 			Data: LokiData{
 				ResultType: loghttp.ResultTypeStream,
 				Result: []logproto.Stream{
@@ -75,10 +90,7 @@ var (
 )
 
 func Test_shardSplitter(t *testing.T) {
-	req := defaultReq().WithStartEnd(
-		util.TimeToMillis(start),
-		util.TimeToMillis(end),
-	)
+	req := defaultReq().WithStartEnd(start, end)
 
 	for _, tc := range []struct {
 		desc        string
@@ -109,7 +121,7 @@ func Test_shardSplitter(t *testing.T) {
 		t.Run(tc.desc, func(t *testing.T) {
 			var didShard bool
 			splitter := &shardSplitter{
-				shardingware: queryrange.HandlerFunc(func(ctx context.Context, req queryrange.Request) (queryrange.Response, error) {
+				shardingware: queryrangebase.HandlerFunc(func(ctx context.Context, req queryrangebase.Request) (queryrangebase.Response, error) {
 					didShard = true
 					return mockHandler(lokiResps[0], nil).Do(ctx, req)
 				}),
@@ -117,6 +129,8 @@ func Test_shardSplitter(t *testing.T) {
 				now:  func() time.Time { return end },
 				limits: fakeLimits{
 					minShardingLookback: tc.lookback,
+					queryTimeout:        time.Minute,
+					maxQueryParallelism: 1,
 				},
 			}
 
@@ -139,7 +153,7 @@ func Test_astMapper(t *testing.T) {
 	var lock sync.Mutex
 	called := 0
 
-	handler := queryrange.HandlerFunc(func(ctx context.Context, req queryrange.Request) (queryrange.Response, error) {
+	handler := queryrangebase.HandlerFunc(func(_ context.Context, _ queryrangebase.Request) (queryrangebase.Response, error) {
 		lock.Lock()
 		defer lock.Unlock()
 		resp := lokiResps[called]
@@ -147,92 +161,440 @@ func Test_astMapper(t *testing.T) {
 		return resp, nil
 	})
 
+	// TSDB is the only index type; sharding is resolved dynamically from index
+	// stats. Return a large byte count and cap the factor via maxShards so the
+	// query deterministically shards into 2.
+	statsHandler := queryrangebase.HandlerFunc(func(_ context.Context, _ queryrangebase.Request) (queryrangebase.Response, error) {
+		return &IndexStatsResponse{
+			Response: &logproto.IndexStatsResponse{Bytes: 1 << 40},
+		}, nil
+	})
+
 	mware := newASTMapperware(
-		ShardingConfigs{
-			chunk.PeriodConfig{
-				RowShards: 2,
-			},
+		[]config.PeriodConfig{
+			{IndexType: types.IndexTypeTSDB},
 		},
+		testEngineOpts,
 		handler,
+		handler,
+		statsHandler,
 		log.NewNopLogger(),
 		nilShardingMetrics,
-		fakeLimits{maxSeries: math.MaxInt32},
+		Config{},
+		fakeLimits{maxSeries: math.MaxInt32, maxQueryParallelism: 1, tsdbMaxQueryParallelism: 1, queryTimeout: time.Second},
+		2,
 	)
 
-	resp, err := mware.Do(context.Background(), defaultReq().WithQuery(`{food="bar"}`))
+	req := defaultReq()
+	req.Query = `{foo="bar"}`
+	req.Plan = testutil.MustPlan(req.Query)
+	resp, err := mware.Do(user.InjectOrgID(context.Background(), "1"), req)
 	require.Nil(t, err)
 
-	expected, err := LokiCodec.MergeResponse(lokiResps...)
+	require.Equal(t, []*definitions.PrometheusResponseHeader{
+		{Name: "Header", Values: []string{"value"}},
+	}, resp.GetHeaders())
+
+	expected, err := DefaultCodec.MergeResponse(lokiResps...)
 	sort.Sort(logproto.Streams(expected.(*LokiResponse).Data.Result))
 	require.Nil(t, err)
 	require.Equal(t, called, 2)
 	require.Equal(t, expected.(*LokiResponse).Data, resp.(*LokiResponse).Data)
 }
 
+func Test_astMapper_QuerySizeLimits(t *testing.T) {
+	noErr := ""
+	for _, tc := range []struct {
+		desc                string
+		query               string
+		maxQuerierBytesSize int
+
+		err                      string
+		expectedStatsHandlerHits int
+	}{
+		{
+			desc:                "Non shardable query",
+			query:               `sum_over_time({app="foo"} |= "foo" | unwrap foo [1h])`,
+			maxQuerierBytesSize: 100,
+
+			err:                      noErr,
+			expectedStatsHandlerHits: 1,
+		},
+		{
+			desc:                     "Non shardable query too big",
+			query:                    `avg_over_time({job="foo"} | json busy="utilization" | unwrap busy [5m])`,
+			maxQuerierBytesSize:      10,
+			err:                      fmt.Sprintf(limErrQuerierTooManyBytesUnshardableTmpl, "100 B", "10 B"),
+			expectedStatsHandlerHits: 1,
+		},
+		{
+			desc:                "Shardable query",
+			query:               `count_over_time({app="foo"} |= "foo" [1h])`,
+			maxQuerierBytesSize: 100,
+
+			err:                      noErr,
+			expectedStatsHandlerHits: 1,
+		},
+		{
+			desc:                "Shardable query too big",
+			query:               `count_over_time({app="foo"} |= "foo" [1h])`,
+			maxQuerierBytesSize: 10,
+
+			err:                      fmt.Sprintf(limErrQuerierTooManyBytesShardableTmpl, "100 B", "10 B"),
+			expectedStatsHandlerHits: 1,
+		},
+		{
+			desc:                "Partially Shardable query fitting",
+			query:               `count_over_time({app="foo"} |= "foo" [1h]) - sum_over_time({app="foo"} |= "foo" | unwrap foo [1h])`,
+			maxQuerierBytesSize: 100,
+
+			err:                      noErr,
+			expectedStatsHandlerHits: 2,
+		},
+		{
+			desc:                "Partially Shardable LHS too big",
+			query:               `count_over_time({app="bar"} |= "bar" [1h]) - sum_over_time({app="foo"} |= "foo" | unwrap foo [1h])`,
+			maxQuerierBytesSize: 100,
+
+			err:                      fmt.Sprintf(limErrQuerierTooManyBytesShardableTmpl, "500 B", "100 B"),
+			expectedStatsHandlerHits: 2,
+		},
+		{
+			desc:                "Partially Shardable RHS too big",
+			query:               `count_over_time({app="foo"} |= "foo" [1h]) - sum_over_time({app="bar"} |= "bar" | unwrap foo [1h])`,
+			maxQuerierBytesSize: 100,
+
+			err:                      fmt.Sprintf(limErrQuerierTooManyBytesShardableTmpl, "500 B", "100 B"),
+			expectedStatsHandlerHits: 2,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			statsCalled := 0
+			handler := queryrangebase.HandlerFunc(func(_ context.Context, req queryrangebase.Request) (queryrangebase.Response, error) {
+				if casted, ok := req.(*logproto.IndexStatsRequest); ok {
+					statsCalled++
+
+					var bytes uint64
+					if strings.Contains(casted.Matchers, `app="foo"`) {
+						bytes = 100
+					}
+					if strings.Contains(casted.Matchers, `app="bar"`) {
+						bytes = 500
+					}
+
+					return &IndexStatsResponse{
+						Response: &logproto.IndexStatsResponse{
+							Bytes: bytes,
+						},
+					}, nil
+				}
+				if _, ok := req.(*LokiRequest); ok {
+					return &LokiPromResponse{Response: &queryrangebase.PrometheusResponse{
+						Data: queryrangebase.PrometheusData{
+							ResultType: loghttp.ResultTypeVector,
+							Result: []queryrangebase.SampleStream{
+								{
+									Labels:  []logproto.LabelAdapter{{Name: "foo", Value: "bar"}},
+									Samples: []logproto.LegacySample{{Value: 10, TimestampMs: 10}},
+								},
+							},
+						},
+					}}, nil
+				}
+
+				return nil, nil
+			})
+
+			mware := newASTMapperware(
+				[]config.PeriodConfig{
+					{IndexType: types.IndexTypeTSDB},
+				},
+				testEngineOpts,
+				handler,
+				handler,
+				nil,
+				log.NewNopLogger(),
+				nilShardingMetrics,
+				Config{},
+				fakeLimits{
+					maxSeries:               math.MaxInt32,
+					maxQueryParallelism:     1,
+					tsdbMaxQueryParallelism: 1,
+					queryTimeout:            time.Minute,
+					maxQuerierBytesRead:     tc.maxQuerierBytesSize,
+				},
+				0,
+			)
+
+			req := defaultReq()
+			req.Query = tc.query
+			req.Plan = testutil.MustPlan(tc.query)
+			_, err := mware.Do(user.InjectOrgID(context.Background(), "1"), req)
+			if err != nil {
+				require.ErrorContains(t, err, tc.err)
+			}
+
+			require.Equal(t, tc.expectedStatsHandlerHits, statsCalled)
+		})
+	}
+}
+
+func Test_astMapper_ShardAggregations(t *testing.T) {
+	const query = `quantile_over_time(0.5, {app="foo"} | unwrap foo [1h])`
+
+	// The index reports 100 B and the limit is 10 B, so every subtest fails before the query runs.
+	// The subtests do not check that failure. They check which error comes back, because the
+	// message says whether the query is shardable.
+	exceedQuerierBytesRead := func(t *testing.T, cfg Config) error {
+		t.Helper()
+
+		handler := queryrangebase.HandlerFunc(func(_ context.Context, _ queryrangebase.Request) (queryrangebase.Response, error) {
+			return &IndexStatsResponse{Response: &logproto.IndexStatsResponse{Bytes: 100}}, nil
+		})
+		mware := newASTMapperware(
+			[]config.PeriodConfig{{IndexType: types.IndexTypeTSDB}},
+			testEngineOpts,
+			handler,
+			handler,
+			nil,
+			log.NewNopLogger(),
+			nilShardingMetrics,
+			cfg,
+			fakeLimits{maxSeries: math.MaxInt32, maxQueryParallelism: 1, tsdbMaxQueryParallelism: 1, queryTimeout: time.Minute, maxQuerierBytesRead: 10},
+			0,
+		)
+
+		req := defaultReq()
+		req.Query = query
+		req.Plan = testutil.MustPlan(query)
+		_, err := mware.Do(user.InjectOrgID(t.Context(), "1"), req)
+		return err
+	}
+
+	t.Run("shards an aggregation that the config lists", func(t *testing.T) {
+		cfg := Config{}
+		cfg.ShardAggregations = []string{logql.ShardQuantileOverTime}
+
+		err := exceedQuerierBytesRead(t, cfg)
+
+		require.ErrorContains(t, err, fmt.Sprintf(limErrQuerierTooManyBytesShardableTmpl, "100 B", "10 B"))
+	})
+
+	t.Run("does not shard an aggregation that the config does not list", func(t *testing.T) {
+		err := exceedQuerierBytesRead(t, Config{})
+
+		require.ErrorContains(t, err, fmt.Sprintf(limErrQuerierTooManyBytesUnshardableTmpl, "100 B", "10 B"))
+	})
+}
+
+func Test_astMapper_TSDBShardingStrategyUsesContext(t *testing.T) {
+	type strategyContextKey struct{}
+
+	handler := queryrangebase.HandlerFunc(func(_ context.Context, req queryrangebase.Request) (queryrangebase.Response, error) {
+		switch req.(type) {
+		case *logproto.IndexStatsRequest:
+			return &IndexStatsResponse{
+				Response: &logproto.IndexStatsResponse{
+					Bytes: 100,
+				},
+			}, nil
+		case *LokiRequest:
+			return lokiResps[0], nil
+		default:
+			return nil, fmt.Errorf("request not supported: %T", req)
+		}
+	})
+
+	calls := 0
+	mware := newASTMapperware(
+		[]config.PeriodConfig{
+			{IndexType: types.IndexTypeTSDB},
+		},
+		testEngineOpts,
+		handler,
+		handler,
+		nil,
+		log.NewNopLogger(),
+		nilShardingMetrics,
+		Config{},
+		fakeLimits{
+			maxSeries:               math.MaxInt32,
+			maxQueryParallelism:     1,
+			tsdbMaxQueryParallelism: 1,
+			queryTimeout:            time.Minute,
+			tsdbShardingStrategy: func(ctx context.Context, userID string) string {
+				calls++
+				require.Equal(t, "strategy-context", ctx.Value(strategyContextKey{}))
+				require.Equal(t, "tenant-a", userID)
+				return logql.PowerOfTwoVersion.String()
+			},
+		},
+		0,
+	)
+
+	req := defaultReq()
+	req.Query = `{app="foo"}`
+	req.Plan = testutil.MustPlan(req.Query)
+	ctx := context.WithValue(context.Background(), strategyContextKey{}, "strategy-context")
+	ctx = user.InjectOrgID(ctx, "tenant-a")
+
+	_, err := mware.Do(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, 1, calls)
+}
+
+func Test_astMapper_ShardPlannedChunks(t *testing.T) {
+	for _, tc := range []struct {
+		desc            string
+		strategy        logql.ShardVersion
+		query           string
+		indexChunks     uint64
+		expectedPlanned int64
+		expectedScanned int64
+	}{
+		{
+			desc:            "power of two sharded query",
+			strategy:        logql.PowerOfTwoVersion,
+			query:           `{foo="bar"}`,
+			indexChunks:     40,
+			expectedPlanned: 40,
+			expectedScanned: 10, // 5 for each of the 2 shards
+		},
+		{
+			desc:            "power of two unshardable query",
+			strategy:        logql.PowerOfTwoVersion,
+			query:           `quantile_over_time(0.99, {foo="bar"} | unwrap foo [1h])`,
+			indexChunks:     40,
+			expectedPlanned: 40,
+			expectedScanned: 5,
+		},
+		{
+			desc:            "bounded sharded query",
+			strategy:        logql.BoundedVersion,
+			query:           `{foo="bar"}`,
+			indexChunks:     40,
+			expectedPlanned: 35, // 15 + 20 from the shards, the index stats aren't looked up
+			expectedScanned: 10,
+		},
+		{
+			desc:     "nothing planned",
+			strategy: logql.PowerOfTwoVersion,
+			query:    `quantile_over_time(0.99, {foo="bar"} | unwrap foo [1h])`,
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			queried := stats.Result{Querier: stats.Querier{Store: stats.Store{TotalChunksScanned: 5}}}
+			handler := queryrangebase.HandlerFunc(func(_ context.Context, req queryrangebase.Request) (queryrangebase.Response, error) {
+				switch r := req.(type) {
+				case *logproto.IndexStatsRequest:
+					return &IndexStatsResponse{Response: &logproto.IndexStatsResponse{Bytes: 1 << 40, Chunks: tc.indexChunks}}, nil
+				case *logproto.ShardsRequest:
+					return &ShardsResponse{Response: &logproto.ShardsResponse{Shards: []logproto.Shard{
+						{Bounds: logproto.FPBounds{Min: 0, Max: math.MaxUint64 / 2}, Stats: &logproto.IndexStatsResponse{Chunks: 15}},
+						{Bounds: logproto.FPBounds{Min: math.MaxUint64/2 + 1, Max: math.MaxUint64}, Stats: &logproto.IndexStatsResponse{Chunks: 20}},
+					}}}, nil
+				case *LokiRequest:
+					if _, ok := r.Plan.AST.(syntax.SampleExpr); ok {
+						return &LokiPromResponse{
+							Response: &queryrangebase.PrometheusResponse{
+								Status: loghttp.QueryStatusSuccess,
+								Data:   queryrangebase.PrometheusData{ResultType: loghttp.ResultTypeMatrix},
+							},
+							Statistics: queried,
+						}, nil
+					}
+					return &LokiResponse{
+						Status:     loghttp.QueryStatusSuccess,
+						Direction:  r.Direction,
+						Limit:      r.Limit,
+						Version:    1,
+						Data:       LokiData{ResultType: loghttp.ResultTypeStream},
+						Statistics: queried,
+					}, nil
+				default:
+					return nil, fmt.Errorf("request not supported: %T", req)
+				}
+			})
+
+			mware := newASTMapperware(
+				[]config.PeriodConfig{
+					{IndexType: types.IndexTypeTSDB},
+				},
+				testEngineOpts,
+				handler,
+				handler,
+				nil,
+				log.NewNopLogger(),
+				nilShardingMetrics,
+				Config{},
+				fakeLimits{
+					maxSeries:               math.MaxInt32,
+					maxQueryParallelism:     1,
+					tsdbMaxQueryParallelism: 1,
+					queryTimeout:            time.Minute,
+					tsdbShardingStrategy: func(context.Context, string) string {
+						return tc.strategy.String()
+					},
+				},
+				2,
+			)
+
+			req := defaultReq()
+			req.Query = tc.query
+			req.Plan = testutil.MustPlan(tc.query)
+			resp, err := mware.Do(user.InjectOrgID(context.Background(), "1"), req)
+			require.NoError(t, err)
+
+			var idx stats.Index
+			switch resp := resp.(type) {
+			case *LokiResponse:
+				idx = resp.Statistics.Index
+			case *LokiPromResponse:
+				idx = resp.Statistics.Index
+			default:
+				t.Fatalf("unexpected response type %T", resp)
+			}
+			require.Equal(t, tc.expectedPlanned, idx.ShardPlannedChunks)
+			require.Equal(t, tc.expectedScanned, idx.ShardPlannedChunksScanned)
+		})
+	}
+}
+
 func Test_ShardingByPass(t *testing.T) {
 	called := 0
-	handler := queryrange.HandlerFunc(func(ctx context.Context, req queryrange.Request) (queryrange.Response, error) {
+	handler := queryrangebase.HandlerFunc(func(_ context.Context, _ queryrangebase.Request) (queryrangebase.Response, error) {
 		called++
 		return nil, nil
 	})
 
 	mware := newASTMapperware(
-		ShardingConfigs{
-			chunk.PeriodConfig{
-				RowShards: 2,
-			},
+		[]config.PeriodConfig{
+			{IndexType: types.IndexTypeTSDB},
 		},
+		testEngineOpts,
 		handler,
+		handler,
+		nil,
 		log.NewNopLogger(),
 		nilShardingMetrics,
-		fakeLimits{maxSeries: math.MaxInt32},
+		Config{},
+		fakeLimits{maxSeries: math.MaxInt32, maxQueryParallelism: 1, tsdbMaxQueryParallelism: 1},
+		0,
 	)
 
-	_, err := mware.Do(context.Background(), defaultReq().WithQuery(`1+1`))
+	req := defaultReq()
+	req.Query = `1+1`
+	req.Plan = testutil.MustPlan(req.Query)
+
+	_, err := mware.Do(user.InjectOrgID(context.Background(), "1"), req)
 	require.Nil(t, err)
 	require.Equal(t, called, 1)
 }
 
-func Test_hasShards(t *testing.T) {
-	for i, tc := range []struct {
-		input    ShardingConfigs
-		expected bool
-	}{
-		{
-			input: ShardingConfigs{
-				{},
-			},
-			expected: false,
-		},
-		{
-			input: ShardingConfigs{
-				{RowShards: 16},
-			},
-			expected: true,
-		},
-		{
-			input: ShardingConfigs{
-				{},
-				{RowShards: 16},
-				{},
-			},
-			expected: true,
-		},
-		{
-			input:    nil,
-			expected: false,
-		},
-	} {
-		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			require.Equal(t, tc.expected, hasShards(tc.input))
-		})
-	}
-}
-
 // astmapper successful stream & prom conversion
 
-func mockHandler(resp queryrange.Response, err error) queryrange.Handler {
-	return queryrange.HandlerFunc(func(ctx context.Context, req queryrange.Request) (queryrange.Response, error) {
+func mockHandler(resp queryrangebase.Response, err error) queryrangebase.Handler {
+	return queryrangebase.HandlerFunc(func(ctx context.Context, _ queryrangebase.Request) (queryrangebase.Response, error) {
 		if expired := ctx.Err(); expired != nil {
 			return nil, expired
 		}
@@ -248,28 +610,43 @@ func Test_InstantSharding(t *testing.T) {
 	called := 0
 	shards := []string{}
 
-	sharding := NewQueryShardMiddleware(log.NewNopLogger(), ShardingConfigs{
-		chunk.PeriodConfig{
-			RowShards: 3,
-		},
-	}, queryrange.NewInstrumentMiddlewareMetrics(nil),
+	// TSDB is the only index type; sharding is resolved dynamically from index
+	// stats. Return a large byte count and cap the factor via maxShards so the
+	// query deterministically shards into 3.
+	statsHandler := queryrangebase.HandlerFunc(func(_ context.Context, _ queryrangebase.Request) (queryrangebase.Response, error) {
+		return &IndexStatsResponse{
+			Response: &logproto.IndexStatsResponse{Bytes: 1 << 40},
+		}, nil
+	})
+
+	cpyPeriodConf := testSchemasTSDB[0]
+	sharding := NewQueryShardMiddleware(log.NewNopLogger(), []config.PeriodConfig{
+		cpyPeriodConf,
+	}, testEngineOpts, queryrangebase.NewInstrumentMiddlewareMetrics(nil, constants.Loki),
 		nilShardingMetrics,
+		Config{},
 		fakeLimits{
-			maxSeries:           math.MaxInt32,
-			maxQueryParallelism: 10,
-		})
-	response, err := sharding.Wrap(queryrange.HandlerFunc(func(c context.Context, r queryrange.Request) (queryrange.Response, error) {
+			maxSeries:               math.MaxInt32,
+			maxQueryParallelism:     10,
+			tsdbMaxQueryParallelism: 10,
+			queryTimeout:            time.Second,
+		},
+		3,
+		statsHandler,
+		nil,
+	)
+	response, err := sharding.Wrap(queryrangebase.HandlerFunc(func(_ context.Context, r queryrangebase.Request) (queryrangebase.Response, error) {
 		lock.Lock()
 		defer lock.Unlock()
 		called++
 		shards = append(shards, r.(*LokiInstantRequest).Shards...)
-		return &LokiPromResponse{Response: &queryrange.PrometheusResponse{
-			Data: queryrange.PrometheusData{
+		return &LokiPromResponse{Response: &queryrangebase.PrometheusResponse{
+			Data: queryrangebase.PrometheusData{
 				ResultType: loghttp.ResultTypeVector,
-				Result: []queryrange.SampleStream{
+				Result: []queryrangebase.SampleStream{
 					{
-						Labels:  []cortexpb.LabelAdapter{{Name: "foo", Value: "bar"}},
-						Samples: []cortexpb.Sample{{Value: 10, TimestampMs: 10}},
+						Labels:  []logproto.LabelAdapter{{Name: "foo", Value: "bar"}},
+						Samples: []logproto.LegacySample{{Value: 10, TimestampMs: 10}},
 					},
 				},
 			},
@@ -278,25 +655,26 @@ func Test_InstantSharding(t *testing.T) {
 		Query:  `rate({app="foo"}[1m])`,
 		TimeTs: util.TimeFromMillis(10),
 		Path:   "/v1/query",
+		Plan:   testutil.MustPlan(`rate({app="foo"}[1m])`),
 	})
 	require.NoError(t, err)
 	require.Equal(t, 3, called, "expected 3 calls but got {}", called)
 	require.Len(t, response.(*LokiPromResponse).Response.Data.Result, 3)
 	require.ElementsMatch(t, []string{"0_of_3", "1_of_3", "2_of_3"}, shards)
-	require.Equal(t, queryrange.PrometheusData{
+	require.Equal(t, queryrangebase.PrometheusData{
 		ResultType: loghttp.ResultTypeVector,
-		Result: []queryrange.SampleStream{
+		Result: []queryrangebase.SampleStream{
 			{
-				Labels:  []cortexpb.LabelAdapter{{Name: "foo", Value: "bar"}},
-				Samples: []cortexpb.Sample{{Value: 10, TimestampMs: 10}},
+				Labels:  []logproto.LabelAdapter{{Name: "foo", Value: "bar"}},
+				Samples: []logproto.LegacySample{{Value: 10, TimestampMs: 10}},
 			},
 			{
-				Labels:  []cortexpb.LabelAdapter{{Name: "foo", Value: "bar"}},
-				Samples: []cortexpb.Sample{{Value: 10, TimestampMs: 10}},
+				Labels:  []logproto.LabelAdapter{{Name: "foo", Value: "bar"}},
+				Samples: []logproto.LegacySample{{Value: 10, TimestampMs: 10}},
 			},
 			{
-				Labels:  []cortexpb.LabelAdapter{{Name: "foo", Value: "bar"}},
-				Samples: []cortexpb.Sample{{Value: 10, TimestampMs: 10}},
+				Labels:  []logproto.LabelAdapter{{Name: "foo", Value: "bar"}},
+				Samples: []logproto.LegacySample{{Value: 10, TimestampMs: 10}},
 			},
 		},
 	}, response.(*LokiPromResponse).Response.Data)
@@ -304,21 +682,22 @@ func Test_InstantSharding(t *testing.T) {
 }
 
 func Test_SeriesShardingHandler(t *testing.T) {
-	sharding := NewSeriesQueryShardMiddleware(log.NewNopLogger(), ShardingConfigs{
-		chunk.PeriodConfig{
-			RowShards: 3,
+	sharding := NewSeriesQueryShardMiddleware(log.NewNopLogger(), []config.PeriodConfig{
+		{
+			IndexType: types.IndexTypeTSDB,
 		},
 	},
-		queryrange.NewInstrumentMiddlewareMetrics(nil),
+		queryrangebase.NewInstrumentMiddlewareMetrics(nil, constants.Loki),
 		nilShardingMetrics,
 		fakeLimits{
-			maxQueryParallelism: 10,
+			maxQueryParallelism:     10,
+			tsdbMaxQueryParallelism: 10,
 		},
-		LokiCodec,
+		DefaultCodec,
 	)
 	ctx := user.InjectOrgID(context.Background(), "1")
 
-	response, err := sharding.Wrap(queryrange.HandlerFunc(func(c context.Context, r queryrange.Request) (queryrange.Response, error) {
+	response, err := sharding.Wrap(queryrangebase.HandlerFunc(func(_ context.Context, r queryrangebase.Request) (queryrangebase.Response, error) {
 		req, ok := r.(*LokiSeriesRequest)
 		if !ok {
 			return nil, errors.New("not a series call")
@@ -328,13 +707,13 @@ func Test_SeriesShardingHandler(t *testing.T) {
 			Version: 1,
 			Data: []logproto.SeriesIdentifier{
 				{
-					Labels: map[string]string{
-						"foo": "bar",
+					Labels: []logproto.SeriesIdentifier_LabelsEntry{
+						{Key: "foo", Value: "bar"},
 					},
 				},
 				{
-					Labels: map[string]string{
-						"shard": req.Shards[0],
+					Labels: []logproto.SeriesIdentifier_LabelsEntry{
+						{Key: "shard", Value: req.Shards[0]},
 					},
 				},
 			},
@@ -346,39 +725,347 @@ func Test_SeriesShardingHandler(t *testing.T) {
 		Path:    "foo",
 	})
 
-	expected := &LokiSeriesResponse{
-		Status:  "success",
-		Version: 1,
-		Data: []logproto.SeriesIdentifier{
-			{
-				Labels: map[string]string{
-					"foo": "bar",
-				},
-			},
-			{
-				Labels: map[string]string{
-					"shard": "0_of_3",
-				},
-			},
-			{
-				Labels: map[string]string{
-					"shard": "1_of_3",
-				},
-			},
-			{
-				Labels: map[string]string{
-					"shard": "2_of_3",
-				},
+	// Series queries fan out into config.DefaultRowShards shards.
+	expectedData := []logproto.SeriesIdentifier{
+		{
+			Labels: []logproto.SeriesIdentifier_LabelsEntry{
+				{Key: "foo", Value: "bar"},
 			},
 		},
 	}
-	sort.Slice(expected.Data, func(i, j int) bool {
-		return expected.Data[i].Labels["shard"] > expected.Data[j].Labels["shard"]
-	})
+	for i := 0; i < config.DefaultRowShards; i++ {
+		expectedData = append(expectedData, logproto.SeriesIdentifier{
+			Labels: []logproto.SeriesIdentifier_LabelsEntry{
+				{Key: "shard", Value: fmt.Sprintf("%d_of_%d", i, config.DefaultRowShards)},
+			},
+		})
+	}
+
 	actual := response.(*LokiSeriesResponse)
-	sort.Slice(actual.Data, func(i, j int) bool {
-		return actual.Data[i].Labels["shard"] > actual.Data[j].Labels["shard"]
-	})
 	require.NoError(t, err)
-	require.Equal(t, expected, actual)
+	require.Equal(t, "success", actual.Status)
+	require.ElementsMatch(t, expectedData, actual.Data)
+}
+
+func TestShardingAcrossConfigs_ASTMapper(t *testing.T) {
+	now := model.Now()
+	confs := []config.PeriodConfig{
+		{
+			From:      config.DayTime{Time: now.Add(-30 * 24 * time.Hour)},
+			IndexType: types.IndexTypeTSDB,
+		},
+		{
+			From:      config.DayTime{Time: now.Add(-24 * time.Hour)},
+			IndexType: types.IndexTypeTSDB,
+		},
+	}
+
+	for _, tc := range []struct {
+		name              string
+		req               queryrangebase.Request
+		resp              queryrangebase.Response
+		numExpectedShards int
+	}{
+		{
+			name: "logs query touching just the active schema config",
+			req:  defaultReq().WithStartEnd(now.Add(-time.Hour).Time(), now.Time()).WithQuery(`{foo="bar"}`),
+			resp: &LokiResponse{
+				Status: loghttp.QueryStatusSuccess,
+				Headers: []definitions.PrometheusResponseHeader{
+					{Name: "Header", Values: []string{"value"}},
+				},
+			},
+			numExpectedShards: 2,
+		},
+		{
+			name: "logs query touching just the prev schema config",
+			req:  defaultReq().WithStartEnd(confs[0].From.Time.Time(), confs[0].From.Time.Add(time.Hour).Time()).WithQuery(`{foo="bar"}`),
+			resp: &LokiResponse{
+				Status: loghttp.QueryStatusSuccess,
+				Headers: []definitions.PrometheusResponseHeader{
+					{Name: "Header", Values: []string{"value"}},
+				},
+			},
+			numExpectedShards: 2,
+		},
+		{
+			name: "metric query touching just the active schema config",
+			req:  defaultReq().WithStartEnd(confs[1].From.Time.Add(5*time.Minute).Time(), confs[1].From.Time.Add(time.Hour).Time()).WithQuery(`rate({foo="bar"}[1m])`),
+			resp: &LokiPromResponse{
+				Response: &queryrangebase.PrometheusResponse{
+					Status: loghttp.QueryStatusSuccess,
+					Data: queryrangebase.PrometheusData{
+						ResultType: "",
+						Result:     []queryrangebase.SampleStream{},
+					},
+					Headers: []*definitions.PrometheusResponseHeader{
+						{Name: "Header", Values: []string{"value"}},
+					},
+				},
+			},
+			numExpectedShards: 2,
+		},
+		{
+			name: "metric query touching just the prev schema config",
+			req:  defaultReq().WithStartEnd(confs[0].From.Time.Add(time.Hour).Time(), confs[0].From.Time.Add(2*time.Hour).Time()).WithQuery(`rate({foo="bar"}[1m])`),
+			resp: &LokiPromResponse{
+				Response: &queryrangebase.PrometheusResponse{
+					Status: loghttp.QueryStatusSuccess,
+					Data: queryrangebase.PrometheusData{
+						ResultType: "",
+						Result:     []queryrangebase.SampleStream{},
+					},
+					Headers: []*definitions.PrometheusResponseHeader{
+						{Name: "Header", Values: []string{"value"}},
+					},
+				},
+			},
+			numExpectedShards: 2,
+		},
+		{
+			name: "logs query covering both schemas",
+			req:  defaultReq().WithStartEnd(confs[0].From.Time.Time(), now.Time()).WithQuery(`{foo="bar"}`),
+			resp: &LokiResponse{
+				Status: loghttp.QueryStatusSuccess,
+				Headers: []definitions.PrometheusResponseHeader{
+					{Name: "Header", Values: []string{"value"}},
+				},
+			},
+			numExpectedShards: 2,
+		},
+		{
+			name: "metric query covering both schemas",
+			req:  defaultReq().WithStartEnd(confs[0].From.Time.Time(), now.Time()).WithQuery(`rate({foo="bar"}[1m])`),
+			resp: &LokiPromResponse{
+				Response: &queryrangebase.PrometheusResponse{
+					Status: loghttp.QueryStatusSuccess,
+					Data: queryrangebase.PrometheusData{
+						ResultType: "",
+						Result:     []queryrangebase.SampleStream{},
+					},
+					Headers: []*definitions.PrometheusResponseHeader{
+						{Name: "Header", Values: []string{"value"}},
+					},
+				},
+			},
+			numExpectedShards: 2,
+		},
+		{
+			name: "metric query with start/end within first schema but with large enough range to cover previous schema too",
+			req:  defaultReq().WithStartEnd(confs[1].From.Time.Add(5*time.Minute).Time(), confs[1].From.Time.Add(time.Hour).Time()).WithQuery(`rate({foo="bar"}[30m])`),
+			resp: &LokiPromResponse{
+				Response: &queryrangebase.PrometheusResponse{
+					Status: loghttp.QueryStatusSuccess,
+					Data: queryrangebase.PrometheusData{
+						ResultType: "",
+						Result:     []queryrangebase.SampleStream{},
+					},
+					Headers: []*definitions.PrometheusResponseHeader{
+						{Name: "Header", Values: []string{"value"}},
+					},
+				},
+			},
+			numExpectedShards: 2,
+		},
+		{
+			name: "metric query with start/end within first schema but with large enough offset to shift it to previous schema",
+			req:  defaultReq().WithStartEnd(confs[1].From.Time.Add(5*time.Minute).Time(), now.Time()).WithQuery(`rate({foo="bar"}[1m] offset 12h)`),
+			resp: &LokiPromResponse{
+				Response: &queryrangebase.PrometheusResponse{
+					Status: loghttp.QueryStatusSuccess,
+					Data: queryrangebase.PrometheusData{
+						ResultType: "",
+						Result:     []queryrangebase.SampleStream{},
+					},
+					Headers: []*definitions.PrometheusResponseHeader{
+						{Name: "Header", Values: []string{"value"}},
+					},
+				},
+			},
+			numExpectedShards: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var lock sync.Mutex
+			called := 0
+
+			handler := queryrangebase.HandlerFunc(func(_ context.Context, _ queryrangebase.Request) (queryrangebase.Response, error) {
+				lock.Lock()
+				defer lock.Unlock()
+				called++
+				return tc.resp, nil
+			})
+
+			// TSDB is the only index type; sharding is resolved dynamically from
+			// index stats. Return a large byte count and cap the factor via
+			// maxShards so all queries deterministically shard into 2.
+			statsHandler := queryrangebase.HandlerFunc(func(_ context.Context, _ queryrangebase.Request) (queryrangebase.Response, error) {
+				return &IndexStatsResponse{
+					Response: &logproto.IndexStatsResponse{Bytes: 1 << 40},
+				}, nil
+			})
+
+			mware := newASTMapperware(
+				confs,
+				testEngineOpts,
+				handler,
+				handler,
+				statsHandler,
+				log.NewNopLogger(),
+				nilShardingMetrics,
+				Config{},
+				fakeLimits{maxSeries: math.MaxInt32, maxQueryParallelism: 1, tsdbMaxQueryParallelism: 1, queryTimeout: time.Second},
+				2,
+			)
+
+			// currently all the tests call `defaultReq()` which creates an instance of the type LokiRequest
+			// if in the future that isn't true, we need another way to access the Plan field of an arbitrary query type
+			// or we should set the Plan in calls to `GetExpression` if the Plan is nil by calling `ParseExpr` or similar
+			tc.req.(*LokiRequest).Plan = &plan.QueryPlan{
+				AST: syntax.MustParseExpr(tc.req.GetQuery()),
+			}
+
+			resp, err := mware.Do(user.InjectOrgID(context.Background(), "1"), tc.req)
+			require.Nil(t, err)
+
+			require.Equal(t, []*definitions.PrometheusResponseHeader{
+				{Name: "Header", Values: []string{"value"}},
+			}, resp.GetHeaders())
+
+			require.Equal(t, tc.numExpectedShards, called)
+		})
+	}
+}
+
+func TestShardingAcrossConfigs_SeriesSharding(t *testing.T) {
+	now := model.Now()
+	confs := []config.PeriodConfig{
+		{
+			From:      config.DayTime{Time: now.Add(-30 * 24 * time.Hour)},
+			IndexType: types.IndexTypeTSDB,
+		},
+		{
+			From:      config.DayTime{Time: now.Add(-24 * time.Hour)},
+			IndexType: types.IndexTypeTSDB,
+		},
+	}
+
+	for _, tc := range []struct {
+		name              string
+		req               *LokiSeriesRequest
+		numExpectedShards int
+	}{
+		{
+			name: "series query touching just the active schema config",
+			req: &LokiSeriesRequest{
+				Match:   []string{"foo", "bar"},
+				StartTs: confs[1].From.Time.Add(5 * time.Minute).Time(),
+				EndTs:   now.Time(),
+				Path:    "foo",
+			},
+			numExpectedShards: 16,
+		},
+		{
+			name: "series query touching just the prev schema config",
+			req: &LokiSeriesRequest{
+				Match:   []string{"foo", "bar"},
+				StartTs: confs[0].From.Time.Time(),
+				EndTs:   confs[0].From.Time.Add(time.Hour).Time(),
+				Path:    "foo",
+			},
+			numExpectedShards: 16,
+		},
+		{
+			name: "series query covering both schemas",
+			req: &LokiSeriesRequest{
+				Match:   []string{"foo", "bar"},
+				StartTs: confs[0].From.Time.Time(),
+				EndTs:   now.Time(),
+				Path:    "foo",
+			}, numExpectedShards: 16,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := user.InjectOrgID(context.Background(), "1")
+			var lock sync.Mutex
+			called := 0
+
+			mware := NewSeriesQueryShardMiddleware(
+				log.NewNopLogger(),
+				confs,
+				queryrangebase.NewInstrumentMiddlewareMetrics(nil, constants.Loki),
+				nilShardingMetrics,
+				fakeLimits{
+					maxQueryParallelism:     10,
+					tsdbMaxQueryParallelism: 10,
+				},
+				DefaultCodec,
+			)
+
+			_, err := mware.Wrap(queryrangebase.HandlerFunc(func(_ context.Context, r queryrangebase.Request) (queryrangebase.Response, error) {
+				_, ok := r.(*LokiSeriesRequest)
+				if !ok {
+					return nil, errors.New("not a series call")
+				}
+				lock.Lock()
+				defer lock.Unlock()
+				called++
+				return &LokiSeriesResponse{
+					Status:  "success",
+					Version: 1,
+					Data:    []logproto.SeriesIdentifier{},
+				}, nil
+			})).Do(ctx, tc.req)
+			require.NoError(t, err)
+
+			require.Equal(t, tc.numExpectedShards, called)
+		})
+	}
+}
+
+func Test_ASTMapper_MaxLookBackPeriod(t *testing.T) {
+	engineOpts := testEngineOpts
+	engineOpts.MaxLookBackPeriod = 1 * time.Hour
+
+	queryHandler := queryrangebase.HandlerFunc(func(_ context.Context, _ queryrangebase.Request) (queryrangebase.Response, error) {
+		return &LokiResponse{}, nil
+	})
+
+	statsHandler := queryrangebase.HandlerFunc(func(_ context.Context, req queryrangebase.Request) (queryrangebase.Response, error) {
+		// This is the actual check that we're testing.
+		require.Equal(t, testTime.Add(-engineOpts.MaxLookBackPeriod).UnixMilli(), req.GetStart().UnixMilli())
+
+		return &IndexStatsResponse{
+			Response: &logproto.IndexStatsResponse{
+				Bytes: 1 << 10,
+			},
+		}, nil
+	})
+
+	mware := newASTMapperware(
+		testSchemasTSDB,
+		engineOpts,
+		queryHandler,
+		queryHandler,
+		statsHandler,
+		log.NewNopLogger(),
+		nilShardingMetrics,
+		Config{},
+		fakeLimits{maxSeries: math.MaxInt32, tsdbMaxQueryParallelism: 1, queryTimeout: time.Second},
+		0,
+	)
+
+	q := `{cluster="dev-us-central-0"}`
+	lokiReq := &LokiInstantRequest{
+		Query:     q,
+		Limit:     1000,
+		TimeTs:    testTime,
+		Direction: logproto.FORWARD,
+		Path:      "/loki/api/v1/query",
+		Plan:      testutil.MustPlan(q),
+	}
+
+	ctx := user.InjectOrgID(context.Background(), "foo")
+	_, err := mware.Do(ctx, lokiReq)
+	require.NoError(t, err)
 }

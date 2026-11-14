@@ -71,3 +71,12 @@ convergence rate.
 
 For details on all of these extensions, please read our paper "[Lifeguard : SWIM-ing with Situational Awareness](https://arxiv.org/abs/1707.00788)", along with the memberlist source.  We welcome any questions related
 to the protocol on our issue tracker.
+
+## Metrics Emission
+
+This library emits metrics using `github.com/hashicorp/go-metrics`.
+
+Applications should configure the global `hashicorp/go-metrics` sink they want
+memberlist metrics to use. Memberlist no longer routes metrics through
+`github.com/armon/go-metrics` or the `github.com/hashicorp/go-metrics/compat`
+build-tag bridge.

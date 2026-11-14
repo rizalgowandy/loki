@@ -6,23 +6,30 @@ package instance
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util/test"
+	"net/url"
+
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	common_config "github.com/prometheus/common/config"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/wlog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/grafana/loki/v3/pkg/util/test"
 )
 
 func TestConfig_Unmarshal_Defaults(t *testing.T) {
@@ -164,9 +171,7 @@ func TestRemoteWriteMetricInterceptor_AllValues(t *testing.T) {
 // instance of the WAL storage and testing that samples get written to it.
 // This test touches most of Instance and is enough for a basic integration test.
 func TestInstance(t *testing.T) {
-	walDir, err := ioutil.TempDir(os.TempDir(), "wal")
-	require.NoError(t, err)
-	defer os.RemoveAll(walDir)
+	walDir := t.TempDir()
 
 	mockStorage := mockWalStorage{
 		series:    make(map[storage.SeriesRef]int),
@@ -193,14 +198,38 @@ func TestInstance(t *testing.T) {
 
 	count := 3
 	for i := 0; i < count; i++ {
-		_, err := app.Append(0, labels.Labels{
-			labels.Label{Name: "__name__", Value: "test"},
-			labels.Label{Name: "iter", Value: fmt.Sprintf("%v", i)},
-		}, refTime-int64(i), float64(i))
+		_, err := app.Append(0, labels.FromStrings("__name__", "test", "iter", fmt.Sprintf("%v", i)), refTime-int64(i), float64(i))
 
 		require.NoError(t, err)
 	}
 	assert.Len(t, mockStorage.series, count)
+
+	require.NotPanics(t, func() {
+		sendInterval := 100 * time.Millisecond
+		cfg.RemoteWrite = []*config.RemoteWriteConfig{
+			{
+				Name: "write-test",
+				URL: &common_config.URL{
+					URL: &url.URL{
+						Scheme: "http",
+						Host:   "localhost:8080",
+						Path:   "/write",
+					},
+				},
+				RemoteTimeout: config.DefaultRemoteWriteConfig.RemoteTimeout,
+				QueueConfig:   config.DefaultRemoteWriteConfig.QueueConfig,
+				MetadataConfig: config.MetadataConfig{
+					Send:              true,
+					MaxSamplesPerSend: 1,
+					SendInterval:      model.Duration(sendInterval),
+				},
+			},
+		}
+		err = inst.Update(cfg)
+		assert.NoError(t, err)
+		// Wait enough time for the metrics send interval to kick in.
+		time.Sleep(2 * sendInterval)
+	})
 }
 
 type mockWalStorage struct {
@@ -214,13 +243,36 @@ type mockWalStorage struct {
 
 func (s *mockWalStorage) Directory() string                          { return s.directory }
 func (s *mockWalStorage) StartTime() (int64, error)                  { return 0, nil }
-func (s *mockWalStorage) WriteStalenessMarkers(f func() int64) error { return nil }
+func (s *mockWalStorage) WriteStalenessMarkers(_ func() int64) error { return nil }
+func (s *mockWalStorage) SetWriteNotified(_ wlog.WriteNotified)      {}
 func (s *mockWalStorage) Close() error                               { return nil }
-func (s *mockWalStorage) Truncate(mint int64) error                  { return nil }
+func (s *mockWalStorage) Truncate(_ int64) error                     { return nil }
 
 func (s *mockWalStorage) Appender(context.Context) storage.Appender {
 	return &mockAppender{s: s}
 }
+
+func (s *mockWalStorage) AppenderV2(ctx context.Context) storage.AppenderV2 {
+	return &mockAppenderV2{inner: s.Appender(ctx)}
+}
+
+type mockAppenderV2 struct {
+	inner storage.Appender
+}
+
+func (a *mockAppenderV2) Append(ref storage.SeriesRef, ls labels.Labels, _, t int64, v float64, h *histogram.Histogram, fh *histogram.FloatHistogram, _ storage.AppendV2Options) (storage.SeriesRef, error) {
+	switch {
+	case fh != nil:
+		return a.inner.AppendHistogram(ref, ls, t, nil, fh)
+	case h != nil:
+		return a.inner.AppendHistogram(ref, ls, t, h, nil)
+	default:
+		return a.inner.Append(ref, ls, t, v)
+	}
+}
+
+func (a *mockAppenderV2) Commit() error   { return a.inner.Commit() }
+func (a *mockAppenderV2) Rollback() error { return a.inner.Rollback() }
 
 type mockAppender struct {
 	s *mockWalStorage
@@ -234,17 +286,17 @@ func (a *mockAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v
 }
 
 // Add adds a new series and sets its written count to 1.
-func (a *mockAppender) Add(l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
+func (a *mockAppender) Add(l labels.Labels, _ int64, _ float64) (storage.SeriesRef, error) {
 	a.s.mut.Lock()
 	defer a.s.mut.Unlock()
 
-	hash := l.Hash()
+	hash := labels.StableHash(l)
 	a.s.series[storage.SeriesRef(hash)] = 1
 	return storage.SeriesRef(hash), nil
 }
 
 // AddFast increments the number of writes to an existing series.
-func (a *mockAppender) AddFast(ref storage.SeriesRef, t int64, v float64) error {
+func (a *mockAppender) AddFast(ref storage.SeriesRef, _ int64, _ float64) error {
 	a.s.mut.Lock()
 	defer a.s.mut.Unlock()
 	_, ok := a.s.series[ref]
@@ -256,9 +308,35 @@ func (a *mockAppender) AddFast(ref storage.SeriesRef, t int64, v float64) error 
 	return nil
 }
 
-func (a *mockAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e exemplar.Exemplar) (storage.SeriesRef, error) {
+func (a *mockAppender) AppendExemplar(_ storage.SeriesRef, _ labels.Labels, _ exemplar.Exemplar) (storage.SeriesRef, error) {
 	return 0, nil
 }
+
+func (a *mockAppender) UpdateMetadata(_ storage.SeriesRef, _ labels.Labels, _ metadata.Metadata) (storage.SeriesRef, error) {
+	return 0, nil
+}
+
+func (a *mockAppender) AppendHistogram(_ storage.SeriesRef, _ labels.Labels, _ int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, nil
+}
+
+func (a *mockAppender) AppendHistogramCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, nil
+}
+
+func (a *mockAppender) AppendHistogramSTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, nil
+}
+
+func (a *mockAppender) AppendSTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64) (storage.SeriesRef, error) {
+	return 0, nil
+}
+
+func (a *mockAppender) AppendCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64) (storage.SeriesRef, error) {
+	return 0, nil
+}
+
+func (a *mockAppender) SetOptions(_ *storage.AppendOptions) {}
 
 func (a *mockAppender) Commit() error {
 	return nil

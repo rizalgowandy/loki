@@ -2,11 +2,9 @@ package stages
 
 import (
 	"fmt"
-	"reflect"
 	"time"
 
 	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
@@ -26,7 +24,7 @@ func validateLabelsConfig(c LabelsConfig) error {
 		return errors.New(ErrEmptyLabelStageConfig)
 	}
 	for labelName, labelSrc := range c {
-		if !model.LabelName(labelName).IsValid() {
+		if !model.LegacyValidation.IsValidLabelName(labelName) {
 			return fmt.Errorf(ErrInvalidLabelName, labelName)
 		}
 		// If no label source was specified, use the key name
@@ -62,24 +60,27 @@ type labelStage struct {
 }
 
 // Process implements Stage
-func (l *labelStage) Process(labels model.LabelSet, extracted map[string]interface{}, t *time.Time, entry *string) {
-	for lName, lSrc := range l.cfgs {
-		if lValue, ok := extracted[*lSrc]; ok {
+func (l *labelStage) Process(labels model.LabelSet, extracted map[string]interface{}, _ *time.Time, _ *string) {
+	processLabelsConfigs(extracted, l.cfgs, func(_, labelName model.LabelName, labelValue model.LabelValue) {
+		labels[labelName] = labelValue
+	})
+}
+
+type labelsConsumer func(source, labelName model.LabelName, labelValue model.LabelValue)
+
+func processLabelsConfigs(extracted map[string]interface{}, configs LabelsConfig, consumer labelsConsumer) {
+	for lName, lSrc := range configs {
+		source := *lSrc
+		if lValue, ok := extracted[source]; ok {
 			s, err := getString(lValue)
 			if err != nil {
-				if Debug {
-					level.Debug(l.logger).Log("msg", "failed to convert extracted label value to string", "err", err, "type", reflect.TypeOf(lValue))
-				}
 				continue
 			}
 			labelValue := model.LabelValue(s)
 			if !labelValue.IsValid() {
-				if Debug {
-					level.Debug(l.logger).Log("msg", "invalid label value parsed", "value", labelValue)
-				}
 				continue
 			}
-			labels[model.LabelName(lName)] = labelValue
+			consumer(model.LabelName(source), model.LabelName(lName), labelValue)
 		}
 	}
 }

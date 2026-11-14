@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 )
@@ -47,7 +46,7 @@ func Test_staticLabelStage_Process(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			st, err := newStaticLabelsStage(util_log.Logger, test.config)
+			st, err := newStaticLabelsStage(test.config)
 			if err != nil {
 				t.Fatal(err)
 			}

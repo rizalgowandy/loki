@@ -1,19 +1,19 @@
-FROM logstash:7.16.1
+FROM logstash:9.5.5@sha256:7c492dde0e3d68106a3ab23b717ef2bfd6fd138f61d7c43b9f95e17650341dae
 
 USER logstash
-ENV PATH /usr/share/logstash/vendor/jruby/bin:/usr/share/logstash/vendor/bundle/jruby/2.5.0/bin:/usr/share/logstash/jdk/bin:$PATH
+ENV PATH /usr/share/logstash/vendor/jruby/bin:/usr/share/logstash/vendor/bundle/jruby/3.1.0/bin:/usr/share/logstash/jdk/bin:$PATH
 ENV LOGSTASH_PATH /usr/share/logstash
-ENV GEM_PATH /usr/share/logstash/vendor/bundle/jruby/2.5.0
-ENV GEM_HOME /usr/share/logstash/vendor/bundle/jruby/2.5.0
+ENV GEM_PATH /usr/share/logstash/vendor/bundle/jruby/3.1.0
+ENV GEM_HOME /usr/share/logstash/vendor/bundle/jruby/3.1.0
 
-RUN gem install bundler:2.1.4
+RUN gem install bundler -v 2.6.9
 
 COPY --chown=logstash:logstash ./clients/cmd/logstash/ /home/logstash/
 WORKDIR /home/logstash/
 
+# don't run 'bundle update'. It causes a transitive dependency error
 RUN bundle config set --local path /usr/share/logstash/vendor/bundle && \
     bundle install && \
-    bundle update && \
     bundle exec rake vendor && \
     bundle exec rspec
 

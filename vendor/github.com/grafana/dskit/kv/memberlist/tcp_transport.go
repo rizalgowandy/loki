@@ -7,22 +7,22 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/hashicorp/go-sockaddr"
+	sockaddr "github.com/hashicorp/go-sockaddr"
 	"github.com/hashicorp/memberlist"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"go.uber.org/atomic"
 
 	dstls "github.com/grafana/dskit/crypto/tls"
 	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/netutil"
 )
 
 type messageType uint8
@@ -34,10 +34,11 @@ const (
 )
 
 const zeroZeroZeroZero = "0.0.0.0"
+const colonColon = "::"
 
 // TCPTransportConfig is a configuration structure for creating new TCPTransport.
 type TCPTransportConfig struct {
-	// BindAddrs is a list of addresses to bind to.
+	// BindAddrs is a list of IP addresses to bind to.
 	BindAddrs flagext.StringSlice `yaml:"bind_addr"`
 
 	// BindPort is the port to listen on, for each address above.
@@ -45,33 +46,49 @@ type TCPTransportConfig struct {
 
 	// Timeout used when making connections to other nodes to send packet.
 	// Zero = no timeout
-	PacketDialTimeout time.Duration `yaml:"packet_dial_timeout"`
+	PacketDialTimeout time.Duration `yaml:"packet_dial_timeout" category:"advanced"`
 
 	// Timeout for writing packet data. Zero = no timeout.
-	PacketWriteTimeout time.Duration `yaml:"packet_write_timeout"`
+	PacketWriteTimeout time.Duration `yaml:"packet_write_timeout" category:"advanced"`
 
-	// Transport logs lot of messages at debug level, so it deserves an extra flag for turning it on
-	TransportDebug bool `yaml:"-"`
+	// Maximum number of concurrent writes to other nodes.
+	MaxConcurrentWrites int `yaml:"max_concurrent_writes" category:"advanced"`
+
+	// Timeout for acquiring one of the concurrent write slots.
+	AcquireWriterTimeout time.Duration `yaml:"acquire_writer_timeout" category:"advanced"`
+
+	// Transport logs lots of messages at debug level, so it deserves an extra flag for turning it on
+	TransportDebug bool `yaml:"-" category:"advanced"`
 
 	// Where to put custom metrics. nil = don't register.
-	MetricsRegisterer prometheus.Registerer `yaml:"-"`
-	MetricsNamespace  string                `yaml:"-"`
+	MetricsNamespace string `yaml:"-"`
 
-	TLSEnabled bool               `yaml:"tls_enabled"`
+	TLSEnabled bool               `yaml:"tls_enabled" category:"advanced"`
 	TLS        dstls.ClientConfig `yaml:",inline"`
 }
 
-// RegisterFlags registers flags.
-func (cfg *TCPTransportConfig) RegisterFlags(f *flag.FlagSet, prefix string) {
+func (cfg *TCPTransportConfig) RegisterFlags(f *flag.FlagSet) {
+	cfg.RegisterFlagsWithPrefix(f, "")
+}
+
+// RegisterFlagsWithPrefix registers flags with prefix.
+func (cfg *TCPTransportConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	// "Defaults to hostname" -- memberlist sets it to hostname by default.
 	f.Var(&cfg.BindAddrs, prefix+"memberlist.bind-addr", "IP address to listen on for gossip messages. Multiple addresses may be specified. Defaults to 0.0.0.0")
 	f.IntVar(&cfg.BindPort, prefix+"memberlist.bind-port", 7946, "Port to listen on for gossip messages.")
-	f.DurationVar(&cfg.PacketDialTimeout, prefix+"memberlist.packet-dial-timeout", 5*time.Second, "Timeout used when connecting to other nodes to send packet.")
+	f.DurationVar(&cfg.PacketDialTimeout, prefix+"memberlist.packet-dial-timeout", 2*time.Second, "Timeout used when connecting to other nodes to send packet.")
 	f.DurationVar(&cfg.PacketWriteTimeout, prefix+"memberlist.packet-write-timeout", 5*time.Second, "Timeout for writing 'packet' data.")
+	f.IntVar(&cfg.MaxConcurrentWrites, prefix+"memberlist.max-concurrent-writes", 3, "Maximum number of concurrent writes to other nodes.")
+	f.DurationVar(&cfg.AcquireWriterTimeout, prefix+"memberlist.acquire-writer-timeout", 250*time.Millisecond, "Timeout for acquiring one of the concurrent write slots. After this time, the message will be dropped.")
 	f.BoolVar(&cfg.TransportDebug, prefix+"memberlist.transport-debug", false, "Log debug transport messages. Note: global log.level must be at debug level as well.")
 
 	f.BoolVar(&cfg.TLSEnabled, prefix+"memberlist.tls-enabled", false, "Enable TLS on the memberlist transport layer.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"memberlist", f)
+}
+
+type writeRequest struct {
+	b    []byte
+	addr string
 }
 
 // TCPTransport is a memberlist.Transport implementation that uses TCP for both packet and stream
@@ -86,7 +103,11 @@ type TCPTransport struct {
 	tcpListeners []net.Listener
 	tlsConfig    *tls.Config
 
-	shutdown atomic.Int32
+	shutdownMu sync.RWMutex
+	shutdown   bool
+	writeCh    chan writeRequest // this channel is protected by shutdownMu
+
+	writeWG sync.WaitGroup
 
 	advertiseMu   sync.RWMutex
 	advertiseAddr string
@@ -102,23 +123,37 @@ type TCPTransport struct {
 	sentPackets           prometheus.Counter
 	sentPacketsBytes      prometheus.Counter
 	sentPacketsErrors     prometheus.Counter
+	droppedPackets        prometheus.Counter
 	unknownConnections    prometheus.Counter
+
+	sentBytes     prometheus.Counter
+	receivedBytes prometheus.Counter
 }
 
 // NewTCPTransport returns a new tcp-based transport with the given configuration. On
 // success all the network listeners will be created and listening.
-func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTransport, error) {
+func NewTCPTransport(config TCPTransportConfig, logger log.Logger, registerer prometheus.Registerer) (*TCPTransport, error) {
 	if len(config.BindAddrs) == 0 {
 		config.BindAddrs = []string{zeroZeroZeroZero}
 	}
 
 	// Build out the new transport.
 	var ok bool
+	concurrentWrites := config.MaxConcurrentWrites
+	if concurrentWrites <= 0 {
+		concurrentWrites = 1
+	}
 	t := TCPTransport{
 		cfg:      config,
-		logger:   logger,
+		logger:   log.With(logger, "component", "memberlist TCPTransport"),
 		packetCh: make(chan *memberlist.Packet),
 		connCh:   make(chan net.Conn),
+		writeCh:  make(chan writeRequest),
+	}
+
+	for i := 0; i < concurrentWrites; i++ {
+		t.writeWG.Add(1)
+		go t.writeWorker()
 	}
 
 	var err error
@@ -129,7 +164,7 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 		}
 	}
 
-	t.registerMetrics(config.MetricsRegisterer)
+	t.registerMetrics(registerer)
 
 	// Clean up listeners if there's an error.
 	defer func() {
@@ -142,6 +177,9 @@ func NewTCPTransport(config TCPTransportConfig, logger log.Logger) (*TCPTranspor
 	port := config.BindPort
 	for _, addr := range config.BindAddrs {
 		ip := net.ParseIP(addr)
+		if ip == nil {
+			return nil, fmt.Errorf("could not parse bind addr %q as IP address", addr)
+		}
 
 		tcpAddr := &net.TCPAddr{IP: ip, Port: port}
 
@@ -197,7 +235,10 @@ func (t *TCPTransport) tcpListen(tcpLn net.Listener) {
 	for {
 		conn, err := tcpLn.Accept()
 		if err != nil {
-			if s := t.shutdown.Load(); s == 1 {
+			t.shutdownMu.RLock()
+			isShuttingDown := t.shutdown
+			t.shutdownMu.RUnlock()
+			if isShuttingDown {
 				break
 			}
 
@@ -211,7 +252,7 @@ func (t *TCPTransport) tcpListen(tcpLn net.Listener) {
 				loopDelay = maxDelay
 			}
 
-			level.Error(t.logger).Log("msg", "TCPTransport: Error accepting TCP connection", "err", err)
+			level.Error(t.logger).Log("msg", "Error accepting TCP connection", "err", err)
 			time.Sleep(loopDelay)
 			continue
 		}
@@ -232,7 +273,10 @@ func (t *TCPTransport) debugLog() log.Logger {
 }
 
 func (t *TCPTransport) handleConnection(conn net.Conn) {
-	t.debugLog().Log("msg", "TCPTransport: New connection", "addr", conn.RemoteAddr())
+	t.debugLog().Log("msg", "New connection", "addr", conn.RemoteAddr())
+
+	// Wrap the connection to track sent/received bytes.
+	conn = newMeteredConn(conn, t.sentBytes, t.receivedBytes)
 
 	closeConn := true
 	defer func() {
@@ -245,7 +289,7 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 	msgType := []byte{0}
 	_, err := io.ReadFull(conn, msgType)
 	if err != nil {
-		level.Error(t.logger).Log("msg", "TCPTransport: failed to read message type", "err", err)
+		level.Warn(t.logger).Log("msg", "failed to read message type", "err", err, "remote", conn.RemoteAddr())
 		return
 	}
 
@@ -260,33 +304,33 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 		t.receivedPackets.Inc()
 
 		// before reading packet, read the address
-		b := []byte{0}
-		_, err := io.ReadFull(conn, b)
+		addrLengthBuf := []byte{0}
+		_, err := io.ReadFull(conn, addrLengthBuf)
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
-			level.Error(t.logger).Log("msg", "TCPTransport: error while reading address:", "err", err)
+			level.Warn(t.logger).Log("msg", "error while reading node address length from packet", "err", err, "remote", conn.RemoteAddr())
 			return
 		}
 
-		addrBuf := make([]byte, b[0])
+		addrBuf := make([]byte, addrLengthBuf[0])
 		_, err = io.ReadFull(conn, addrBuf)
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
-			level.Error(t.logger).Log("msg", "TCPTransport: error while reading address:", "err", err)
+			level.Warn(t.logger).Log("msg", "error while reading node address from packet", "err", err, "remote", conn.RemoteAddr())
 			return
 		}
 
 		// read the rest to buffer -- this is the "packet" itself
-		buf, err := ioutil.ReadAll(conn)
+		buf, err := io.ReadAll(conn)
 		if err != nil {
 			t.receivedPacketsErrors.Inc()
-			level.Error(t.logger).Log("msg", "TCPTransport: error while reading packet data:", "err", err)
+			level.Warn(t.logger).Log("msg", "error while reading packet data", "err", err, "remote", conn.RemoteAddr())
 			return
 		}
 
 		if len(buf) < md5.Size {
 			t.receivedPacketsErrors.Inc()
-			level.Error(t.logger).Log("msg", "TCPTransport: not enough data received", "length", len(buf))
+			level.Warn(t.logger).Log("msg", "not enough data received", "data_length", len(buf), "remote", conn.RemoteAddr())
 			return
 		}
 
@@ -297,10 +341,10 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 
 		if !bytes.Equal(receivedDigest, expectedDigest[:]) {
 			t.receivedPacketsErrors.Inc()
-			level.Warn(t.logger).Log("msg", "TCPTransport: packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest))
+			level.Warn(t.logger).Log("msg", "packet digest mismatch", "expected", fmt.Sprintf("%x", expectedDigest), "received", fmt.Sprintf("%x", receivedDigest), "data_length", len(buf), "remote", conn.RemoteAddr())
 		}
 
-		t.debugLog().Log("msg", "TCPTransport: Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
+		t.debugLog().Log("msg", "Received packet", "addr", addr(addrBuf), "size", len(buf), "hash", fmt.Sprintf("%x", receivedDigest))
 
 		t.receivedPacketsBytes.Add(float64(len(buf)))
 
@@ -311,7 +355,7 @@ func (t *TCPTransport) handleConnection(conn net.Conn) {
 		}
 	} else {
 		t.unknownConnections.Inc()
-		level.Error(t.logger).Log("msg", "TCPTransport: unknown message type", "msgType", msgType)
+		level.Error(t.logger).Log("msg", "unknown message type", "msgType", msgType, "remote", conn.RemoteAddr())
 	}
 }
 
@@ -326,10 +370,17 @@ func (a addr) String() string {
 }
 
 func (t *TCPTransport) getConnection(addr string, timeout time.Duration) (net.Conn, error) {
+	var conn net.Conn
+	var err error
 	if t.cfg.TLSEnabled {
-		return tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", addr, t.tlsConfig)
+		conn, err = tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", addr, t.tlsConfig)
+	} else {
+		conn, err = net.DialTimeout("tcp", addr, timeout)
 	}
-	return net.DialTimeout("tcp", addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return newMeteredConn(conn, t.sentBytes, t.receivedBytes), nil
 }
 
 // GetAutoBindPort returns the bind port that was automatically given by the
@@ -354,13 +405,11 @@ func (t *TCPTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, err
 			return nil, 0, fmt.Errorf("failed to parse advertise address %q", ip)
 		}
 
-		// Ensure IPv4 conversion if necessary.
-		if ip4 := advertiseAddr.To4(); ip4 != nil {
-			advertiseAddr = ip4
-		}
 		advertisePort = port
 	} else {
-		if t.cfg.BindAddrs[0] == zeroZeroZeroZero {
+
+		switch t.cfg.BindAddrs[0] {
+		case zeroZeroZeroZero:
 			// Otherwise, if we're not bound to a specific IP, let's
 			// use a suitable private IP address.
 			var err error
@@ -374,9 +423,19 @@ func (t *TCPTransport) FinalAdvertiseAddr(ip string, port int) (net.IP, int, err
 
 			advertiseAddr = net.ParseIP(ip)
 			if advertiseAddr == nil {
-				return nil, 0, fmt.Errorf("failed to parse advertise address: %q", ip)
+				return nil, 0, fmt.Errorf("failed to parse advertise address %q", ip)
 			}
-		} else {
+		case colonColon:
+			inet6Ip, err := netutil.GetFirstAddressOf(nil, t.logger, true)
+			if err != nil {
+				return nil, 0, fmt.Errorf("failed to get private inet6 address: %w", err)
+			}
+
+			advertiseAddr = net.ParseIP(inet6Ip)
+			if advertiseAddr == nil {
+				return nil, 0, fmt.Errorf("failed to parse inet6 advertise address %q", ip)
+			}
+		default:
 			// Use the IP that we're bound to, based on the first
 			// TCP listener, which we already ensure is there.
 			advertiseAddr = t.tcpListeners[0].Addr().(*net.TCPAddr).IP
@@ -408,21 +467,48 @@ func (t *TCPTransport) getAdvertisedAddr() string {
 // WriteTo is a packet-oriented interface that fires off the given
 // payload to the given address.
 func (t *TCPTransport) WriteTo(b []byte, addr string) (time.Time, error) {
-	t.sentPackets.Inc()
-	t.sentPacketsBytes.Add(float64(len(b)))
+	t.shutdownMu.RLock()
+	defer t.shutdownMu.RUnlock() // Unlock at the end to protect the chan
+	if t.shutdown {
+		return time.Time{}, errors.New("transport is shutting down")
+	}
 
-	err := t.writeTo(b, addr)
-	if err != nil {
-		t.sentPacketsErrors.Inc()
-
-		level.Warn(t.logger).Log("msg", "TCPTransport: WriteTo failed", "addr", addr, "err", err)
-
+	// Send the packet to the write workers
+	// If this blocks for too long (as configured), abort and log an error.
+	select {
+	case <-time.After(t.cfg.AcquireWriterTimeout):
+		// Dropped packets are not an issue, the memberlist protocol will retry later.
+		level.Debug(t.logger).Log("msg", "WriteTo failed to acquire a writer. Dropping message", "timeout", t.cfg.AcquireWriterTimeout, "addr", addr)
+		t.droppedPackets.Inc()
 		// WriteTo is used to send "UDP" packets. Since we use TCP, we can detect more errors,
 		// but memberlist library doesn't seem to cope with that very well. That is why we return nil instead.
 		return time.Now(), nil
+	case t.writeCh <- writeRequest{b: b, addr: addr}:
+		// OK
 	}
 
 	return time.Now(), nil
+}
+
+func (t *TCPTransport) writeWorker() {
+	defer t.writeWG.Done()
+	for req := range t.writeCh {
+		b, addr := req.b, req.addr
+		t.sentPackets.Inc()
+		t.sentPacketsBytes.Add(float64(len(b)))
+		err := t.writeTo(b, addr)
+		if err != nil {
+			t.sentPacketsErrors.Inc()
+
+			logLevel := level.Warn(t.logger)
+			if strings.Contains(err.Error(), "connection refused") {
+				// The connection refused is a common error that could happen during normal operations when a node
+				// shutdown (or crash). It shouldn't be considered a warning condition on the sender side.
+				logLevel = t.debugLog()
+			}
+			logLevel.Log("msg", "WriteTo failed", "addr", addr, "err", err)
+		}
+	}
 }
 
 func (t *TCPTransport) writeTo(b []byte, addr string) error {
@@ -440,16 +526,15 @@ func (t *TCPTransport) writeTo(b []byte, addr string) error {
 		}
 	}()
 
-	if t.cfg.PacketWriteTimeout > 0 {
-		deadline := time.Now().Add(t.cfg.PacketWriteTimeout)
-		err := c.SetDeadline(deadline)
-		if err != nil {
-			return fmt.Errorf("setting deadline: %v", err)
-		}
-	}
+	// Compute the digest *before* setting the deadline on the connection (so that the time
+	// it takes to compute the digest is not taken in account).
+	// We use md5 as quick and relatively short hash, not in cryptographic context.
+	// It's also used to detect if the whole packet has been received on the receiver side.
+	digest := md5.Sum(b)
 
-	buf := bytes.Buffer{}
-	buf.WriteByte(byte(packet))
+	// Prepare the header *before* setting the deadline on the connection.
+	headerBuf := bytes.Buffer{}
+	headerBuf.WriteByte(byte(packet))
 
 	// We need to send our address to the other side, otherwise other side can only see IP and port from TCP header.
 	// But that doesn't match our node address (new TCP connection has new random port), which confuses memberlist.
@@ -460,10 +545,18 @@ func (t *TCPTransport) writeTo(b []byte, addr string) error {
 		return fmt.Errorf("local address too long")
 	}
 
-	buf.WriteByte(byte(len(ourAddr)))
-	buf.WriteString(ourAddr)
+	headerBuf.WriteByte(byte(len(ourAddr)))
+	headerBuf.WriteString(ourAddr)
 
-	_, err = c.Write(buf.Bytes())
+	if t.cfg.PacketWriteTimeout > 0 {
+		deadline := time.Now().Add(t.cfg.PacketWriteTimeout)
+		err := c.SetDeadline(deadline)
+		if err != nil {
+			return fmt.Errorf("setting deadline: %v", err)
+		}
+	}
+
+	_, err = c.Write(headerBuf.Bytes())
 	if err != nil {
 		return fmt.Errorf("sending local address: %v", err)
 	}
@@ -476,9 +569,7 @@ func (t *TCPTransport) writeTo(b []byte, addr string) error {
 		return fmt.Errorf("sending data: short write")
 	}
 
-	// Append digest. We use md5 as quick and relatively short hash, not in cryptographic context.
-	// This helped to find some bugs, so let's keep it.
-	digest := md5.Sum(b)
+	// Append digest.
 	n, err = c.Write(digest[:])
 	if err != nil {
 		return fmt.Errorf("digest: %v", err)
@@ -532,17 +623,31 @@ func (t *TCPTransport) StreamCh() <-chan net.Conn {
 
 // Shutdown is called when memberlist is shutting down; this gives the
 // transport a chance to clean up any listeners.
+// This will avoid log spam about errors when we shut down.
 func (t *TCPTransport) Shutdown() error {
+	t.shutdownMu.Lock()
 	// This will avoid log spam about errors when we shut down.
-	t.shutdown.Store(1)
+	if t.shutdown {
+		t.shutdownMu.Unlock()
+		return nil // already shut down
+	}
+
+	// Set the shutdown flag and close the write channel.
+	t.shutdown = true
+	close(t.writeCh)
+	t.shutdownMu.Unlock()
 
 	// Rip through all the connections and shut them down.
 	for _, conn := range t.tcpListeners {
 		_ = conn.Close()
 	}
 
+	// Wait until all write workers have finished.
+	t.writeWG.Wait()
+
 	// Block until all the listener threads have died.
 	t.wg.Wait()
+
 	return nil
 }
 
@@ -581,7 +686,7 @@ func (t *TCPTransport) registerMetrics(registerer prometheus.Registerer) {
 		Namespace: t.cfg.MetricsNamespace,
 		Subsystem: subsystem,
 		Name:      "packets_received_bytes_total",
-		Help:      "Total bytes received as packets",
+		Help:      "Total bytes received as packets. This metric only tracks broadcast packets, and does not include full state syncs or pings.",
 	})
 
 	t.receivedPacketsErrors = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
@@ -589,6 +694,13 @@ func (t *TCPTransport) registerMetrics(registerer prometheus.Registerer) {
 		Subsystem: subsystem,
 		Name:      "packets_received_errors_total",
 		Help:      "Number of errors when receiving memberlist packets",
+	})
+
+	t.droppedPackets = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
+		Namespace: t.cfg.MetricsNamespace,
+		Subsystem: subsystem,
+		Name:      "packets_dropped_total",
+		Help:      "Number of dropped memberlist packets. These packets were not sent due to timeout waiting for a writer.",
 	})
 
 	t.sentPackets = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
@@ -602,7 +714,7 @@ func (t *TCPTransport) registerMetrics(registerer prometheus.Registerer) {
 		Namespace: t.cfg.MetricsNamespace,
 		Subsystem: subsystem,
 		Name:      "packets_sent_bytes_total",
-		Help:      "Total bytes sent as packets",
+		Help:      "Total bytes sent as packets. This metric only tracks broadcast packets, and does not include full state syncs or pings.",
 	})
 
 	t.sentPacketsErrors = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
@@ -617,5 +729,19 @@ func (t *TCPTransport) registerMetrics(registerer prometheus.Registerer) {
 		Subsystem: subsystem,
 		Name:      "unknown_connections_total",
 		Help:      "Number of unknown TCP connections (not a packet or stream)",
+	})
+
+	t.sentBytes = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
+		Namespace: t.cfg.MetricsNamespace,
+		Subsystem: subsystem,
+		Name:      "sent_bytes_total",
+		Help:      "Total bytes sent by the transport. This metric tracks all data transferred, including broadcast packets, full state syncs, and pings.",
+	})
+
+	t.receivedBytes = promauto.With(registerer).NewCounter(prometheus.CounterOpts{
+		Namespace: t.cfg.MetricsNamespace,
+		Subsystem: subsystem,
+		Name:      "received_bytes_total",
+		Help:      "Total bytes sent by the transport. This metric tracks all data transferred, including broadcast packets, full state syncs, and pings.",
 	})
 }

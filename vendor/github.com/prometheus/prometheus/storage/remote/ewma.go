@@ -1,4 +1,4 @@
-// Copyright 2013 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -55,9 +55,10 @@ func (r *ewmaRate) tick() {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
-	if r.init {
+	switch {
+	case r.init:
 		r.lastRate += r.alpha * (instantRate - r.lastRate)
-	} else if newEvents > 0 {
+	case newEvents > 0:
 		r.init = true
 		r.lastRate = instantRate
 	}

@@ -2,146 +2,373 @@ package storage
 
 import (
 	"context"
-	"errors"
-	"flag"
-	"sort"
+	"fmt"
+	"math"
+	"slices"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/querier/astmapper"
 	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/tenant"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"go.opentelemetry.io/otel"
 
-	"github.com/grafana/loki/pkg/tenant"
-
-	"github.com/grafana/loki/pkg/iter"
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql"
-	"github.com/grafana/loki/pkg/logqlmodel/stats"
-	"github.com/grafana/loki/pkg/storage/chunk"
-	chunk_local "github.com/grafana/loki/pkg/storage/chunk/local"
-	"github.com/grafana/loki/pkg/storage/chunk/storage"
-	"github.com/grafana/loki/pkg/storage/stores/shipper"
-	"github.com/grafana/loki/pkg/util"
+	"github.com/grafana/loki/v3/pkg/analytics"
+	"github.com/grafana/loki/v3/pkg/indexgateway"
+	"github.com/grafana/loki/v3/pkg/iter"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql"
+	lokilog "github.com/grafana/loki/v3/pkg/logql/log"
+	"github.com/grafana/loki/v3/pkg/logql/model/stats"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/querier/astmapper"
+	"github.com/grafana/loki/v3/pkg/querier/plan"
+	"github.com/grafana/loki/v3/pkg/storage/chunk"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/congestion"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/fetcher"
+	"github.com/grafana/loki/v3/pkg/storage/config"
+	"github.com/grafana/loki/v3/pkg/storage/stores"
+	"github.com/grafana/loki/v3/pkg/storage/stores/index"
+	"github.com/grafana/loki/v3/pkg/storage/stores/series"
+	"github.com/grafana/loki/v3/pkg/storage/stores/shipper/indexshipper"
+	"github.com/grafana/loki/v3/pkg/storage/stores/shipper/indexshipper/tsdb"
+	"github.com/grafana/loki/v3/pkg/storage/types"
+	"github.com/grafana/loki/v3/pkg/util"
+	"github.com/grafana/loki/v3/pkg/util/deletion"
+	"github.com/grafana/loki/v3/pkg/util/httpreq"
 )
+
+var tracer = otel.Tracer("pkg/storage")
 
 var (
-	errCurrentBoltdbShipperNon24Hours  = errors.New("boltdb-shipper works best with 24h periodic index config. Either add a new config with future date set to 24h to retain the existing index or change the existing config to use 24h period")
-	errUpcomingBoltdbShipperNon24Hours = errors.New("boltdb-shipper with future date must always have periodic config for index set to 24h")
-	errZeroLengthConfig                = errors.New("must specify at least one schema configuration")
+	indexTypeStats  = analytics.NewString("store_index_type")
+	objectTypeStats = analytics.NewString("store_object_type")
+	schemaStats     = analytics.NewString("store_schema")
+
+	errWritingChunkUnsupported = errors.New("writing chunks is not supported while running store in read-only mode")
 )
 
-// Config is the loki storage configuration
-type Config struct {
-	storage.Config      `yaml:",inline"`
-	MaxChunkBatchSize   int            `yaml:"max_chunk_batch_size"`
-	BoltDBShipperConfig shipper.Config `yaml:"boltdb_shipper"`
-}
-
-// RegisterFlags adds the flags required to configure this flag set.
-func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
-	cfg.Config.RegisterFlags(f)
-	cfg.BoltDBShipperConfig.RegisterFlags(f)
-	f.IntVar(&cfg.MaxChunkBatchSize, "store.max-chunk-batch-size", 50, "The maximum number of chunks to fetch per batch.")
-}
-
-// SchemaConfig contains the config for our chunk index schemas
-type SchemaConfig struct {
-	chunk.SchemaConfig `yaml:",inline"`
-}
-
-// Validate the schema config and returns an error if the validation doesn't pass
-func (cfg *SchemaConfig) Validate() error {
-	if len(cfg.Configs) == 0 {
-		return errZeroLengthConfig
-	}
-	activePCIndex := ActivePeriodConfig((*cfg).Configs)
-
-	// if current index type is boltdb-shipper and there are no upcoming index types then it should be set to 24 hours.
-	if cfg.Configs[activePCIndex].IndexType == shipper.BoltDBShipperType && cfg.Configs[activePCIndex].IndexTables.Period != 24*time.Hour && len(cfg.Configs)-1 == activePCIndex {
-		return errCurrentBoltdbShipperNon24Hours
-	}
-
-	// if upcoming index type is boltdb-shipper, it should always be set to 24 hours.
-	if len(cfg.Configs)-1 > activePCIndex && (cfg.Configs[activePCIndex+1].IndexType == shipper.BoltDBShipperType && cfg.Configs[activePCIndex+1].IndexTables.Period != 24*time.Hour) {
-		return errUpcomingBoltdbShipperNon24Hours
-	}
-
-	return cfg.SchemaConfig.Validate()
-}
-
-type ChunkStoreConfig struct {
-	chunk.StoreConfig `yaml:",inline"`
-
-	// Limits query start time to be greater than now() - MaxLookBackPeriod, if set.
-	// Will be deprecated in the next major release.
-	MaxLookBackPeriod model.Duration `yaml:"max_look_back_period"`
-}
-
-// RegisterFlags adds the flags required to configure this flag set.
-func (cfg *ChunkStoreConfig) RegisterFlags(f *flag.FlagSet) {
-	cfg.StoreConfig.RegisterFlags(f)
-	f.Var(&cfg.MaxLookBackPeriod, "store.max-look-back-period", "This flag is deprecated. Use -querier.max-query-lookback instead.")
-}
-
-func (cfg *ChunkStoreConfig) Validate(logger log.Logger) error {
-	if cfg.MaxLookBackPeriod > 0 {
-		flagext.DeprecatedFlagsUsed.Inc()
-		level.Warn(logger).Log("msg", "running with DEPRECATED flag -store.max-look-back-period, use -querier.max-query-lookback instead.")
-	}
-	return cfg.StoreConfig.Validate(logger)
-}
-
-// Store is the Loki chunk store to retrieve and save chunks.
-type Store interface {
-	chunk.Store
+type SelectStore interface {
 	SelectSamples(ctx context.Context, req logql.SelectSampleParams) (iter.SampleIterator, error)
 	SelectLogs(ctx context.Context, req logql.SelectLogParams) (iter.EntryIterator, error)
-	GetSeries(ctx context.Context, req logql.SelectLogParams) ([]logproto.SeriesIdentifier, error)
-	GetSchemaConfigs() []chunk.PeriodConfig
-	SetChunkFilterer(chunkFilter RequestChunkFilterer)
+	SelectSeries(ctx context.Context, req logql.SelectLogParams) ([]logproto.SeriesIdentifier, error)
 }
 
-// RequestChunkFilterer creates ChunkFilterer for a given request context.
-type RequestChunkFilterer interface {
-	ForRequest(ctx context.Context) ChunkFilterer
+type SchemaConfigProvider interface {
+	GetSchemaConfigs() []config.PeriodConfig
 }
 
-// ChunkFilterer filters chunks based on the metric.
-type ChunkFilterer interface {
-	ShouldFilter(metric labels.Labels) bool
+type Instrumentable interface {
+	SetExtractorWrapper(wrapper lokilog.SampleExtractorWrapper)
+
+	SetPipelineWrapper(wrapper lokilog.PipelineWrapper)
 }
 
-type store struct {
-	chunk.Store
-	cfg          Config
-	chunkMetrics *ChunkMetrics
-	schemaCfg    SchemaConfig
+type Store interface {
+	stores.Store
+	SelectStore
+	SchemaConfigProvider
+	Instrumentable
+	index.Flusher
+}
 
-	chunkFilterer RequestChunkFilterer
+// syncerFlusher is the union of the index store's optional on-demand
+// capabilities: flushing the in-memory head to object storage (write side, used
+// by the ingester), and refreshing the object-listing cache + downloading newly
+// shipped indexes or the indexes it should be query ready for (read side, used
+// by the index-gateway). The TSDB store -- the only store implementing any of
+// them -- implements all of them, so LokiStore collects them through this
+// single interface (see storeForPeriod). The public index.Flusher, index.Syncer
+// and index.QueryReadinessEnsurer stay separate so each consumer depends only
+// on the capability it uses.
+type syncerFlusher interface {
+	index.Flusher
+	index.Syncer
+	index.QueryReadinessEnsurer
+}
+
+// namedSyncerFlusher pairs a collected per-period store with its store name, so
+// SyncStatuses can label each index's status.
+type namedSyncerFlusher struct {
+	name string
+	syncerFlusher
+}
+
+type LokiStore struct {
+	stores.Store
+
+	cfg       Config
+	storeCfg  config.ChunkStoreConfig
+	schemaCfg config.SchemaConfig
+
+	chunkMetrics       *ChunkMetrics
+	chunkClientMetrics client.ChunkClientMetrics
+	clientMetrics      ClientMetrics
+	registerer         prometheus.Registerer
+
+	chunksCache   cache.Cache
+	chunksCacheL2 cache.Cache
+
+	limits StoreLimits
+	logger log.Logger
+
+	chunkFilterer               chunk.RequestChunkFilterer
+	extractorWrapper            lokilog.SampleExtractorWrapper
+	pipelineWrapper             lokilog.PipelineWrapper
+	congestionControllerFactory func(cfg congestion.Config, logger log.Logger, metrics *congestion.Metrics) congestion.Controller
+
+	metricsNamespace string
+
+	// syncerFlushers are the per-period TSDB index stores collected at
+	// construction, used to force the in-memory head to object storage
+	// (FlushIndexes), to refresh the object-listing cache + download newly
+	// shipped indexes on demand (TriggerSync/SyncStatuses), and to download the
+	// indexes they should be query ready for (EnsureQueryReadiness).
+	syncerFlushers []namedSyncerFlusher
 }
 
 // NewStore creates a new Loki Store using configuration supplied.
-func NewStore(cfg Config, schemaCfg SchemaConfig, chunkStore chunk.Store, registerer prometheus.Registerer) (Store, error) {
-	return &store{
-		Store:        chunkStore,
-		cfg:          cfg,
-		chunkMetrics: NewChunkMetrics(registerer, cfg.MaxChunkBatchSize),
-		schemaCfg:    schemaCfg,
-	}, nil
+func NewStore(cfg Config, storeCfg config.ChunkStoreConfig, schemaCfg config.SchemaConfig,
+	limits StoreLimits, clientMetrics ClientMetrics, registerer prometheus.Registerer, logger log.Logger,
+	metricsNamespace string,
+) (*LokiStore, error) {
+	if len(schemaCfg.Configs) != 0 {
+		if index := config.ActivePeriodConfig(schemaCfg.Configs); index != -1 && index < len(schemaCfg.Configs) {
+			indexTypeStats.Set(schemaCfg.Configs[index].IndexType)
+			objectTypeStats.Set(schemaCfg.Configs[index].ObjectType)
+			schemaStats.Set(schemaCfg.Configs[index].Schema)
+		}
+	}
+
+	chunkCacheCfg := storeCfg.ChunkCacheConfig
+	chunkCacheCfg.Prefix = "chunks"
+	chunksCache, err := cache.New(chunkCacheCfg, registerer, logger, stats.ChunkCache, metricsNamespace)
+	if err != nil {
+		return nil, err
+	}
+
+	chunkCacheCfgL2 := storeCfg.ChunkCacheConfigL2
+	chunkCacheCfgL2.Prefix = "chunksl2"
+	// TODO(E.Welch) would we want to disambiguate this cache in the stats? I think not but we'd need to change stats.ChunkCache to do so.
+	chunksCacheL2, err := cache.New(chunkCacheCfgL2, registerer, logger, stats.ChunkCache, metricsNamespace)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache is shared by multiple stores, which means they will try and Stop
+	// it more than once.  Wrap in a StopOnce to prevent this.
+	chunksCache = cache.StopOnce(chunksCache)
+	chunksCacheL2 = cache.StopOnce(chunksCacheL2)
+
+	err = schemaCfg.Load()
+	if err != nil {
+		return nil, errors.Wrap(err, "error loading schema config")
+	}
+	stores := stores.NewCompositeStore(limits)
+
+	s := &LokiStore{
+		Store:     stores,
+		cfg:       cfg,
+		storeCfg:  storeCfg,
+		schemaCfg: schemaCfg,
+
+		congestionControllerFactory: congestion.NewController,
+
+		chunkClientMetrics: client.NewChunkClientMetrics(registerer),
+		clientMetrics:      clientMetrics,
+		chunkMetrics:       NewChunkMetrics(registerer, cfg.MaxChunkBatchSize),
+		registerer:         registerer,
+
+		chunksCache:   chunksCache,
+		chunksCacheL2: chunksCacheL2,
+
+		logger: logger,
+		limits: limits,
+
+		metricsNamespace: metricsNamespace,
+	}
+	if err := s.init(); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
-// NewTableClient creates a TableClient for managing tables for index/chunk store.
-// ToDo: Add support in Cortex for registering custom table client like index client.
-func NewTableClient(name string, cfg Config) (chunk.TableClient, error) {
-	if name == shipper.BoltDBShipperType {
-		name = "boltdb"
-		cfg.FSConfig = chunk_local.FSConfig{Directory: cfg.BoltDBShipperConfig.ActiveIndexDirectory}
+// FlushIndexes forces every writable index store collected at construction to
+// build and ship its in-memory indexes (the TSDB head) to object storage.
+func (s *LokiStore) FlushIndexes(ctx context.Context) error {
+	for _, sf := range s.syncerFlushers {
+		if err := sf.FlushIndexes(ctx); err != nil {
+			return err
+		}
 	}
-	return storage.NewTableClient(name, cfg.Config, prometheus.DefaultRegisterer)
+	return nil
+}
+
+// TriggerSync starts a background index sync on every readable index store
+// collected at construction, returning true if any started a new sync.
+func (s *LokiStore) TriggerSync() bool {
+	started := false
+	for _, sf := range s.syncerFlushers {
+		if sf.TriggerSync() {
+			started = true
+		}
+	}
+	return started
+}
+
+// EnsureQueryReadiness downloads the missing indexes of every readable index
+// store.
+func (s *LokiStore) EnsureQueryReadiness(ctx context.Context) error {
+	for _, sf := range s.syncerFlushers {
+		if err := sf.EnsureQueryReadiness(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SyncStatuses reports the sync status of each per-period index store, labeled
+// with that store's name -- one entry per index the store syncs.
+func (s *LokiStore) SyncStatuses() []index.SyncStatus {
+	statuses := make([]index.SyncStatus, 0, len(s.syncerFlushers))
+	for _, sf := range s.syncerFlushers {
+		st := sf.SyncStatus()
+		st.Name = sf.name
+		statuses = append(statuses, st)
+	}
+	return statuses
+}
+
+func (s *LokiStore) init() error {
+	for i, p := range s.schemaCfg.Configs {
+		chunkClient, err := s.chunkClientForPeriod(p)
+		if err != nil {
+			return err
+		}
+		f, err := fetcher.New(s.chunksCache, s.chunksCacheL2, s.storeCfg.ChunkCacheStubs(), s.schemaCfg, chunkClient, s.storeCfg.L2ChunkCacheHandoff, s.storeCfg.SkipQueryWritebackOlderThan)
+		if err != nil {
+			return err
+		}
+
+		periodEndTime := config.DayTime{Time: math.MaxInt64}
+		if i < len(s.schemaCfg.Configs)-1 {
+			periodEndTime = config.DayTime{Time: s.schemaCfg.Configs[i+1].From.Add(-time.Millisecond)}
+		}
+		w, idx, stop, err := s.storeForPeriod(p, p.GetIndexTableNumberRange(periodEndTime), chunkClient, f)
+		if err != nil {
+			return err
+		}
+
+		// s.Store is always assigned the CompositeStore implementation of the Store interface
+		s.Store.(*stores.CompositeStore).AddStore(p.From.Time, f, idx, w, stop)
+	}
+
+	if s.cfg.EnableAsyncStore {
+		s.Store = NewAsyncStore(s.cfg.AsyncStoreConfig, s.Store, s.schemaCfg)
+	}
+
+	return nil
+}
+
+func (s *LokiStore) chunkClientForPeriod(p config.PeriodConfig) (client.Client, error) {
+	objectStoreType := p.ObjectType
+	if objectStoreType == "" {
+		objectStoreType = p.IndexType
+	}
+
+	component := "chunk-store-" + p.From.String()
+	chunkClientReg := prometheus.WrapRegistererWith(
+		prometheus.Labels{"component": component}, s.registerer)
+	chunks, err := NewChunkClient(objectStoreType, component, s.cfg, s.schemaCfg, p, chunkClientReg, s.clientMetrics, s.logger)
+	if err != nil {
+		return nil, errors.Wrap(err, "error creating object client")
+	}
+
+	chunks = client.NewMetricsChunkClient(chunks, s.chunkClientMetrics)
+	return chunks, nil
+}
+
+func shouldUseIndexGatewayClient(cfg indexshipper.Config) bool {
+	if cfg.Mode != indexshipper.ModeReadOnly || cfg.IndexGatewayClientConfig.Disabled {
+		return false
+	}
+
+	gatewayCfg := cfg.IndexGatewayClientConfig
+	if gatewayCfg.Mode == indexgateway.SimpleMode && gatewayCfg.Address == "" {
+		return false
+	}
+
+	return true
+}
+
+func (s *LokiStore) storeForPeriod(p config.PeriodConfig, tableRange config.TableRange, chunkClient client.Client, f *fetcher.Fetcher) (stores.ChunkWriter, index.ReaderWriter, func(), error) {
+	// currently we only support one index type "tsdb" so all the code below here applies to tsdb only. this method will need to be improved should we ever support another type
+	if !slices.Contains(types.SupportedIndexTypes, p.IndexType) {
+		return nil, nil, nil, fmt.Errorf("unsupported index type %s for schema period starting at %s", p.IndexType, p.From.String())
+	}
+
+	component := fmt.Sprintf("index-store-%s-%s", p.IndexType, p.From.String())
+	indexClientReg := prometheus.WrapRegistererWith(prometheus.Labels{"component": component}, s.registerer)
+	indexClientLogger := log.With(s.logger, "index-store", fmt.Sprintf("%s-%s", p.IndexType, p.From.String()))
+
+	if shouldUseIndexGatewayClient(s.cfg.TSDBShipperConfig) {
+		// inject the index-gateway client into the index store
+		gw, err := indexgateway.NewGatewayClient(s.cfg.TSDBShipperConfig.IndexGatewayClientConfig, indexClientReg, s.limits, indexClientLogger, s.metricsNamespace)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		idx := series.NewIndexGatewayClientStore(gw, indexClientLogger)
+
+		return failingChunkWriter{}, index.NewMonitoredReaderWriter(idx, indexClientReg), func() {
+			f.Stop()
+			gw.Stop()
+		}, nil
+	}
+
+	objectClient, err := NewObjectClient(p.ObjectType, component, s.cfg, s.clientMetrics)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	name := fmt.Sprintf("%s_%s", p.ObjectType, p.From.String())
+	shipperCfg, prefix := s.cfg.TSDBShipperConfig.ForPeriod(p)
+	indexReaderWriter, stopTSDBStoreFunc, err := tsdb.NewStore(name, prefix, shipperCfg, s.schemaCfg, objectClient, s.limits, tableRange, indexClientReg, s.registerer, indexClientLogger)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	// Collect the TSDB index store's on-demand capabilities -- flushing the
+	// in-memory head to object storage (used by the ingester) and refreshing the
+	// listing + downloading newly shipped or query ready indexes (used by the
+	// index-gateway) -- captured here before the monitored-reader-writer wrap,
+	// which implements none of them.
+	//
+	// We deliberately keep these off the index.Reader/Writer/ReaderWriter
+	// interfaces: those are also implemented by stores with nothing to flush or
+	// sync -- e.g. the read-only index-gateway client store (which only stubs
+	// IndexChunk) and the monitored wrapper -- so putting them there would force
+	// meaningless no-ops onto every store. Instead we treat them as optional
+	// capabilities and collect only the stores that implement them. The TSDB store
+	// (today the only such store) implements all of them, so a single
+	// syncerFlusher assertion collects it for every use.
+	if sf, ok := indexReaderWriter.(syncerFlusher); ok {
+		s.syncerFlushers = append(s.syncerFlushers, namedSyncerFlusher{name: name, syncerFlusher: sf})
+	}
+
+	indexReaderWriter = index.NewMonitoredReaderWriter(indexReaderWriter, indexClientReg)
+	chunkWriter := stores.NewChunkWriter(f, s.schemaCfg, indexReaderWriter, s.storeCfg.DisableIndexDeduplication)
+
+	return chunkWriter, indexReaderWriter,
+		func() {
+			f.Stop()
+			chunkClient.Stop()
+			stopTSDBStoreFunc()
+			objectClient.Stop()
+		}, nil
 }
 
 // decodeReq sanitizes an incoming request, rounds bounds, appends the __name__ matcher,
@@ -154,14 +381,11 @@ func decodeReq(req logql.QueryParams) ([]*labels.Matcher, model.Time, model.Time
 	}
 
 	matchers := expr.Matchers()
-	nameLabelMatcher, err := labels.NewMatcher(labels.MatchEqual, labels.MetricName, "logs")
+	nameLabelMatcher, err := labels.NewMatcher(labels.MatchEqual, model.MetricNameLabel, "logs")
 	if err != nil {
 		return nil, 0, 0, err
 	}
 	matchers = append(matchers, nameLabelMatcher)
-	if err != nil {
-		return nil, 0, 0, err
-	}
 	matchers, err = injectShardLabel(req.GetShards(), matchers)
 	if err != nil {
 		return nil, 0, 0, err
@@ -170,9 +394,12 @@ func decodeReq(req logql.QueryParams) ([]*labels.Matcher, model.Time, model.Time
 	return matchers, from, through, nil
 }
 
+// TODO(owen-d): refactor this. Injecting shard labels via matchers is a big hack and we shouldn't continue
+// doing it, _but_ it requires adding `fingerprintfilter` support to much of our storage interfaces
+// or a way to transform the base store into a more specialized variant.
 func injectShardLabel(shards []string, matchers []*labels.Matcher) ([]*labels.Matcher, error) {
 	if shards != nil {
-		parsed, err := logql.ParseShards(shards)
+		parsed, _, err := logql.ParseShards(shards)
 		if err != nil {
 			return nil, err
 		}
@@ -192,20 +419,46 @@ func injectShardLabel(shards []string, matchers []*labels.Matcher) ([]*labels.Ma
 	return matchers, nil
 }
 
-func (s *store) SetChunkFilterer(chunkFilterer RequestChunkFilterer) {
+func (s *LokiStore) SetChunkFilterer(chunkFilterer chunk.RequestChunkFilterer) {
 	s.chunkFilterer = chunkFilterer
+	s.Store.SetChunkFilterer(chunkFilterer)
 }
 
-// lazyChunks is an internal function used to resolve a set of lazy chunks from the store without actually loading them. It's used internally by `LazyQuery` and `GetSeries`
-func (s *store) lazyChunks(ctx context.Context, matchers []*labels.Matcher, from, through model.Time) ([]*LazyChunk, error) {
+func (s *LokiStore) SetExtractorWrapper(wrapper lokilog.SampleExtractorWrapper) {
+	s.extractorWrapper = wrapper
+}
+
+func (s *LokiStore) SetPipelineWrapper(wrapper lokilog.PipelineWrapper) {
+	s.pipelineWrapper = wrapper
+}
+
+// lazyChunks is an internal function used to resolve a set of lazy chunks from the store without actually loading them.
+func (s *LokiStore) lazyChunks(
+	ctx context.Context,
+	from, through model.Time,
+	predicate chunk.Predicate,
+	storeChunksOverride *logproto.ChunkRefGroup,
+	hintRanges iter.HintTimeRanges,
+) ([]*LazyChunk, error) {
 	userID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
 	}
 
+	if hintRanges.Enabled() {
+		hintFrom, hintThrough, ok := hintRanges.Bounds()
+		if !ok {
+			return nil, nil
+		}
+		from, through = util.RoundToMilliseconds(hintFrom, hintThrough)
+	}
+
 	stats := stats.FromContext(ctx)
 
-	chks, fetchers, err := s.GetChunkRefs(ctx, userID, from, through, matchers...)
+	start := time.Now()
+	chks, fetchers, err := s.GetChunks(ctx, userID, from, through, predicate, storeChunksOverride)
+	stats.AddChunkRefsFetchTime(time.Since(start))
+
 	if err != nil {
 		return nil, err
 	}
@@ -216,9 +469,14 @@ func (s *store) lazyChunks(ctx context.Context, matchers []*labels.Matcher, from
 		prefiltered += len(chks[i])
 		stats.AddChunksRef(int64(len(chks[i])))
 		chks[i] = filterChunksByTime(from, through, chks[i])
+		chks[i] = filterChunksByHintRanges(chks[i], hintRanges)
 		filtered += len(chks[i])
 	}
+	stats.AddChunksScanned(int64(filtered))
 
+	if storeChunksOverride != nil {
+		s.chunkMetrics.refsBypassed.Add(float64(len(storeChunksOverride.Refs)))
+	}
 	s.chunkMetrics.refs.WithLabelValues(statusDiscarded).Add(float64(prefiltered - filtered))
 	s.chunkMetrics.refs.WithLabelValues(statusMatched).Add(float64(filtered))
 
@@ -232,15 +490,31 @@ func (s *store) lazyChunks(ctx context.Context, matchers []*labels.Matcher, from
 	return lazyChunks, nil
 }
 
-func (s *store) GetSeries(ctx context.Context, req logql.SelectLogParams) ([]logproto.SeriesIdentifier, error) {
+func (s *LokiStore) SelectSeries(ctx context.Context, req logql.SelectLogParams) ([]logproto.SeriesIdentifier, error) {
+	userID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// decodeReq resolves matchers from Plan.AST only. Callers that have not been
+	// migrated yet set the deprecated Selector field instead, so parse it into a plan.
+	if (req.Plan == nil || req.Plan.AST == nil) && req.Selector != "" {
+		expr, err := syntax.ParseExpr(req.Selector)
+		if err != nil {
+			return nil, err
+		}
+		cpy := *req.QueryRequest
+		cpy.Plan = &plan.QueryPlan{AST: expr}
+		req = logql.SelectLogParams{QueryRequest: &cpy}
+	}
+
 	var from, through model.Time
 	var matchers []*labels.Matcher
 
 	// The Loki parser doesn't allow for an empty label matcher but for the Series API
 	// we allow this to select all series in the time range.
-	if req.Selector == "" {
+	if req.Plan == nil || req.Plan.AST == nil {
 		from, through = util.RoundToMilliseconds(req.Start, req.End)
-		nameLabelMatcher, err := labels.NewMatcher(labels.MatchEqual, labels.MetricName, "logs")
+		nameLabelMatcher, err := labels.NewMatcher(labels.MatchEqual, model.MetricNameLabel, "logs")
 		if err != nil {
 			return nil, err
 		}
@@ -256,88 +530,33 @@ func (s *store) GetSeries(ctx context.Context, req logql.SelectLogParams) ([]log
 			return nil, err
 		}
 	}
-
-	lazyChunks, err := s.lazyChunks(ctx, matchers, from, through)
+	series, err := s.GetSeries(ctx, userID, from, through, matchers...)
 	if err != nil {
 		return nil, err
 	}
-
-	// group chunks by series
-	chunksBySeries := partitionBySeriesChunks(lazyChunks)
-
-	firstChunksPerSeries := make([]*LazyChunk, 0, len(chunksBySeries))
-
-	// discard all but one chunk per series
-	for _, chks := range chunksBySeries {
-		firstChunksPerSeries = append(firstChunksPerSeries, chks[0][0])
+	result := make([]logproto.SeriesIdentifier, len(series))
+	for i, s := range series {
+		result[i] = logproto.SeriesIdentifierFromLabels(s)
 	}
-
-	results := make(logproto.SeriesIdentifiers, 0, len(firstChunksPerSeries))
-
-	// bound concurrency
-	groups := make([][]*LazyChunk, 0, len(firstChunksPerSeries)/s.cfg.MaxChunkBatchSize+1)
-
-	split := s.cfg.MaxChunkBatchSize
-	if len(firstChunksPerSeries) < split {
-		split = len(firstChunksPerSeries)
-	}
-
-	var chunkFilterer ChunkFilterer
-	if s.chunkFilterer != nil {
-		chunkFilterer = s.chunkFilterer.ForRequest(ctx)
-	}
-
-	for split > 0 {
-		groups = append(groups, firstChunksPerSeries[:split])
-		firstChunksPerSeries = firstChunksPerSeries[split:]
-		if len(firstChunksPerSeries) < split {
-			split = len(firstChunksPerSeries)
-		}
-	}
-
-	for _, group := range groups {
-		err = fetchLazyChunks(ctx, group)
-		if err != nil {
-			return nil, err
-		}
-
-	outer:
-		for _, chk := range group {
-			for _, matcher := range matchers {
-				if matcher.Name == astmapper.ShardLabel || matcher.Name == labels.MetricName {
-					continue
-				}
-				if !matcher.Matches(chk.Chunk.Metric.Get(matcher.Name)) {
-					continue outer
-				}
-			}
-
-			if chunkFilterer != nil && chunkFilterer.ShouldFilter(chk.Chunk.Metric) {
-				continue outer
-			}
-
-			m := chk.Chunk.Metric.Map()
-			delete(m, labels.MetricName)
-			results = append(results, logproto.SeriesIdentifier{
-				Labels: m,
-			})
-		}
-	}
-	sort.Sort(results)
-	return results, nil
+	return result, nil
 }
 
 // SelectLogs returns an iterator that will query the store for more chunks while iterating instead of fetching all chunks upfront
 // for that request.
-func (s *store) SelectLogs(ctx context.Context, req logql.SelectLogParams) (iter.EntryIterator, error) {
+func (s *LokiStore) SelectLogs(ctx context.Context, req logql.SelectLogParams) (iter.EntryIterator, error) {
 	matchers, from, through, err := decodeReq(req)
 	if err != nil {
 		return nil, err
 	}
 
-	lazyChunks, err := s.lazyChunks(ctx, matchers, from, through)
+	hintRanges := iter.NewHintTimeRanges(req.GetHintRanges(), req.Start, req.End)
+	lazyChunks, err := s.lazyChunks(ctx, from, through, chunk.NewPredicate(matchers, req.Plan), req.GetStoreChunks(), hintRanges)
 	if err != nil {
 		return nil, err
+	}
+
+	if len(lazyChunks) == 0 {
+		return iter.NoopEntryIterator, nil
 	}
 
 	expr, err := req.LogSelector()
@@ -350,21 +569,42 @@ func (s *store) SelectLogs(ctx context.Context, req logql.SelectLogParams) (iter
 		return nil, err
 	}
 
-	if len(lazyChunks) == 0 {
-		return iter.NoopIterator, nil
+	pipeline, err = deletion.SetupPipeline(req, pipeline)
+	if err != nil {
+		return nil, err
 	}
-	var chunkFilterer ChunkFilterer
+
+	if s.pipelineWrapper != nil && httpreq.ExtractHeader(ctx, httpreq.LokiDisablePipelineWrappersHeader) != "true" {
+		userID, err := tenant.TenantID(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		pipeline = s.pipelineWrapper.Wrap(ctx, pipeline, req.Plan.String(), userID)
+	}
+
+	var chunkFilterer chunk.Filterer
 	if s.chunkFilterer != nil {
 		chunkFilterer = s.chunkFilterer.ForRequest(ctx)
 	}
 
-	return newLogBatchIterator(ctx, s.chunkMetrics, lazyChunks, s.cfg.MaxChunkBatchSize, matchers, pipeline, req.Direction, req.Start, req.End, chunkFilterer)
+	return newLogBatchIterator(ctx, s.schemaCfg, s.chunkMetrics, lazyChunks, s.cfg.MaxChunkBatchSize, matchers, pipeline, req.Direction, req.Start, req.End, chunkFilterer, hintRanges)
 }
 
-func (s *store) SelectSamples(ctx context.Context, req logql.SelectSampleParams) (iter.SampleIterator, error) {
+func (s *LokiStore) SelectSamples(ctx context.Context, req logql.SelectSampleParams) (iter.SampleIterator, error) {
 	matchers, from, through, err := decodeReq(req)
 	if err != nil {
 		return nil, err
+	}
+
+	hintRanges := iter.NewHintTimeRanges(req.GetHintRanges(), req.Start, req.End)
+	lazyChunks, err := s.lazyChunks(ctx, from, through, chunk.NewPredicate(matchers, req.Plan), req.GetStoreChunks(), hintRanges)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(lazyChunks) == 0 {
+		return iter.NoopSampleIterator, nil
 	}
 
 	expr, err := req.Expr()
@@ -376,24 +616,73 @@ func (s *store) SelectSamples(ctx context.Context, req logql.SelectSampleParams)
 	if err != nil {
 		return nil, err
 	}
+	// A literal or a vector expression produces samples without reading logs, so its
+	// extractor is nil and there is no chunk worth touching. The plan is
+	// caller-supplied, so guard rather than assume such a request never arrives.
+	//
+	// Guard before SetupExtractor: given deletes it wraps the nil extractor into a
+	// non-nil filtering one, and this check would stop firing.
+	if extractor == nil {
+		return iter.NoopSampleIterator, nil
+	}
 
-	lazyChunks, err := s.lazyChunks(ctx, matchers, from, through)
+	extractor, err = deletion.SetupExtractor(req, extractor)
 	if err != nil {
 		return nil, err
 	}
 
-	if len(lazyChunks) == 0 {
-		return iter.NoopIterator, nil
+	if s.extractorWrapper != nil &&
+		httpreq.ExtractHeader(ctx, httpreq.LokiDisablePipelineWrappersHeader) != "true" {
+		userID, err := tenant.TenantID(ctx)
+		if err != nil {
+			return nil, err
+		}
+
+		extractor = s.extractorWrapper.Wrap(ctx, extractor, req.Plan.String(), userID)
 	}
-	var chunkFilterer ChunkFilterer
+
+	var chunkFilterer chunk.Filterer
 	if s.chunkFilterer != nil {
 		chunkFilterer = s.chunkFilterer.ForRequest(ctx)
 	}
 
-	return newSampleBatchIterator(ctx, s.chunkMetrics, lazyChunks, s.cfg.MaxChunkBatchSize, matchers, extractor, req.Start, req.End, chunkFilterer)
+	switch req.Order {
+	case logproto.SAMPLE_ORDER_BY_TIMESTAMP:
+		return newTimestampFirstSampleBatchIterator(
+			ctx,
+			s.schemaCfg,
+			s.chunkMetrics,
+			lazyChunks,
+			s.cfg.MaxChunkBatchSize,
+			matchers,
+			req.Start,
+			req.End,
+			chunkFilterer,
+			extractor,
+			hintRanges,
+		)
+	case logproto.SAMPLE_ORDER_BY_STREAM:
+		return newStreamFirstSampleBatchIterator(
+			ctx,
+			s.schemaCfg,
+			s.chunkMetrics,
+			lazyChunks,
+			s.cfg.MaxChunkBatchSize,
+			matchers,
+			req.Start,
+			req.End,
+			chunkFilterer,
+			streamFirstPrefetchConcurrency(s.cfg.MaxParallelGetChunk, s.cfg.MaxChunkBatchSize),
+			fetchLazyChunks,
+			extractor,
+			hintRanges,
+		)
+	default:
+		return nil, fmt.Errorf("unknown sample order %v", req.Order)
+	}
 }
 
-func (s *store) GetSchemaConfigs() []chunk.PeriodConfig {
+func (s *LokiStore) GetSchemaConfigs() []config.PeriodConfig {
 	return s.schemaCfg.Configs
 }
 
@@ -408,65 +697,26 @@ func filterChunksByTime(from, through model.Time, chunks []chunk.Chunk) []chunk.
 	return filtered
 }
 
-func RegisterCustomIndexClients(cfg *Config, registerer prometheus.Registerer) {
-	// BoltDB Shipper is supposed to be run as a singleton.
-	// This could also be done in NewBoltDBIndexClientWithShipper factory method but we are doing it here because that method is used
-	// in tests for creating multiple instances of it at a time.
-	var boltDBIndexClientWithShipper chunk.IndexClient
-
-	storage.RegisterIndexStore(shipper.BoltDBShipperType, func() (chunk.IndexClient, error) {
-		if boltDBIndexClientWithShipper != nil {
-			return boltDBIndexClientWithShipper, nil
-		}
-
-		if cfg.BoltDBShipperConfig.Mode == shipper.ModeReadOnly && cfg.BoltDBShipperConfig.IndexGatewayClientConfig.Address != "" {
-			gateway, err := shipper.NewGatewayClient(cfg.BoltDBShipperConfig.IndexGatewayClientConfig, registerer)
-			if err != nil {
-				return nil, err
-			}
-
-			boltDBIndexClientWithShipper = gateway
-			return gateway, nil
-		}
-
-		objectClient, err := storage.NewObjectClient(cfg.BoltDBShipperConfig.SharedStoreType, cfg.Config)
-		if err != nil {
-			return nil, err
-		}
-
-		boltDBIndexClientWithShipper, err = shipper.NewShipper(cfg.BoltDBShipperConfig, objectClient, registerer)
-
-		return boltDBIndexClientWithShipper, err
-	}, func() (client chunk.TableClient, e error) {
-		objectClient, err := storage.NewObjectClient(cfg.BoltDBShipperConfig.SharedStoreType, cfg.Config)
-		if err != nil {
-			return nil, err
-		}
-
-		return shipper.NewBoltDBShipperTableClient(objectClient, cfg.BoltDBShipperConfig.SharedStoreKeyPrefix), nil
-	})
-}
-
-// ActivePeriodConfig returns index of active PeriodicConfig which would be applicable to logs that would be pushed starting now.
-// Note: Another PeriodicConfig might be applicable for future logs which can change index type.
-func ActivePeriodConfig(configs []chunk.PeriodConfig) int {
-	now := model.Now()
-	i := sort.Search(len(configs), func(i int) bool {
-		return configs[i].From.Time > now
-	})
-	if i > 0 {
-		i--
-	}
-	return i
-}
-
-// UsingBoltdbShipper checks whether current or the next index type is boltdb-shipper, returns true if yes.
-func UsingBoltdbShipper(configs []chunk.PeriodConfig) bool {
-	activePCIndex := ActivePeriodConfig(configs)
-	if configs[activePCIndex].IndexType == shipper.BoltDBShipperType ||
-		(len(configs)-1 > activePCIndex && configs[activePCIndex+1].IndexType == shipper.BoltDBShipperType) {
-		return true
+func filterChunksByHintRanges(chunks []chunk.Chunk, hintRanges iter.HintTimeRanges) []chunk.Chunk {
+	if !hintRanges.Enabled() {
+		return chunks
 	}
 
-	return false
+	filtered := make([]chunk.Chunk, 0, len(chunks))
+	for _, chk := range chunks {
+		if hintRanges.OverlapsClosed(chk.From.Time(), chk.Through.Time()) {
+			filtered = append(filtered, chk)
+		}
+	}
+	return filtered
+}
+
+type failingChunkWriter struct{}
+
+func (f failingChunkWriter) Put(_ context.Context, _ []chunk.Chunk) error {
+	return errWritingChunkUnsupported
+}
+
+func (f failingChunkWriter) PutOne(_ context.Context, _, _ model.Time, _ chunk.Chunk) error {
+	return errWritingChunkUnsupported
 }

@@ -2,25 +2,29 @@ package ingester
 
 import (
 	"flag"
+	"fmt"
 	"sync"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"go.uber.org/atomic"
+
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/prometheus/tsdb/wal"
+	"github.com/prometheus/prometheus/tsdb/wlog"
+	"github.com/prometheus/prometheus/util/compression"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/util/flagext"
+	"github.com/grafana/loki/v3/pkg/ingester/wal"
+	"github.com/grafana/loki/v3/pkg/util/flagext"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var (
 	// shared pool for WALRecords and []logproto.Entries
-	recordPool = newRecordPool()
+	recordPool = wal.NewRecordPool()
 )
 
-const walSegmentSize = wal.DefaultSegmentSize * 4
+const walSegmentSize = wlog.DefaultSegmentSize * 4
 const defaultCeiling = 4 << 30 // 4GB
 
 type WALConfig struct {
@@ -29,50 +33,62 @@ type WALConfig struct {
 	CheckpointDuration  time.Duration    `yaml:"checkpoint_duration"`
 	FlushOnShutdown     bool             `yaml:"flush_on_shutdown"`
 	ReplayMemoryCeiling flagext.ByteSize `yaml:"replay_memory_ceiling"`
+	DiskFullThreshold   float64          `yaml:"disk_full_threshold"`
+
+	RecordV4Enabled bool `yaml:"record_v4_enabled"`
 }
 
 func (cfg *WALConfig) Validate() error {
 	if cfg.Enabled && cfg.CheckpointDuration < 1 {
-		return errors.Errorf("invalid checkpoint duration: %v", cfg.CheckpointDuration)
+		return fmt.Errorf("invalid checkpoint duration: %v", cfg.CheckpointDuration)
+	}
+	if cfg.DiskFullThreshold < 0 || cfg.DiskFullThreshold > 1 {
+		return fmt.Errorf("invalid disk full threshold: %v (must be between 0 and 1)", cfg.DiskFullThreshold)
 	}
 	return nil
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
 func (cfg *WALConfig) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&cfg.Dir, "ingester.wal-dir", "wal", "Directory to store the WAL and/or recover from WAL.")
+	f.StringVar(&cfg.Dir, "ingester.wal-dir", "wal", "Directory where the WAL data is stored and/or recovered from.")
 	f.BoolVar(&cfg.Enabled, "ingester.wal-enabled", true, "Enable writing of ingested data into WAL.")
 	f.DurationVar(&cfg.CheckpointDuration, "ingester.checkpoint-duration", 5*time.Minute, "Interval at which checkpoints should be created.")
 	f.BoolVar(&cfg.FlushOnShutdown, "ingester.flush-on-shutdown", false, "When WAL is enabled, should chunks be flushed to long-term storage on shutdown.")
+	f.Float64Var(&cfg.DiskFullThreshold, "ingester.wal-disk-full-threshold", 0.90, "Threshold for disk usage (0.0 to 1.0) at which the WAL will throttle incoming writes. Set to 0 to disable throttling.")
+	f.BoolVar(&cfg.RecordV4Enabled, "ingester.wal-record-v4-enabled", false, "Write WAL records as V4, which store the Kafka record timestamp. Older versions can't replay them. When disabled, records are written as V3 and V4 timestamps are ignored on replay.")
 
 	// Need to set default here
 	cfg.ReplayMemoryCeiling = flagext.ByteSize(defaultCeiling)
-	f.Var(&cfg.ReplayMemoryCeiling, "ingester.wal-replay-memory-ceiling", "How much memory the WAL may use during replay before it needs to flush chunks to storage, i.e. 10GB. We suggest setting this to a high percentage (~75%) of available memory.")
+	f.Var(&cfg.ReplayMemoryCeiling, "ingester.wal-replay-memory-ceiling", "Maximum memory size the WAL may use during replay. After hitting this, it will flush data to storage before continuing. A unit suffix (KB, MB, GB) may be applied.")
 }
 
 // WAL interface allows us to have a no-op WAL when the WAL is disabled.
 type WAL interface {
 	Start()
 	// Log marshalls the records and writes it into the WAL.
-	Log(*WALRecord) error
+	Log(*wal.Record) error
 	// Stop stops all the WAL operations.
 	Stop() error
+	// IsDiskThrottled returns true if the disk is too full and writes should be throttled.
+	IsDiskThrottled() bool
 }
 
 type noopWAL struct{}
 
-func (noopWAL) Start()               {}
-func (noopWAL) Log(*WALRecord) error { return nil }
-func (noopWAL) Stop() error          { return nil }
+func (noopWAL) Start()                {}
+func (noopWAL) Log(*wal.Record) error { return nil }
+func (noopWAL) Stop() error           { return nil }
+func (noopWAL) IsDiskThrottled() bool { return false }
 
 type walWrapper struct {
 	cfg        WALConfig
-	wal        *wal.WAL
+	wal        *wlog.WL
 	metrics    *ingesterMetrics
 	seriesIter SeriesIter
 
-	wait sync.WaitGroup
-	quit chan struct{}
+	wait          sync.WaitGroup
+	quit          chan struct{}
+	diskThrottled atomic.Bool
 }
 
 // newWAL creates a WAL object. If the WAL is disabled, then the returned WAL is a no-op WAL.
@@ -81,7 +97,7 @@ func newWAL(cfg WALConfig, registerer prometheus.Registerer, metrics *ingesterMe
 		return noopWAL{}, nil
 	}
 
-	tsdbWAL, err := wal.NewSize(util_log.Logger, registerer, cfg.Dir, walSegmentSize, false)
+	tsdbWAL, err := wlog.NewSize(util_log.SlogFromGoKit(util_log.Logger), registerer, cfg.Dir, walSegmentSize, compression.None)
 	if err != nil {
 		return nil, err
 	}
@@ -102,36 +118,41 @@ func (w *walWrapper) Start() {
 	go w.run()
 }
 
-func (w *walWrapper) Log(record *WALRecord) error {
+func (w *walWrapper) Log(record *wal.Record) error {
 	if record == nil || (len(record.Series) == 0 && len(record.RefEntries) == 0) {
 		return nil
 	}
 	select {
 	case <-w.quit:
-		return nil
+		return errors.New("wal is stopped")
 	default:
-		buf := recordPool.GetBytes()[:0]
+		buf := recordPool.GetBytes()
 		defer func() {
 			recordPool.PutBytes(buf)
 		}()
 
 		// Always write series then entries.
 		if len(record.Series) > 0 {
-			buf = record.encodeSeries(buf)
-			if err := w.wal.Log(buf); err != nil {
+			*buf = record.EncodeSeries(*buf)
+			if err := w.wal.Log(*buf); err != nil {
 				return err
 			}
 			w.metrics.walRecordsLogged.Inc()
-			w.metrics.walLoggedBytesTotal.Add(float64(len(buf)))
-			buf = buf[:0]
+			w.metrics.walLoggedBytesTotal.Add(float64(len(*buf)))
+			*buf = (*buf)[:0]
 		}
 		if len(record.RefEntries) > 0 {
-			buf = record.encodeEntries(CurrentEntriesRec, buf)
-			if err := w.wal.Log(buf); err != nil {
+			// Only V4 stores the record timestamp, but older versions can't read it.
+			version := wal.WALRecordEntriesV3
+			if w.cfg.RecordV4Enabled {
+				version = wal.WALRecordEntriesV4
+			}
+			*buf = record.EncodeEntries(version, *buf)
+			if err := w.wal.Log(*buf); err != nil {
 				return err
 			}
 			w.metrics.walRecordsLogged.Inc()
-			w.metrics.walLoggedBytesTotal.Add(float64(len(buf)))
+			w.metrics.walLoggedBytesTotal.Add(float64(len(*buf)))
 		}
 		return nil
 	}
@@ -145,6 +166,10 @@ func (w *walWrapper) Stop() error {
 	return err
 }
 
+func (w *walWrapper) IsDiskThrottled() bool {
+	return w.diskThrottled.Load()
+}
+
 func (w *walWrapper) checkpointWriter() *WALCheckpointWriter {
 	return &WALCheckpointWriter{
 		metrics:    w.metrics,
@@ -155,6 +180,12 @@ func (w *walWrapper) checkpointWriter() *WALCheckpointWriter {
 func (w *walWrapper) run() {
 	level.Info(util_log.Logger).Log("msg", "started", "component", "wal")
 	defer w.wait.Done()
+
+	// Start disk monitoring if throttling is enabled
+	if w.cfg.DiskFullThreshold > 0 {
+		w.wait.Add(1)
+		go w.monitorDisk()
+	}
 
 	checkpointer := NewCheckpointer(
 		w.cfg.CheckpointDuration,
@@ -167,54 +198,50 @@ func (w *walWrapper) run() {
 
 }
 
-type resettingPool struct {
-	rPool *sync.Pool // records
-	ePool *sync.Pool // entries
-	bPool *sync.Pool // bytes
-}
+// monitorDisk periodically checks disk usage and sets the throttle flag
+func (w *walWrapper) monitorDisk() {
+	defer w.wait.Done()
 
-func (p *resettingPool) GetRecord() *WALRecord {
-	rec := p.rPool.Get().(*WALRecord)
-	rec.Reset()
-	return rec
-}
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
 
-func (p *resettingPool) PutRecord(r *WALRecord) {
-	p.rPool.Put(r)
-}
+	for {
+		select {
+		case <-ticker.C:
+			usage, err := w.checkDiskUsage()
+			if err != nil {
+				level.Warn(util_log.Logger).Log("msg", "failed to check disk usage", "err", err, "component", "wal")
+				continue
+			}
 
-func (p *resettingPool) GetEntries() []logproto.Entry {
-	return p.ePool.Get().([]logproto.Entry)
-}
+			wasThrottled := w.diskThrottled.Load()
+			isThrottled := usage >= w.cfg.DiskFullThreshold
 
-func (p *resettingPool) PutEntries(es []logproto.Entry) {
-	p.ePool.Put(es[:0]) // nolint:staticcheck
-}
+			if isThrottled != wasThrottled {
+				w.diskThrottled.Store(isThrottled)
+				if isThrottled {
+					level.Warn(util_log.Logger).Log(
+						"msg", "disk usage exceeded threshold, throttling writes",
+						"usage_percent", fmt.Sprintf("%.2f%%", usage*100),
+						"threshold_percent", fmt.Sprintf("%.2f%%", w.cfg.DiskFullThreshold*100),
+						"component", "wal",
+					)
+					w.metrics.walDiskFullFailures.Inc()
+				} else {
+					level.Info(util_log.Logger).Log(
+						"msg", "disk usage below threshold, resuming writes",
+						"usage_percent", fmt.Sprintf("%.2f%%", usage*100),
+						"threshold_percent", fmt.Sprintf("%.2f%%", w.cfg.DiskFullThreshold*100),
+						"component", "wal",
+					)
+				}
+			}
 
-func (p *resettingPool) GetBytes() []byte {
-	return p.bPool.Get().([]byte)
-}
+			// Update metrics with current disk usage
+			w.metrics.walDiskUsagePercent.Set(usage)
 
-func (p *resettingPool) PutBytes(b []byte) {
-	p.bPool.Put(b[:0]) // nolint:staticcheck
-}
-
-func newRecordPool() *resettingPool {
-	return &resettingPool{
-		rPool: &sync.Pool{
-			New: func() interface{} {
-				return &WALRecord{}
-			},
-		},
-		ePool: &sync.Pool{
-			New: func() interface{} {
-				return make([]logproto.Entry, 0, 512)
-			},
-		},
-		bPool: &sync.Pool{
-			New: func() interface{} {
-				return make([]byte, 0, 1<<10) // 1kb
-			},
-		},
+		case <-w.quit:
+			return
+		}
 	}
 }

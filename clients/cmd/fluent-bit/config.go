@@ -2,28 +2,26 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/grafana/dskit/flagext"
+	dskit_flagext "github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/log"
 	"github.com/prometheus/common/model"
-	"github.com/weaveworks/common/logging"
 
-	"github.com/grafana/loki/clients/pkg/logentry/logql"
-	"github.com/grafana/loki/clients/pkg/promtail/client"
-
-	lokiflag "github.com/grafana/loki/pkg/util/flagext"
+	"github.com/grafana/loki/v3/clients/pkg/util"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/util/flagext"
 )
 
-var defaultClientCfg = client.Config{}
+var defaultClientCfg = util.Config{}
 
 func init() {
 	// Init everything with default values.
-	flagext.RegisterFlags(&defaultClientCfg)
+	dskit_flagext.RegisterFlags(&defaultClientCfg)
 }
 
 type ConfigGetter interface {
@@ -43,15 +41,32 @@ const (
 )
 
 type config struct {
-	clientConfig         client.Config
+	clientConfig         util.Config
 	bufferConfig         bufferConfig
-	logLevel             logging.Level
+	logLevel             log.Level
 	autoKubernetesLabels bool
 	removeKeys           []string
 	labelKeys            []string
 	lineFormat           format
 	dropSingleKey        bool
 	labelMap             map[string]interface{}
+}
+
+// externalLabelsFromFluentBitLabelsOption parses the fluent-bit plugin Labels option
+// (LogQL stream selector) into ExternalLabels. Empty labels uses the default {job="fluent-bit"}.
+func externalLabelsFromFluentBitLabelsOption(labels string) (flagext.LabelSet, error) {
+	if labels == "" {
+		labels = `{job="fluent-bit"}`
+	}
+	matchers, err := syntax.ParseMatchers(labels, true)
+	if err != nil {
+		return flagext.LabelSet{}, err
+	}
+	labelSet := make(model.LabelSet)
+	for _, m := range matchers {
+		labelSet[model.LabelName(m.Name)] = model.LabelValue(m.Value)
+	}
+	return flagext.LabelSet{LabelSet: labelSet}, nil
 }
 
 func parseConfig(cfg ConfigGetter) (*config, error) {
@@ -61,13 +76,13 @@ func parseConfig(cfg ConfigGetter) (*config, error) {
 	res.bufferConfig = defaultBufferConfig
 
 	url := cfg.Get("URL")
-	var clientURL flagext.URLValue
+	var clientURL dskit_flagext.URLValue
 	if url == "" {
 		url = "http://localhost:3100/loki/api/v1/push"
 	}
 	err := clientURL.Set(url)
 	if err != nil {
-		return nil, errors.New("failed to parse client URL")
+		return nil, fmt.Errorf("failed to parse client URL: %w", err)
 	}
 	res.clientConfig.URL = clientURL
 
@@ -83,7 +98,7 @@ func parseConfig(cfg ConfigGetter) (*config, error) {
 		} else {
 			batchWaitValue, err := time.ParseDuration(batchWait)
 			if err != nil {
-				return nil, fmt.Errorf("failed to parse BatchWait: %s", batchWait)
+				return nil, fmt.Errorf("failed to parse BatchWait %s: %w", batchWait, err)
 			}
 			res.clientConfig.BatchWait = batchWaitValue
 		}
@@ -93,7 +108,7 @@ func parseConfig(cfg ConfigGetter) (*config, error) {
 	if batchSize != "" {
 		batchSizeValue, err := strconv.Atoi(batchSize)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse BatchSize: %s", batchSize)
+			return nil, fmt.Errorf("failed to parse BatchSize %s: %w", batchSize, err)
 		}
 		res.clientConfig.BatchSize = batchSizeValue
 	}
@@ -102,7 +117,7 @@ func parseConfig(cfg ConfigGetter) (*config, error) {
 	if timeout != "" {
 		timeoutValue, err := time.ParseDuration(timeout)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse Timeout: %s", timeout)
+			return nil, fmt.Errorf("failed to parse Timeout %s: %w", timeout, err)
 		}
 		res.clientConfig.Timeout = timeoutValue
 	}
@@ -111,7 +126,7 @@ func parseConfig(cfg ConfigGetter) (*config, error) {
 	if minBackoff != "" {
 		minBackoffValue, err := time.ParseDuration(minBackoff)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse MinBackoff: %s", minBackoff)
+			return nil, fmt.Errorf("failed to parse MinBackoff %s: %w", minBackoff, err)
 		}
 		res.clientConfig.BackoffConfig.MinBackoff = minBackoffValue
 	}
@@ -120,7 +135,7 @@ func parseConfig(cfg ConfigGetter) (*config, error) {
 	if maxBackoff != "" {
 		maxBackoffValue, err := time.ParseDuration(maxBackoff)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse MaxBackoff: %s", maxBackoff)
+			return nil, fmt.Errorf("failed to parse MaxBackoff %s: %w", maxBackoff, err)
 		}
 		res.clientConfig.BackoffConfig.MaxBackoff = maxBackoffValue
 	}
@@ -129,32 +144,24 @@ func parseConfig(cfg ConfigGetter) (*config, error) {
 	if maxRetries != "" {
 		maxRetriesValue, err := strconv.Atoi(maxRetries)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse MaxRetries: %s", maxRetries)
+			return nil, fmt.Errorf("failed to parse MaxRetries %s: %w", maxRetries, err)
 		}
 		res.clientConfig.BackoffConfig.MaxRetries = maxRetriesValue
 	}
 
-	labels := cfg.Get("Labels")
-	if labels == "" {
-		labels = `{job="fluent-bit"}`
-	}
-	matchers, err := logql.ParseMatchers(labels)
+	extLabels, err := externalLabelsFromFluentBitLabelsOption(cfg.Get("Labels"))
 	if err != nil {
 		return nil, err
 	}
-	labelSet := make(model.LabelSet)
-	for _, m := range matchers {
-		labelSet[model.LabelName(m.Name)] = model.LabelValue(m.Value)
-	}
-	res.clientConfig.ExternalLabels = lokiflag.LabelSet{LabelSet: labelSet}
+	res.clientConfig.ExternalLabels = extLabels
 
 	logLevel := cfg.Get("LogLevel")
 	if logLevel == "" {
 		logLevel = "info"
 	}
-	var level logging.Level
+	var level log.Level
 	if err := level.Set(logLevel); err != nil {
-		return nil, fmt.Errorf("invalid log level: %v", logLevel)
+		return nil, fmt.Errorf("invalid log level %v: %w", logLevel, err)
 	}
 	res.logLevel = level
 
@@ -200,7 +207,7 @@ func parseConfig(cfg ConfigGetter) (*config, error) {
 
 	labelMapPath := cfg.Get("LabelMapPath")
 	if labelMapPath != "" {
-		content, err := ioutil.ReadFile(labelMapPath)
+		content, err := os.ReadFile(labelMapPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open LabelMap file: %s", err)
 		}
@@ -238,7 +245,7 @@ func parseConfig(cfg ConfigGetter) (*config, error) {
 	if queueSegmentSize != "" {
 		res.bufferConfig.dqueConfig.queueSegmentSize, err = strconv.Atoi(queueSegmentSize)
 		if err != nil {
-			return nil, fmt.Errorf("impossible to convert string to integer DqueSegmentSize: %v", queueSegmentSize)
+			return nil, fmt.Errorf("impossible to convert string to integer DqueSegmentSize %v: %w", queueSegmentSize, err)
 		}
 	}
 

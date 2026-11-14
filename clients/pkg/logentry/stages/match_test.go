@@ -5,9 +5,10 @@ import (
 	"testing"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
+
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var testMatchYaml = `
@@ -125,6 +126,7 @@ func TestMatcher(t *testing.T) {
 		{`{foo="bar",bar!~"te.*"}`, map[string]string{"foo": "bar", "bar": "test"}, MatchActionDrop, false, false, false},
 
 		{`{foo=""}`, map[string]string{}, MatchActionKeep, false, true, false},
+		{`{foo="bar"} |= "foo" | status >= 200`, map[string]string{"foo": "bar"}, MatchActionKeep, false, false, true},
 	}
 
 	for _, tt := range tests {

@@ -9,24 +9,19 @@ local k = import 'ksonnet-util/kausal.libsonnet';
 
   ruler_args:: $._config.commonArgs {
     target: 'ruler',
-  } + if $._config.using_boltdb_shipper then {
-    // Use PVC for caching
-    'boltdb.shipper.cache-location': '/data/boltdb-cache',
-  } else {},
-
-  _config+:: {
-    // run rulers as statefulsets when using boltdb-shipper to avoid using node disk for storing the index.
-    stateful_rulers: if self.using_boltdb_shipper && !self.use_index_gateway then true else super.stateful_rulers,
   },
+
+  ruler_ports:: $.util.defaultPorts,
 
   ruler_container::
     if $._config.ruler_enabled then
       container.new('ruler', $._images.ruler) +
-      container.withPorts($.util.defaultPorts) +
+      container.withPorts($.ruler_ports) +
       container.withArgsMixin(k.util.mapToFlags($.ruler_args)) +
       k.util.resourcesRequests('1', '6Gi') +
       k.util.resourcesLimits('16', '16Gi') +
       $.util.readinessProbe +
+      container.withEnvMixin($._config.commonEnvs) +
       $.jaeger_mixin +
       if $._config.stateful_rulers then
         container.withVolumeMountsMixin([
@@ -44,15 +39,17 @@ local k = import 'ksonnet-util/kausal.libsonnet';
         $._config.overrides_configmap_mount_name,
         $._config.overrides_configmap_mount_path,
       ) +
-      k.util.antiAffinity
+      k.util.antiAffinity +
+      deployment.mixin.spec.strategy.rollingUpdate.withMaxSurge(5) +
+      deployment.mixin.spec.strategy.rollingUpdate.withMaxUnavailable(1)
     else {},
 
   ruler_service: if !$._config.ruler_enabled
   then {}
   else
     if $._config.stateful_rulers
-    then k.util.serviceFor($.ruler_statefulset)
-    else k.util.serviceFor($.ruler_deployment),
+    then k.util.serviceFor($.ruler_statefulset, $._config.service_ignored_labels)
+    else k.util.serviceFor($.ruler_deployment, $._config.service_ignored_labels),
 
 
   // PVC for rulers when running as statefulsets

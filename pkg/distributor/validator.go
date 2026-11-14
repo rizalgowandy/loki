@@ -1,27 +1,35 @@
 package distributor
 
 import (
+	"context"
 	"errors"
-	"net/http"
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/weaveworks/common/httpgrpc"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/validation"
+	"github.com/grafana/loki/v3/pkg/loghttp/push"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/util"
+	"github.com/grafana/loki/v3/pkg/util/constants"
+	"github.com/grafana/loki/v3/pkg/validation"
+)
+
+const (
+	timeFormat = time.RFC3339
 )
 
 type Validator struct {
 	Limits
+	usageTracker push.UsageTracker
 }
 
-func NewValidator(l Limits) (*Validator, error) {
+func NewValidator(l Limits, t push.UsageTracker) (*Validator, error) {
 	if l == nil {
 		return nil, errors.New("nil Limits")
 	}
-	return &Validator{l}, nil
+	return &Validator{l, t}, nil
 }
 
 type validationContext struct {
@@ -29,98 +37,197 @@ type validationContext struct {
 	rejectOldSampleMaxAge int64
 	creationGracePeriod   int64
 
-	maxLineSize         int
-	maxLineSizeTruncate bool
+	maxLineSize                   int
+	maxLineSizeTruncate           bool
+	maxLineSizeTruncateIdentifier string
 
 	maxLabelNamesPerSeries int
 	maxLabelNameLength     int
 	maxLabelValueLength    int
 
+	incrementDuplicateTimestamps bool
+	discoverServiceName          []string
+	discoverGenericFields        map[string][]string
+	discoverLogLevels            bool
+	logLevelFields               []string
+	logLevelFromJSONMaxDepth     int
+
+	allowStructuredMetadata    bool
+	maxStructuredMetadataSize  int
+	maxStructuredMetadataCount int
+
+	blockIngestionUntil      time.Time
+	blockIngestionStatusCode int
+	enforcedLabels           []string
+
 	userID string
 }
 
-func (v Validator) getValidationContextFor(userID string) validationContext {
-	now := time.Now()
+func (v Validator) getValidationContextForTime(now time.Time, userID string) validationContext {
 	return validationContext{
-		userID:                 userID,
-		rejectOldSample:        v.RejectOldSamples(userID),
-		rejectOldSampleMaxAge:  now.Add(-v.RejectOldSamplesMaxAge(userID)).UnixNano(),
-		creationGracePeriod:    now.Add(v.CreationGracePeriod(userID)).UnixNano(),
-		maxLineSize:            v.MaxLineSize(userID),
-		maxLineSizeTruncate:    v.MaxLineSizeTruncate(userID),
-		maxLabelNamesPerSeries: v.MaxLabelNamesPerSeries(userID),
-		maxLabelNameLength:     v.MaxLabelNameLength(userID),
-		maxLabelValueLength:    v.MaxLabelValueLength(userID),
+		userID:                        userID,
+		rejectOldSample:               v.RejectOldSamples(userID),
+		rejectOldSampleMaxAge:         now.Add(-v.RejectOldSamplesMaxAge(userID)).UnixNano(),
+		creationGracePeriod:           now.Add(v.CreationGracePeriod(userID)).UnixNano(),
+		maxLineSize:                   v.MaxLineSize(userID),
+		maxLineSizeTruncate:           v.MaxLineSizeTruncate(userID),
+		maxLineSizeTruncateIdentifier: v.MaxLineSizeTruncateIdentifier(userID),
+		maxLabelNamesPerSeries:        v.MaxLabelNamesPerSeries(userID),
+		maxLabelNameLength:            v.MaxLabelNameLength(userID),
+		maxLabelValueLength:           v.MaxLabelValueLength(userID),
+		incrementDuplicateTimestamps:  v.IncrementDuplicateTimestamps(userID),
+		discoverServiceName:           v.DiscoverServiceName(userID),
+		discoverLogLevels:             v.DiscoverLogLevels(userID),
+		logLevelFields:                v.LogLevelFields(userID),
+		logLevelFromJSONMaxDepth:      v.LogLevelFromJSONMaxDepth(userID),
+		discoverGenericFields:         v.DiscoverGenericFields(userID),
+		allowStructuredMetadata:       v.AllowStructuredMetadata(userID),
+		maxStructuredMetadataSize:     v.MaxStructuredMetadataSize(userID),
+		maxStructuredMetadataCount:    v.MaxStructuredMetadataCount(userID),
+		blockIngestionUntil:           v.BlockIngestionUntil(userID),
+		blockIngestionStatusCode:      v.BlockIngestionStatusCode(userID),
+		enforcedLabels:                v.EnforcedLabels(userID),
 	}
 }
 
-// ValidateEntry returns an error if the entry is invalid
-func (v Validator) ValidateEntry(ctx validationContext, labels string, entry logproto.Entry) error {
+// ValidateEntry validates an entry including its shared metadata and returns its rejection reason and error.
+// Shared metadata size and count must describe the original, unnormalized attributes.
+func (v Validator) ValidateEntry(vCtx validationContext, labels labels.Labels, entry logproto.Entry, sharedMetadataSize, sharedMetadataCount int) (string, error) {
 	ts := entry.Timestamp.UnixNano()
-	if ctx.rejectOldSample && ts < ctx.rejectOldSampleMaxAge {
-		validation.DiscardedSamples.WithLabelValues(validation.GreaterThanMaxSampleAge, ctx.userID).Inc()
-		validation.DiscardedBytes.WithLabelValues(validation.GreaterThanMaxSampleAge, ctx.userID).Add(float64(len(entry.Line)))
-		return httpgrpc.Errorf(http.StatusBadRequest, validation.GreaterThanMaxSampleAgeErrorMsg, labels, entry.Timestamp)
+	validation.LineLengthHist.Observe(float64(len(entry.Line)))
+	structuredMetadataCount := len(entry.StructuredMetadata) + sharedMetadataCount
+	structuredMetadataSizeBytes := util.StructuredMetadataSize(entry.StructuredMetadata) + sharedMetadataSize
+
+	if vCtx.rejectOldSample && ts < vCtx.rejectOldSampleMaxAge {
+		// Makes time string on the error message formatted consistently.
+		formatedEntryTime := entry.Timestamp.Format(timeFormat)
+		formatedRejectMaxAgeTime := time.Unix(0, vCtx.rejectOldSampleMaxAge).Format(timeFormat)
+		return validation.GreaterThanMaxSampleAge, fmt.Errorf(validation.GreaterThanMaxSampleAgeErrorMsg, labels, formatedEntryTime, formatedRejectMaxAgeTime)
 	}
 
-	if ts > ctx.creationGracePeriod {
-		validation.DiscardedSamples.WithLabelValues(validation.TooFarInFuture, ctx.userID).Inc()
-		validation.DiscardedBytes.WithLabelValues(validation.TooFarInFuture, ctx.userID).Add(float64(len(entry.Line)))
-		return httpgrpc.Errorf(http.StatusBadRequest, validation.TooFarInFutureErrorMsg, labels, entry.Timestamp)
+	if ts > vCtx.creationGracePeriod {
+		formatedEntryTime := entry.Timestamp.Format(timeFormat)
+		return validation.TooFarInFuture, fmt.Errorf(validation.TooFarInFutureErrorMsg, labels, formatedEntryTime)
 	}
 
-	if maxSize := ctx.maxLineSize; maxSize != 0 && len(entry.Line) > maxSize {
+	if maxSize := vCtx.maxLineSize; maxSize != 0 && len(entry.Line) > maxSize {
 		// I wish we didn't return httpgrpc errors here as it seems
 		// an orthogonal concept (we need not use ValidateLabels in this context)
 		// but the upstream cortex_validation pkg uses it, so we keep this
 		// for parity.
-		validation.DiscardedSamples.WithLabelValues(validation.LineTooLong, ctx.userID).Inc()
-		validation.DiscardedBytes.WithLabelValues(validation.LineTooLong, ctx.userID).Add(float64(len(entry.Line)))
-		return httpgrpc.Errorf(http.StatusBadRequest, validation.LineTooLongErrorMsg, maxSize, labels, len(entry.Line))
+		return validation.LineTooLong, fmt.Errorf(validation.LineTooLongErrorMsg, maxSize, labels, len(entry.Line))
 	}
 
-	return nil
+	if structuredMetadataCount > 0 {
+		if !vCtx.allowStructuredMetadata {
+			return validation.DisallowedStructuredMetadata, fmt.Errorf(validation.DisallowedStructuredMetadataErrorMsg, labels)
+		}
+
+		if maxSize := vCtx.maxStructuredMetadataSize; maxSize != 0 && structuredMetadataSizeBytes > maxSize {
+			return validation.StructuredMetadataTooLarge, fmt.Errorf(validation.StructuredMetadataTooLargeErrorMsg, labels, structuredMetadataSizeBytes, vCtx.maxStructuredMetadataSize)
+		}
+
+		if maxCount := vCtx.maxStructuredMetadataCount; maxCount != 0 && structuredMetadataCount > maxCount {
+			return validation.StructuredMetadataTooMany, fmt.Errorf(validation.StructuredMetadataTooManyErrorMsg, labels, structuredMetadataCount, vCtx.maxStructuredMetadataCount)
+		}
+	}
+
+	return "", nil
 }
 
-// Validate labels returns an error if the labels are invalid
-func (v Validator) ValidateLabels(ctx validationContext, ls labels.Labels, stream logproto.Stream) error {
-	if len(ls) == 0 {
-		validation.DiscardedSamples.WithLabelValues(validation.MissingLabels, ctx.userID).Inc()
-		return httpgrpc.Errorf(http.StatusBadRequest, validation.MissingLabelsErrorMsg)
-	}
-	numLabelNames := len(ls)
-	if numLabelNames > ctx.maxLabelNamesPerSeries {
-		validation.DiscardedSamples.WithLabelValues(validation.MaxLabelNamesPerSeries, ctx.userID).Inc()
-		bytes := 0
-		for _, e := range stream.Entries {
-			bytes += len(e.Line)
-		}
-		validation.DiscardedBytes.WithLabelValues(validation.MaxLabelNamesPerSeries, ctx.userID).Add(float64(bytes))
-		return httpgrpc.Errorf(http.StatusBadRequest, validation.MaxLabelNamesPerSeriesErrorMsg, stream.Labels, numLabelNames, ctx.maxLabelNamesPerSeries)
+// ValidateLabels returns the discard reason and an error if the stream's labels are invalid. Like
+// ValidateEntry, it reports nothing; the caller does. Aggregated metric and pattern streams are not
+// validated, as Loki creates those for internal use.
+func (v Validator) ValidateLabels(vCtx validationContext, ls labels.Labels, stream logproto.InternalStreamAdapter) (string, error) {
+	if ls.IsEmpty() {
+		return validation.MissingLabels, fmt.Errorf(validation.MissingLabelsErrorMsg)
 	}
 
+	if constants.IsInternalStream(ls.Has) {
+		return "", nil
+	}
+
+	numLabelNames := ls.Len()
+	// This is a special case that's often added by the Loki infrastructure. It may result in allowing one extra label
+	// if incoming requests already have a service_name
+	if ls.Has(push.LabelServiceName) {
+		numLabelNames--
+	}
+
+	if numLabelNames > vCtx.maxLabelNamesPerSeries {
+		return validation.MaxLabelNamesPerSeries, fmt.Errorf(validation.MaxLabelNamesPerSeriesErrorMsg, stream.Labels, numLabelNames, vCtx.maxLabelNamesPerSeries)
+	}
+
+	var reason string
 	lastLabelName := ""
-	for _, l := range ls {
-		if len(l.Name) > ctx.maxLabelNameLength {
-			updateMetrics(validation.LabelNameTooLong, ctx.userID, stream)
-			return httpgrpc.Errorf(http.StatusBadRequest, validation.LabelNameTooLongErrorMsg, stream.Labels, l.Name)
-		} else if len(l.Value) > ctx.maxLabelValueLength {
-			updateMetrics(validation.LabelValueTooLong, ctx.userID, stream)
-			return httpgrpc.Errorf(http.StatusBadRequest, validation.LabelValueTooLongErrorMsg, stream.Labels, l.Value)
+	err := ls.Validate(func(l labels.Label) error {
+		if len(l.Name) > vCtx.maxLabelNameLength {
+			reason = validation.LabelNameTooLong
+			return fmt.Errorf(validation.LabelNameTooLongErrorMsg, stream.Labels, l.Name)
+		} else if len(l.Value) > vCtx.maxLabelValueLength {
+			reason = validation.LabelValueTooLong
+			return fmt.Errorf(validation.LabelValueTooLongErrorMsg, stream.Labels, l.Value)
 		} else if cmp := strings.Compare(lastLabelName, l.Name); cmp == 0 {
-			updateMetrics(validation.DuplicateLabelNames, ctx.userID, stream)
-			return httpgrpc.Errorf(http.StatusBadRequest, validation.DuplicateLabelNamesErrorMsg, stream.Labels, l.Name)
+			reason = validation.DuplicateLabelNames
+			return fmt.Errorf(validation.DuplicateLabelNamesErrorMsg, stream.Labels, l.Name)
 		}
 		lastLabelName = l.Name
-	}
-	return nil
+		return nil
+	})
+	return reason, err
 }
 
-func updateMetrics(reason, userID string, stream logproto.Stream) {
-	validation.DiscardedSamples.WithLabelValues(reason, userID).Inc()
-	bytes := 0
-	for _, e := range stream.Entries {
-		bytes += len(e.Line)
+// reportDiscardedData reports entryCount samples totaling entrySize bytes of a stream with labels as
+// discarded for reason, in the discarded samples and bytes metrics and to the usage tracker. Every
+// discard pushWithResolver makes is reported through here.
+func (v Validator) reportDiscardedData(ctx context.Context, reason string, vCtx validationContext, labels labels.Labels, retentionHours string, policy string, entrySize, entryCount int, format string) {
+	validation.DiscardedSamples.WithLabelValues(reason, vCtx.userID, retentionHours, policy, format).Add(float64(entryCount))
+	validation.DiscardedBytes.WithLabelValues(reason, vCtx.userID, retentionHours, policy, format).Add(float64(entrySize))
+	if v.usageTracker != nil {
+		v.usageTracker.DiscardedBytesAdd(ctx, vCtx.userID, reason, labels, float64(entrySize), format)
 	}
-	validation.DiscardedBytes.WithLabelValues(reason, userID).Add(float64(bytes))
+}
+
+// ShouldBlockIngestion returns whether ingestion should be blocked, until when and the status code.
+// priority is: Per-tenant block > named policy block > Global policy block
+func (v Validator) ShouldBlockIngestion(ctx validationContext, now time.Time, policy string) (bool, int, string, error) {
+	if block, until, code := v.shouldBlockTenant(ctx, now); block {
+		err := fmt.Errorf(validation.BlockedIngestionErrorMsg, ctx.userID, until.Format(time.RFC3339), code)
+		return true, code, validation.BlockedIngestion, err
+	}
+
+	if block, until, code := v.shouldBlockPolicy(ctx, policy, now); block {
+		err := fmt.Errorf(validation.BlockedIngestionPolicyErrorMsg, ctx.userID, policy, until.Format(time.RFC3339), code)
+		return true, code, validation.BlockedIngestionPolicy, err
+	}
+
+	return false, 0, "", nil
+}
+
+func (v Validator) shouldBlockTenant(ctx validationContext, now time.Time) (bool, time.Time, int) {
+	if ctx.blockIngestionUntil.IsZero() {
+		return false, time.Time{}, 0
+	}
+
+	if now.Before(ctx.blockIngestionUntil) {
+		return true, ctx.blockIngestionUntil, ctx.blockIngestionStatusCode
+	}
+
+	return false, time.Time{}, 0
+}
+
+// ShouldBlockPolicy checks if ingestion should be blocked for the given policy.
+// It returns true if ingestion should be blocked, along with the block until time and status code.
+func (v Validator) shouldBlockPolicy(ctx validationContext, policy string, now time.Time) (bool, time.Time, int) {
+	// Check if this policy is blocked in tenant configs
+	blockUntil := v.BlockIngestionPolicyUntil(ctx.userID, policy)
+	if blockUntil.IsZero() {
+		return false, time.Time{}, 0
+	}
+
+	if now.Before(blockUntil) {
+		return true, blockUntil, ctx.blockIngestionStatusCode
+	}
+
+	return false, time.Time{}, 0
 }

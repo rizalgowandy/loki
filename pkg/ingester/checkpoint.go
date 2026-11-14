@@ -3,28 +3,28 @@ package ingester
 import (
 	"bytes"
 	"context"
-	fmt "fmt"
-	"io/ioutil"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/cortexpb"
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/dustin/go-humanize"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pkg/errors"
-	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
-	"github.com/prometheus/prometheus/tsdb/wal"
+	"github.com/prometheus/prometheus/tsdb/wlog"
+	"github.com/prometheus/prometheus/util/compression"
 	prompool "github.com/prometheus/prometheus/util/pool"
 
-	"github.com/grafana/loki/pkg/chunkenc"
-	"github.com/grafana/loki/pkg/util/pool"
+	"github.com/grafana/loki/v3/pkg/chunkenc"
+	"github.com/grafana/loki/v3/pkg/ingester/wal"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/util/pool"
 )
 
 var (
@@ -74,6 +74,9 @@ func toWireChunks(descs []chunkDesc, wireChunks []chunkWithBuffer) ([]chunkWithB
 			blocks: chunksBufferPool.Get(chunkSize),
 			head:   headBufferPool.Get(headSize),
 		}
+		if !d.ingestedAt.IsZero() {
+			wireChunk.IngestedAtMs = d.ingestedAt.UnixMilli()
+		}
 
 		err := d.chunk.SerializeForCheckpointTo(
 			wireChunk.blocks,
@@ -90,7 +93,7 @@ func toWireChunks(descs []chunkDesc, wireChunks []chunkWithBuffer) ([]chunkWithB
 	return wireChunks, nil
 }
 
-func fromWireChunks(conf *Config, wireChunks []Chunk) ([]chunkDesc, error) {
+func fromWireChunks(conf *Config, headfmt chunkenc.HeadBlockFmt, wireChunks []Chunk) ([]chunkDesc, error) {
 	descs := make([]chunkDesc, 0, len(wireChunks))
 	for _, c := range wireChunks {
 		desc := chunkDesc{
@@ -99,12 +102,11 @@ func fromWireChunks(conf *Config, wireChunks []Chunk) ([]chunkDesc, error) {
 			flushed:     c.FlushedAt,
 			lastUpdated: c.LastUpdated,
 		}
+		if c.IngestedAtMs > 0 {
+			desc.ingestedAt = time.UnixMilli(c.IngestedAtMs).UTC()
+		}
 
-		// Always use Unordered headblocks during replay
-		// to ensure Loki can effectively replay an unordered-friendly
-		// WAL into a new configuration that disables unordered writes.
-		hbType := chunkenc.UnorderedHeadBlockFmt
-		mc, err := chunkenc.MemchunkFromCheckpoint(c.Data, c.Head, hbType, conf.BlockSize, conf.TargetChunkSize)
+		mc, err := chunkenc.MemchunkFromCheckpoint(c.Data, c.Head, headfmt, conf.BlockSize, conf.TargetChunkSize)
 		if err != nil {
 			return nil, err
 		}
@@ -125,15 +127,15 @@ func decodeCheckpointRecord(rec []byte, s *Series) error {
 	cpy := make([]byte, len(rec))
 	copy(cpy, rec)
 
-	switch RecordType(cpy[0]) {
-	case CheckpointRecord:
+	switch wal.RecordType(cpy[0]) {
+	case wal.CheckpointRecord:
 		return proto.Unmarshal(cpy[1:], s)
 	default:
-		return errors.Errorf("unexpected record type: %d", rec[0])
+		return fmt.Errorf("unexpected record type: %d", rec[0])
 	}
 }
 
-func encodeWithTypeHeader(m *Series, typ RecordType, buf []byte) ([]byte, error) {
+func encodeWithTypeHeader(m *Series, typ wal.RecordType, buf []byte) ([]byte, error) {
 	size := m.Size()
 	if cap(buf) < size+1 {
 		buf = make([]byte, size+1)
@@ -208,9 +210,7 @@ func newStreamsIterator(ing ingesterInstances) *streamIterator {
 	instances := ing.getInstances()
 	streamInstances := make([]streamInstance, len(instances))
 	for i, inst := range instances {
-		inst.streamsMtx.RLock()
-		streams := make([]*stream, 0, len(inst.streams))
-		inst.streamsMtx.RUnlock()
+		streams := make([]*stream, 0, inst.streams.Len())
 		_ = inst.forAllStreams(context.Background(), func(s *stream) error {
 			streams = append(streams, s)
 			return nil
@@ -245,15 +245,18 @@ func (s *streamIterator) Next() bool {
 	// remove the first stream
 	s.instances[0].streams = s.instances[0].streams[1:]
 
-	stream.chunkMtx.RLock()
-	defer stream.chunkMtx.RUnlock()
-
+	stream.chunkMtx.Lock()
 	if len(stream.chunks) < 1 {
 		// it's possible the stream has been flushed to storage
 		// in between starting the checkpointing process and
 		// checkpointing this stream.
+		// Unlock before recursing so empty streams don't stay
+		// exclusively locked while later streams are serialized.
+		stream.chunkMtx.Unlock()
 		return s.Next()
 	}
+	defer stream.chunkMtx.Unlock()
+
 	chunks, err := toWireChunks(stream.chunks, s.buffer)
 	if err != nil {
 		s.err = err
@@ -272,7 +275,7 @@ func (s *streamIterator) Next() bool {
 
 	s.current.UserID = currentInstance.id
 	s.current.Fingerprint = uint64(stream.fp)
-	s.current.Labels = cortexpb.FromLabelsToLabelAdapters(stream.labels)
+	s.current.Labels = logproto.FromLabelsToLabelAdapters(stream.labels)
 
 	s.current.To = stream.lastLine.ts
 	s.current.LastLine = stream.lastLine.content
@@ -310,7 +313,7 @@ type walLogger interface {
 
 type WALCheckpointWriter struct {
 	metrics    *ingesterMetrics
-	segmentWAL *wal.WAL
+	segmentWAL *wlog.WL
 
 	checkpointWAL walLogger
 	lastSegment   int    // name of the last segment guaranteed to be covered by the checkpoint
@@ -320,7 +323,7 @@ type WALCheckpointWriter struct {
 }
 
 func (w *WALCheckpointWriter) Advance() (bool, error) {
-	_, lastSegment, err := wal.Segments(w.segmentWAL.Dir())
+	_, lastSegment, err := wlog.Segments(w.segmentWAL.Dir())
 	if err != nil {
 		return false, err
 	}
@@ -332,7 +335,7 @@ func (w *WALCheckpointWriter) Advance() (bool, error) {
 
 	// First we advance the wal segment internally to ensure we don't overlap a previous checkpoint in
 	// low throughput scenarios and to minimize segment replays on top of checkpoints.
-	if err := w.segmentWAL.NextSegment(); err != nil {
+	if _, err := w.segmentWAL.NextSegment(); err != nil {
 		return false, err
 	}
 
@@ -340,23 +343,18 @@ func (w *WALCheckpointWriter) Advance() (bool, error) {
 	// we can start from that particular WAL segment.
 	checkpointDir := filepath.Join(w.segmentWAL.Dir(), fmt.Sprintf(checkpointPrefix+"%06d", lastSegment))
 	level.Info(util_log.Logger).Log("msg", "attempting checkpoint for", "dir", checkpointDir)
-	checkpointDirTemp := checkpointDir + ".tmp"
+	checkpointDirTemp := checkpointDir + checkpointTmpSuffix
 
-	// cleanup any old partial checkpoints
-	if _, err := os.Stat(checkpointDirTemp); err == nil {
-		if err := os.RemoveAll(checkpointDirTemp); err != nil {
-			level.Error(util_log.Logger).Log("msg", "unable to cleanup old tmp checkpoint", "dir", checkpointDirTemp)
-			return false, err
-		}
+	// cleanup any old partial checkpoints (not just the current one)
+	cleanupStaleTmpCheckpoints(w.segmentWAL.Dir(), util_log.Logger)
+
+	if err := os.MkdirAll(checkpointDirTemp, 0750); err != nil {
+		return false, fmt.Errorf("create checkpoint dir: %w", err)
 	}
 
-	if err := os.MkdirAll(checkpointDirTemp, 0777); err != nil {
-		return false, errors.Wrap(err, "create checkpoint dir")
-	}
-
-	checkpoint, err := wal.NewSize(log.With(util_log.Logger, "component", "checkpoint_wal"), nil, checkpointDirTemp, walSegmentSize, false)
+	checkpoint, err := wlog.NewSize(util_log.SlogFromGoKit(log.With(util_log.Logger, "component", "checkpoint_wal")), nil, checkpointDirTemp, walSegmentSize, compression.None)
 	if err != nil {
-		return false, errors.Wrap(err, "open checkpoint")
+		return false, fmt.Errorf("open checkpoint: %w", err)
 	}
 
 	w.checkpointWAL = checkpoint
@@ -373,7 +371,7 @@ func (w *WALCheckpointWriter) Write(s *Series) error {
 	size := s.Size() + 1 // +1 for header
 	buf := recordBufferPool.Get(size).([]byte)[:size]
 
-	b, err := encodeWithTypeHeader(s, CheckpointRecord, buf)
+	b, err := encodeWithTypeHeader(s, wal.CheckpointRecord, buf)
 	if err != nil {
 		return err
 	}
@@ -406,8 +404,9 @@ func (w *WALCheckpointWriter) flush() error {
 }
 
 const checkpointPrefix = "checkpoint."
+const checkpointTmpSuffix = ".tmp"
 
-var checkpointRe = regexp.MustCompile("^" + regexp.QuoteMeta(checkpointPrefix) + "(\\d+)(\\.tmp)?$")
+var checkpointRe = regexp.MustCompile("^" + regexp.QuoteMeta(checkpointPrefix) + "(\\d+)(" + regexp.QuoteMeta(checkpointTmpSuffix) + ")?$")
 
 // checkpointIndex returns the index of a given checkpoint file. It handles
 // both regular and temporary checkpoints according to the includeTmp flag. If
@@ -427,7 +426,7 @@ func checkpointIndex(filename string, includeTmp bool) (int, error) {
 // lastCheckpoint returns the directory name and index of the most recent checkpoint.
 // If dir does not contain any checkpoints, -1 is returned as index.
 func lastCheckpoint(dir string) (string, int, error) {
-	dirs, err := ioutil.ReadDir(dir)
+	dirs, err := os.ReadDir(dir)
 	if err != nil {
 		return "", -1, err
 	}
@@ -466,9 +465,9 @@ func (w *WALCheckpointWriter) deleteCheckpoints(maxIndex int) (err error) {
 		}
 	}()
 
-	errs := tsdb_errors.NewMulti()
+	var errs []error
 
-	files, err := ioutil.ReadDir(w.segmentWAL.Dir())
+	files, err := os.ReadDir(w.segmentWAL.Dir())
 	if err != nil {
 		return err
 	}
@@ -478,10 +477,115 @@ func (w *WALCheckpointWriter) deleteCheckpoints(maxIndex int) (err error) {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(w.segmentWAL.Dir(), fi.Name())); err != nil {
-			errs.Add(err)
+			errs = append(errs, err)
 		}
 	}
-	return errs.Err()
+	return errors.Join(errs...)
+}
+
+// cleanupOldCheckpoints removes old checkpoints that have been superseded by a newer checkpoint.
+// This is primarily used during startup to clean up old checkpoints when repeated checkpoint failures
+// have prevented normal cleanup (which happens via deleteCheckpoints() after successful completion).
+//
+// A checkpoint at index N contains a complete snapshot of state through segment N, so segments <= N
+// can be deleted once that checkpoint is successfully written. This function cleans up old checkpoints
+// that are no longer needed because their corresponding segments have been truncated.
+//
+// The protectedCheckpointIdx parameter specifies a checkpoint that should never be deleted, typically
+// the most recent successfully completed checkpoint. This ensures we always keep at least one valid
+// recovery point.
+//
+// Note: It's normal for checkpoint.N to exist while firstSegment is N+1, since the checkpoint replaces
+// the need for segment N. This function relies on the protectedCheckpointIdx to determine which
+// checkpoints are safe to delete, not just the segment numbers.
+//
+// This differs from deleteCheckpoints() which runs after successful checkpoint completion and handles
+// normal cleanup including .tmp files.
+func cleanupOldCheckpoints(dir string, protectedCheckpointIdx int, logger log.Logger) {
+	level.Info(util_log.Logger).Log("msg", "old checkpoint cleanup starting")
+	start := time.Now()
+	allSuccess := true
+	defer func() {
+		elapsed := time.Since(start)
+		level.Info(util_log.Logger).Log("msg", "old checkpoint cleanup done", "duration", elapsed.String(), "success", allSuccess)
+	}()
+	firstSegment, _, err := wlog.Segments(dir)
+	if err != nil {
+		level.Error(logger).Log("msg", "unable to list WAL segments for old checkpoint cleanup, checkpoint cleanup cannot proceed, this is not expected and could lead to disk space exhaustion and may indicate disk I/O problems or corruption and should be investigated manually", "err", err)
+		allSuccess = false
+		return
+	}
+
+	if firstSegment <= 0 {
+		// No cleanup needed if we're starting from segment 0
+		return
+	}
+
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		level.Error(logger).Log("msg", "unable to read WAL directory for old checkpoint cleanup, checkpoint cleanup cannot proceed, this is not expected and could lead to disk space exhaustion and may indicate disk I/O problems or corruption and should be investigated manually", "err", err)
+		allSuccess = false
+		return
+	}
+
+	for _, fi := range files {
+		// Check if this is a completed checkpoint (not .tmp)
+		idx, err := checkpointIndex(fi.Name(), false)
+		if err != nil || !fi.IsDir() {
+			continue
+		}
+
+		// Delete checkpoints that are both:
+		// 1. From a time when segments <= firstSegment existed (idx < firstSegment is typical for old checkpoints)
+		// 2. Older than the protected checkpoint (idx < protectedCheckpointIdx means superseded)
+		// The second condition is the key safety check - we never delete the protected checkpoint.
+		if idx < firstSegment && idx < protectedCheckpointIdx {
+			orphanedPath := filepath.Join(dir, fi.Name())
+			if err := os.RemoveAll(orphanedPath); err != nil {
+				level.Error(logger).Log("msg", "unable to cleanup old checkpoint, this is not expected and could lead to disk space exhaustion and may indicate disk I/O problems or corruption and should be investigated manually", "dir", orphanedPath, "err", err)
+				allSuccess = false
+			} else {
+				level.Info(logger).Log("msg", "cleaned up old superseded checkpoint", "dir", fi.Name(), "idx", idx, "firstSegment", firstSegment, "protectedCheckpoint", protectedCheckpointIdx)
+			}
+		}
+	}
+}
+
+// cleanupStaleTmpCheckpoints removes all .tmp checkpoint directories which represent
+// incomplete/failed checkpoint operations. These are safe to delete because recovery
+// only uses completed checkpoints (those without the .tmp suffix).
+func cleanupStaleTmpCheckpoints(dir string, logger log.Logger) {
+	level.Info(util_log.Logger).Log("msg", "tmp checkpoint cleanup starting")
+	start := time.Now()
+	allSuccess := true
+	defer func() {
+		elapsed := time.Since(start)
+		level.Info(util_log.Logger).Log("msg", "tmp checkpoint cleanup done", "duration", elapsed.String(), "success", allSuccess)
+	}()
+
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		level.Error(logger).Log("msg", "unable to read WAL directory for tmp checkpoint cleanup, checkpoint cleanup cannot proceed, this is not expected and could lead to disk space exhaustion and may indicate disk I/O problems or corruption and should be investigated manually", "err", err)
+		allSuccess = false
+		return
+	}
+
+	for _, fi := range files {
+		// Check if this is a .tmp checkpoint directory
+		if _, tmpErr := checkpointIndex(fi.Name(), true); tmpErr == nil && fi.IsDir() {
+			// Only delete if it actually has the .tmp suffix
+			if filepath.Ext(fi.Name()) == checkpointTmpSuffix {
+				tmpPath := filepath.Join(dir, fi.Name())
+				if err := os.RemoveAll(tmpPath); err != nil {
+					level.Error(logger).Log("msg", "unable to cleanup stale tmp checkpoint, this is not expected and could lead to disk space exhaustion and may indicate disk I/O problems or corruption and should be investigated manually", "dir", tmpPath, "err", err)
+					// Continue cleaning up other .tmp directories even if one fails
+					allSuccess = false
+				} else {
+					level.Info(logger).Log("msg", "cleaned up stale tmp checkpoint at startup", "dir", fi.Name())
+				}
+			}
+		}
+	}
 }
 
 func (w *WALCheckpointWriter) Close(abort bool) error {
@@ -499,7 +603,7 @@ func (w *WALCheckpointWriter) Close(abort bool) error {
 	}
 
 	if err := fileutil.Replace(w.checkpointWAL.Dir(), w.final); err != nil {
-		return errors.Wrap(err, "rename checkpoint directory")
+		return fmt.Errorf("rename checkpoint directory: %w", err)
 	}
 	level.Info(util_log.Logger).Log("msg", "atomic checkpoint finished", "old", w.checkpointWAL.Dir(), "new", w.final)
 	// We delete the WAL segments which are before the previous checkpoint and not before the

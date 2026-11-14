@@ -1,15 +1,19 @@
 package ring
 
 import (
-	"container/heap"
 	"fmt"
+	"maps"
+	"math"
 	"sort"
+	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/gogo/protobuf/proto"
 
 	"github.com/grafana/dskit/kv/codec"
 	"github.com/grafana/dskit/kv/memberlist"
+	"github.com/grafana/dskit/loser"
 )
 
 // ByAddr is a sortable list of InstanceDesc.
@@ -18,6 +22,15 @@ type ByAddr []InstanceDesc
 func (ts ByAddr) Len() int           { return len(ts) }
 func (ts ByAddr) Swap(i, j int)      { ts[i], ts[j] = ts[j], ts[i] }
 func (ts ByAddr) Less(i, j int) bool { return ts[i].Addr < ts[j].Addr }
+
+// ByID is a sortable list of InstanceDesc.
+type ByID []InstanceDesc
+
+func (ts ByID) Len() int           { return len(ts) }
+func (ts ByID) Swap(i, j int)      { ts[i], ts[j] = ts[j], ts[i] }
+func (ts ByID) Less(i, j int) bool { return ts[i].Id < ts[j].Id }
+
+type InstanceVersions map[uint64]uint64
 
 // ProtoDescFactory makes new Descs
 func ProtoDescFactory() proto.Message {
@@ -36,25 +49,50 @@ func NewDesc() *Desc {
 	}
 }
 
+func timeToUnixSecons(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
+}
+
+// maxFutureTimestampSkew is how far ahead of the local clock a timestamp in a ring entry
+// may be before Merge treats it as written by a node with a skewed clock.
+const maxFutureTimestampSkew = 10 * time.Minute
+
+// futureTimestampLimit returns the latest unix timestamp Merge accepts at the given time.
+func futureTimestampLimit(now time.Time) int64 {
+	return now.Add(maxFutureTimestampSkew).Unix()
+}
+
+// localMergeTimestamp returns the timestamp Merge compares incoming timestamps against for a local
+// entry. A local timestamp beyond limit was written by a node with a clock too far ahead, so it loses
+// against any valid incoming timestamp, including zero.
+func localMergeTimestamp(ts, limit int64) int64 {
+	if ts > limit {
+		return -1
+	}
+	return ts
+}
+
 // AddIngester adds the given ingester to the ring. Ingester will only use supplied tokens,
 // any other tokens are removed.
-func (d *Desc) AddIngester(id, addr, zone string, tokens []uint32, state InstanceState, registeredAt time.Time) InstanceDesc {
+func (d *Desc) AddIngester(id, addr, zone string, tokens []uint32, state InstanceState, registeredAt time.Time, readOnly bool, readOnlyUpdated time.Time, versions InstanceVersions) InstanceDesc {
 	if d.Ingesters == nil {
 		d.Ingesters = map[string]InstanceDesc{}
 	}
 
-	registeredTimestamp := int64(0)
-	if !registeredAt.IsZero() {
-		registeredTimestamp = registeredAt.Unix()
-	}
-
 	ingester := InstanceDesc{
-		Addr:                addr,
-		Timestamp:           time.Now().Unix(),
-		RegisteredTimestamp: registeredTimestamp,
-		State:               state,
-		Tokens:              tokens,
-		Zone:                zone,
+		Id:                       id,
+		Addr:                     addr,
+		Timestamp:                time.Now().Unix(),
+		State:                    state,
+		Tokens:                   tokens,
+		Zone:                     zone,
+		RegisteredTimestamp:      timeToUnixSecons(registeredAt),
+		ReadOnly:                 readOnly,
+		ReadOnlyUpdatedTimestamp: timeToUnixSecons(readOnlyUpdated),
+		Versions:                 versions,
 	}
 
 	d.Ingesters[id] = ingester
@@ -132,6 +170,30 @@ func (i *InstanceDesc) GetRegisteredAt() time.Time {
 	return time.Unix(i.RegisteredTimestamp, 0)
 }
 
+// GetLastHeartbeatAt returns the timestamp of the last heartbeat sent by the instance
+// or a zero value if unknown.
+func (i *InstanceDesc) GetLastHeartbeatAt() time.Time {
+	if i == nil || i.Timestamp == 0 {
+		return time.Time{}
+	}
+
+	return time.Unix(i.Timestamp, 0)
+}
+
+// GetReadOnlyState returns the read-only state and timestamp of last read-only state update.
+func (i *InstanceDesc) GetReadOnlyState() (bool, time.Time) {
+	if i == nil {
+		return false, time.Time{}
+	}
+
+	ts := time.Time{}
+	if i.ReadOnlyUpdatedTimestamp > 0 {
+		ts = time.Unix(i.ReadOnlyUpdatedTimestamp, 0)
+	}
+
+	return i.ReadOnly, ts
+}
+
 func (i *InstanceDesc) IsHealthy(op Operation, heartbeatTimeout time.Duration, now time.Time) bool {
 	healthy := op.IsInstanceInStateHealthy(i.State)
 
@@ -139,11 +201,8 @@ func (i *InstanceDesc) IsHealthy(op Operation, heartbeatTimeout time.Duration, n
 }
 
 // IsHeartbeatHealthy returns whether the heartbeat timestamp for the ingester is within the
-// specified timeout period. A timeout of zero disables the timeout; the heartbeat is ignored.
+// specified timeout period.
 func (i *InstanceDesc) IsHeartbeatHealthy(heartbeatTimeout time.Duration, now time.Time) bool {
-	if heartbeatTimeout == 0 {
-		return true
-	}
 	return now.Sub(time.Unix(i.Timestamp, 0)) <= heartbeatTimeout
 }
 
@@ -165,6 +224,10 @@ func (i *InstanceDesc) IsReady(now time.Time, heartbeatTimeout time.Duration) er
 // it will choose more recent state from the two rings, and put that into this ring.
 // There is one exception: we accept LEFT state even if Timestamp hasn't changed.
 //
+// Timestamps more than maxFutureTimestampSkew ahead of the local clock are considered
+// to come from a node with a skewed clock: such incoming entries are ignored, and such
+// local entries are replaced by any other incoming entry, so that the ring can recover.
+//
 // localCAS flag tells the merge that it can use incoming ring as a full state, and detect
 // missing ingesters based on it. Ingesters from incoming ring will cause ingester
 // to be marked as LEFT and gossiped about.
@@ -173,6 +236,14 @@ func (i *InstanceDesc) IsReady(now time.Time, heartbeatTimeout time.Duration) er
 // (see resolveConflicts).
 //
 // This method is part of memberlist.Mergeable interface, and is only used by gossiping ring.
+//
+// The receiver must be normalised, that is, the token lists must sorted and not contain
+// duplicates. The function guarantees that the receiver will be left in this normalised state,
+// so multiple subsequent Merge calls are valid usage.
+//
+// The Mergeable passed as the parameter does not need to be normalised.
+//
+// Note: This method modifies d and mergeable to reduce allocations and copies.
 func (d *Desc) Merge(mergeable memberlist.Mergeable, localCAS bool) (memberlist.Mergeable, error) {
 	return d.mergeWithTime(mergeable, localCAS, time.Now())
 }
@@ -184,7 +255,6 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 
 	other, ok := mergeable.(*Desc)
 	if !ok {
-		// This method only deals with non-nil rings.
 		return nil, fmt.Errorf("expected *ring.Desc, got %T", mergeable)
 	}
 
@@ -192,19 +262,32 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 		return nil, nil
 	}
 
-	thisIngesterMap := buildNormalizedIngestersMap(d)
-	otherIngesterMap := buildNormalizedIngestersMap(other)
+	normalizeIngestersMap(other)
+
+	thisIngesterMap := d.Ingesters
+	otherIngesterMap := other.Ingesters
 
 	var updated []string
+	tokensChanged := false
+	timestampLimit := futureTimestampLimit(now)
 
 	for name, oing := range otherIngesterMap {
+		if oing.Timestamp > timestampLimit {
+			// Written by a node with a clock too far ahead. Accepting it would block all later updates.
+			continue
+		}
+
 		ting := thisIngesterMap[name]
-		// ting.Timestamp will be 0, if there was no such ingester in our version
-		if oing.Timestamp > ting.Timestamp {
+		// thisTimestamp will be 0, if there was no such ingester in our version
+		thisTimestamp := localMergeTimestamp(ting.Timestamp, timestampLimit)
+		if oing.Timestamp > thisTimestamp {
+			if !tokensEqual(ting.Tokens, oing.Tokens) {
+				tokensChanged = true
+			}
 			oing.Tokens = append([]uint32(nil), oing.Tokens...) // make a copy of tokens
 			thisIngesterMap[name] = oing
 			updated = append(updated, name)
-		} else if oing.Timestamp == ting.Timestamp && ting.State != LEFT && oing.State == LEFT {
+		} else if oing.Timestamp == thisTimestamp && ting.State != LEFT && oing.State == LEFT {
 			// we accept LEFT even if timestamp hasn't changed
 			thisIngesterMap[name] = oing // has no tokens already
 			updated = append(updated, name)
@@ -235,7 +318,7 @@ func (d *Desc) mergeWithTime(mergeable memberlist.Mergeable, localCAS bool, now 
 	}
 
 	// resolveConflicts allocates lot of memory, so if we can avoid it, do that.
-	if conflictingTokensExist(thisIngesterMap) {
+	if tokensChanged && conflictingTokensExist(thisIngesterMap) {
 		resolveConflicts(thisIngesterMap)
 	}
 
@@ -261,22 +344,18 @@ func (d *Desc) MergeContent() []string {
 	return result
 }
 
-// buildNormalizedIngestersMap will do the following:
+// normalizeIngestersMap will do the following:
 // - sorts tokens and removes duplicates (only within single ingester)
-// - it doesn't modify input ring
-func buildNormalizedIngestersMap(inputRing *Desc) map[string]InstanceDesc {
-	out := map[string]InstanceDesc{}
-
+// - modifies the input ring
+func normalizeIngestersMap(inputRing *Desc) {
 	// Make sure LEFT ingesters have no tokens
 	for n, ing := range inputRing.Ingesters {
 		if ing.State == LEFT {
 			ing.Tokens = nil
+			inputRing.Ingesters[n] = ing
 		}
-		out[n] = ing
-	}
 
-	// Sort tokens, and remove duplicates
-	for name, ing := range out {
+		// Sort tokens, and remove duplicates
 		if len(ing.Tokens) == 0 {
 			continue
 		}
@@ -297,25 +376,39 @@ func buildNormalizedIngestersMap(inputRing *Desc) map[string]InstanceDesc {
 		}
 
 		// write updated value back to map
-		out[name] = ing
+		inputRing.Ingesters[n] = ing
 	}
-
-	return out
 }
 
-func conflictingTokensExist(normalizedIngesters map[string]InstanceDesc) bool {
-	count := 0
-	for _, ing := range normalizedIngesters {
-		count += len(ing.Tokens)
+// tokensEqual checks for equality of two slices. Assumes the slices are sorted.
+func tokensEqual(lhs, rhs []uint32) bool {
+	if len(lhs) != len(rhs) {
+		return false
 	}
+	for i := 0; i < len(lhs); i++ {
+		if lhs[i] != rhs[i] {
+			return false
+		}
+	}
+	return true
+}
 
-	tokensMap := make(map[uint32]bool, count)
+var tokenMapPool = sync.Pool{New: func() interface{} { return make(map[uint32]struct{}) }}
+
+func conflictingTokensExist(normalizedIngesters map[string]InstanceDesc) bool {
+	tokensMap := tokenMapPool.Get().(map[uint32]struct{})
+	defer func() {
+		for k := range tokensMap {
+			delete(tokensMap, k)
+		}
+		tokenMapPool.Put(tokensMap)
+	}()
 	for _, ing := range normalizedIngesters {
 		for _, t := range ing.Tokens {
-			if tokensMap[t] {
+			if _, contains := tokensMap[t]; contains {
 				return true
 			}
-			tokensMap[t] = true
+			tokensMap[t] = struct{}{}
 		}
 	}
 	return false
@@ -408,9 +501,21 @@ func (d *Desc) RemoveTombstones(limit time.Time) (total, removed int) {
 	return
 }
 
-// Clone returns a deep copy of the ring state.
+// Clone returns a copy of the ring state. The returned Desc and its Ingesters map are
+// safe to modify (entries can be added, removed or replaced), but reference-type fields
+// inside InstanceDesc (Tokens, Versions) share their underlying storage with the
+// original, so they must be treated as read-only.
+//
+// It's hand-written instead of using the reflection-based proto.Clone because it runs on
+// the memberlist hot path (once per watcher notification), where reflection is a
+// significant CPU cost on rings with thousands of instances. Sharing Tokens and Versions
+// storage is not a behavior change: gogo's proto.Clone shallow-copies non-nullable map
+// values, so it shared those fields too.
 func (d *Desc) Clone() memberlist.Mergeable {
-	return proto.Clone(d).(*Desc)
+	if d == nil {
+		return (*Desc)(nil)
+	}
+	return &Desc{Ingesters: maps.Clone(d.Ingesters)}
 }
 
 func (d *Desc) getTokensInfo() map[uint32]instanceInfo {
@@ -451,7 +556,7 @@ func (d *Desc) GetTokens() []uint32 {
 func (d *Desc) getTokensByZone() map[string][]uint32 {
 	zones := map[string][][]uint32{}
 	for _, instance := range d.Ingesters {
-		// Tokens may not be sorted for an older version which, so we enforce sorting here.
+		// Tokens may not be sorted for an older version, so we enforce sorting here.
 		tokens := instance.Tokens
 		if !sort.IsSorted(Tokens(tokens)) {
 			sort.Sort(Tokens(tokens))
@@ -462,6 +567,108 @@ func (d *Desc) getTokensByZone() map[string][]uint32 {
 
 	// Merge tokens per zone.
 	return MergeTokensByZone(zones)
+}
+
+// getOldestRegisteredTimestamp returns unix timestamp of oldest "RegisteredTimestamp" value from all instances.
+// If any instance has 0 value of RegisteredTimestamp, this function returns 0.
+func (d *Desc) getOldestRegisteredTimestamp() int64 {
+	var result int64
+
+	for _, instance := range d.Ingesters {
+		switch {
+		case instance.RegisteredTimestamp == 0:
+			return 0
+
+		case result == 0:
+			result = instance.RegisteredTimestamp
+
+		case instance.RegisteredTimestamp < result:
+			result = instance.RegisteredTimestamp
+		}
+	}
+
+	return result
+}
+
+func (d *Desc) instancesWithTokensCount() int {
+	count := 0
+	if d != nil {
+		for _, ingester := range d.Ingesters {
+			if len(ingester.Tokens) > 0 {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+func (d *Desc) instancesCountPerZone() map[string]int {
+	instancesCountPerZone := map[string]int{}
+	if d != nil {
+		for _, ingester := range d.Ingesters {
+			instancesCountPerZone[ingester.Zone]++
+		}
+	}
+	return instancesCountPerZone
+}
+
+func (d *Desc) instancesWithTokensCountPerZone() map[string]int {
+	instancesCountPerZone := map[string]int{}
+	if d != nil {
+		for _, ingester := range d.Ingesters {
+			if len(ingester.Tokens) > 0 {
+				instancesCountPerZone[ingester.Zone]++
+			}
+		}
+	}
+	return instancesCountPerZone
+}
+
+func (d *Desc) writableInstancesWithTokensCount() int {
+	writableInstancesWithTokensCount := 0
+	if d != nil {
+		for _, ingester := range d.Ingesters {
+			if len(ingester.Tokens) > 0 && !ingester.ReadOnly {
+				writableInstancesWithTokensCount++
+			}
+		}
+	}
+	return writableInstancesWithTokensCount
+}
+
+func (d *Desc) writableInstancesWithTokensCountPerZone() map[string]int {
+	instancesCountPerZone := map[string]int{}
+	if d != nil {
+		for _, ingester := range d.Ingesters {
+			if len(ingester.Tokens) > 0 && !ingester.ReadOnly {
+				instancesCountPerZone[ingester.Zone]++
+			}
+		}
+	}
+	return instancesCountPerZone
+}
+
+func (d *Desc) readOnlyInstancesAndOldestReadOnlyUpdatedTimestamp() (int, int64) {
+	readOnlyInstances := 0
+	oldestReadOnlyUpdatedTimestamp := int64(0)
+	first := true
+
+	if d != nil {
+		for _, ingester := range d.Ingesters {
+			if !ingester.ReadOnly {
+				continue
+			}
+
+			readOnlyInstances++
+			if first {
+				oldestReadOnlyUpdatedTimestamp = ingester.ReadOnlyUpdatedTimestamp
+			} else {
+				oldestReadOnlyUpdatedTimestamp = min(oldestReadOnlyUpdatedTimestamp, ingester.ReadOnlyUpdatedTimestamp)
+			}
+			first = false
+		}
+	}
+	return readOnlyInstances, oldestReadOnlyUpdatedTimestamp
 }
 
 type CompareResult int
@@ -512,13 +719,29 @@ func (d *Desc) RingCompare(o *Desc) CompareResult {
 			return Different
 		}
 
+		if ing.ReadOnly != oing.ReadOnly {
+			return Different
+		}
+
+		if ing.ReadOnlyUpdatedTimestamp != oing.ReadOnlyUpdatedTimestamp {
+			return Different
+		}
+
 		if len(ing.Tokens) != len(oing.Tokens) {
 			return Different
 		}
 
-		for ix, t := range ing.Tokens {
-			if oing.Tokens[ix] != t {
-				return Different
+		// Consecutive ring states usually share the token slice storage for instances
+		// whose tokens didn't change: the memberlist KV store only replaces map entries
+		// of changed instances, and Desc clones share the Tokens backing arrays. When
+		// both slices point at the same storage, they are equal without comparing the
+		// elements. This is only a fast path: slices with different storage but equal
+		// content still compare as equal below.
+		if unsafe.SliceData(ing.Tokens) != unsafe.SliceData(oing.Tokens) {
+			for ix, t := range ing.Tokens {
+				if oing.Tokens[ix] != t {
+					return Different
+				}
 			}
 		}
 
@@ -537,39 +760,20 @@ func (d *Desc) RingCompare(o *Desc) CompareResult {
 	return EqualButStatesAndTimestamps
 }
 
+// setInstanceIDs sets the ID of each InstanceDesc object managed by this Desc
+func (d *Desc) setInstanceIDs() {
+	for id, inst := range d.Ingesters {
+		inst.Id = id
+		d.Ingesters[id] = inst
+	}
+}
+
 func GetOrCreateRingDesc(d interface{}) *Desc {
 	if d == nil {
 		return NewDesc()
 	}
+
 	return d.(*Desc)
-}
-
-// TokensHeap is an heap data structure used to merge multiple lists
-// of sorted tokens into a single one.
-type TokensHeap [][]uint32
-
-func (h TokensHeap) Len() int {
-	return len(h)
-}
-
-func (h TokensHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-}
-
-func (h TokensHeap) Less(i, j int) bool {
-	return h[i][0] < h[j][0]
-}
-
-func (h *TokensHeap) Push(x interface{}) {
-	*h = append(*h, x.([]uint32))
-}
-
-func (h *TokensHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[0 : n-1]
-	return x
 }
 
 // MergeTokens takes in input multiple lists of tokens and returns a single list
@@ -578,34 +782,15 @@ func (h *TokensHeap) Pop() interface{} {
 func MergeTokens(instances [][]uint32) []uint32 {
 	numTokens := 0
 
-	// Build the heap.
-	h := make(TokensHeap, 0, len(instances))
 	for _, tokens := range instances {
-		if len(tokens) == 0 {
-			continue
-		}
-
-		// We can safely append the input slice because elements inside are never shuffled.
-		h = append(h, tokens)
 		numTokens += len(tokens)
 	}
-	heap.Init(&h)
 
+	tree := loser.New(instances, math.MaxUint32)
 	out := make([]uint32, 0, numTokens)
 
-	for h.Len() > 0 {
-		// The minimum element in the tree is the root, at index 0.
-		lowest := h[0]
-		out = append(out, lowest[0])
-
-		if len(lowest) > 1 {
-			// Remove the first token from the lowest because we popped it
-			// and then fix the heap to keep it sorted.
-			h[0] = h[0][1:]
-			heap.Fix(&h, 0)
-		} else {
-			heap.Remove(&h, 0)
-		}
+	for tree.Next() {
+		out = append(out, tree.Winner())
 	}
 
 	return out

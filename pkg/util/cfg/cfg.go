@@ -31,7 +31,7 @@ func Unmarshal(dst Cloneable, sources ...Source) error {
 	if len(sources) == 0 {
 		panic("No sources supplied to cfg.Unmarshal(). This is most likely a programming issue and should never happen. Check the code!")
 	}
-	if reflect.ValueOf(dst).Kind() != reflect.Ptr {
+	if reflect.ValueOf(dst).Kind() != reflect.Pointer {
 		return ErrNotPointer
 	}
 
@@ -47,7 +47,7 @@ func Unmarshal(dst Cloneable, sources ...Source) error {
 func DefaultUnmarshal(dst Cloneable, args []string, fs *flag.FlagSet) error {
 	return Unmarshal(dst,
 		Defaults(fs),
-		YAMLFlag(args, "config.file"),
+		ConfigFileLoader(args, "config.file", true),
 		Flags(args, fs),
 	)
 }

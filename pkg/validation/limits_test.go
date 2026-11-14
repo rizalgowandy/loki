@@ -1,15 +1,28 @@
 package validation
 
 import (
+	"bytes"
 	"encoding/json"
+	"flag"
+	"fmt"
 	"reflect"
 	"testing"
 	"time"
 
+	dskit_flagext "github.com/grafana/dskit/flagext"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v4"
+	"golang.org/x/time/rate"
+
+	"github.com/grafana/loki/v3/pkg/compactor/deletionmode"
+	"github.com/grafana/loki/v3/pkg/compression"
+	"github.com/grafana/loki/v3/pkg/dataobj/sections/streams"
+	"github.com/grafana/loki/v3/pkg/distributor/shardstreams"
+	"github.com/grafana/loki/v3/pkg/loghttp/push"
+	"github.com/grafana/loki/v3/pkg/logql"
+	"github.com/grafana/loki/v3/pkg/util/flagext"
 )
 
 func TestLimitsTagsYamlMatchJson(t *testing.T) {
@@ -49,7 +62,6 @@ max_line_size: 60
 max_line_size_truncate: true
 max_streams_per_user: 70
 max_global_streams_per_user: 80
-max_chunks_per_query: 90
 max_query_series: 100
 max_query_lookback: 110s
 max_query_length: 120s
@@ -63,8 +75,18 @@ split_queries_by_interval: 190s
 ruler_evaluation_delay_duration: 200s
 ruler_max_rules_per_rule_group: 210
 ruler_max_rule_groups_per_tenant: 220
-per_tenant_override_config: ""
-per_tenant_override_period: 230s
+ruler_remote_write_sigv4_config:
+  region: us-east-1
+query_timeout: 5m
+shard_streams:
+  enabled: true
+  desired_rate: 4mb
+  logging_enabled: true
+blocked_queries:
+  - pattern: ".*foo.*"
+    regex: true
+volume_enabled: true
+volume_max_series: 10001
 `
 	inputJSON := `
  {
@@ -82,7 +104,6 @@ per_tenant_override_period: 230s
   "max_line_size_truncate": true,
   "max_streams_per_user": 70,
   "max_global_streams_per_user": 80,
-  "max_chunks_per_query": 90,
   "max_query_series": 100,
   "max_query_lookback": "110s",
   "max_query_length": "120s",
@@ -96,8 +117,23 @@ per_tenant_override_period: 230s
   "ruler_evaluation_delay_duration": "200s",
   "ruler_max_rules_per_rule_group": 210,
   "ruler_max_rule_groups_per_tenant":220,
-  "per_tenant_override_config": "",
-  "per_tenant_override_period": "230s"
+  "ruler_remote_write_sigv4_config": {
+    "region": "us-east-1"
+  },
+  "query_timeout": "5m",
+  "shard_streams": {
+    "desired_rate": "4mb",
+    "enabled": true,
+    "logging_enabled": true
+  },
+  "blocked_queries": [
+	{
+		"pattern": ".*foo.*",
+		"regex": true
+	}
+  ],
+  "volume_enabled": true,
+  "volume_max_series": 10001
  }
 `
 
@@ -137,22 +173,44 @@ func TestOverwriteMarshalingStringMapYAML(t *testing.T) {
 }
 
 func TestLimitsDoesNotMutate(t *testing.T) {
-	initialDefault := defaultLimits
+	initialDefault := defaultLimits.Load()
 	defer func() {
-		defaultLimits = initialDefault
+		defaultLimits.Store(initialDefault)
 	}()
 
-	// Set new defaults with non-nil values for non-scalar types
+	defaultOTLPConfig := push.OTLPConfig{
+		ResourceAttributes: push.ResourceAttributesConfig{
+			IgnoreDefaults: true,
+			AttributesConfig: []push.AttributesConfig{
+				{
+					Action:     push.IndexLabel,
+					Attributes: []string{"pod"},
+				},
+			},
+		},
+	}
+
+	// Set new defaults with non-nil values for non-scalar types. The non-empty
+	// map default lets us verify that per-tenant overrides do not mutate it.
 	newDefaults := Limits{
-		RulerRemoteWriteHeaders: OverwriteMarshalingStringMap{map[string]string{"a": "b"}},
 		StreamRetention: []StreamRetention{
 			{
 				Period:   model.Duration(24 * time.Hour),
 				Selector: `{a="b"}`,
 			},
 		},
+		PolicyEnforcedLabels: map[string][]string{
+			"default-policy": {"foo", "bar"},
+		},
+		OTLPConfig: &defaultOTLPConfig,
 	}
 	SetDefaultLimitsForYAMLUnmarshalling(newDefaults)
+
+	// defaultPolicyEnforcedLabels is the expected default map value inherited by
+	// cases that do not override policy_enforced_labels.
+	defaultPolicyEnforcedLabels := map[string][]string{
+		"default-policy": {"foo", "bar"},
+	}
 
 	for _, tc := range []struct {
 		desc string
@@ -160,13 +218,19 @@ func TestLimitsDoesNotMutate(t *testing.T) {
 		exp  Limits
 	}{
 		{
-			desc: "map",
+			// A per-tenant map override is merged into the default map. The merge
+			// must operate on a copy so the shared default map is left untouched
+			// (verified after each case).
+			desc: "map override merges into defaults",
 			yaml: `
-ruler_remote_write_headers:
-  foo: "bar"
+policy_enforced_labels:
+  tenant-policy:
+    - baz
 `,
 			exp: Limits{
-				RulerRemoteWriteHeaders: OverwriteMarshalingStringMap{map[string]string{"foo": "bar"}},
+				DiscoverGenericFields: FieldDetectorConfig{},
+				DiscoverServiceName:   []string{},
+				LogLevelFields:        []string{},
 
 				// Rest from new defaults
 				StreamRetention: []StreamRetention{
@@ -175,15 +239,28 @@ ruler_remote_write_headers:
 						Selector: `{a="b"}`,
 					},
 				},
+				OTLPConfig:     &defaultOTLPConfig,
+				EnforcedLabels: []string{},
+				PolicyEnforcedLabels: map[string][]string{
+					"default-policy": {"foo", "bar"},
+					"tenant-policy":  {"baz"},
+				},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				PolicyOverrideLimits:      map[string]PolicyOverridableLimits{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
 			},
 		},
 		{
-			desc: "empty map overrides defaults",
+			// An explicit empty map contributes no keys, so the default map is
+			// preserved unchanged.
+			desc: "empty map preserves defaults",
 			yaml: `
-ruler_remote_write_headers:
+policy_enforced_labels: {}
 `,
 			exp: Limits{
-
+				DiscoverGenericFields: FieldDetectorConfig{},
+				DiscoverServiceName:   []string{},
+				LogLevelFields:        []string{},
 				// Rest from new defaults
 				StreamRetention: []StreamRetention{
 					{
@@ -191,6 +268,14 @@ ruler_remote_write_headers:
 						Selector: `{a="b"}`,
 					},
 				},
+				OTLPConfig:     &defaultOTLPConfig,
+				EnforcedLabels: []string{},
+				PolicyEnforcedLabels: map[string][]string{
+					"default-policy": {"foo", "bar"},
+				},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				PolicyOverrideLimits:      map[string]PolicyOverridableLimits{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
 			},
 		},
 		{
@@ -201,6 +286,9 @@ retention_stream:
     selector: '{foo="bar"}'
 `,
 			exp: Limits{
+				DiscoverGenericFields: FieldDetectorConfig{},
+				DiscoverServiceName:   []string{},
+				LogLevelFields:        []string{},
 				StreamRetention: []StreamRetention{
 					{
 						Period:   model.Duration(24 * time.Hour),
@@ -209,7 +297,12 @@ retention_stream:
 				},
 
 				// Rest from new defaults
-				RulerRemoteWriteHeaders: OverwriteMarshalingStringMap{map[string]string{"a": "b"}},
+				OTLPConfig:                &defaultOTLPConfig,
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{"default-policy": {"foo", "bar"}},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				PolicyOverrideLimits:      map[string]PolicyOverridableLimits{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
 			},
 		},
 		{
@@ -218,24 +311,1368 @@ retention_stream:
 reject_old_samples: true
 `,
 			exp: Limits{
-				RejectOldSamples: true,
+				RejectOldSamples:      true,
+				DiscoverGenericFields: FieldDetectorConfig{},
+				DiscoverServiceName:   []string{},
+				LogLevelFields:        []string{},
 
 				// Rest from new defaults
-				RulerRemoteWriteHeaders: OverwriteMarshalingStringMap{map[string]string{"a": "b"}},
 				StreamRetention: []StreamRetention{
 					{
 						Period:   model.Duration(24 * time.Hour),
 						Selector: `{a="b"}`,
 					},
 				},
+				OTLPConfig:                &defaultOTLPConfig,
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{"default-policy": {"foo", "bar"}},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				PolicyOverrideLimits:      map[string]PolicyOverridableLimits{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
+			},
+		},
+		{
+			desc: "per tenant query timeout",
+			yaml: `
+query_timeout: 5m
+`,
+			exp: Limits{
+				DiscoverGenericFields: FieldDetectorConfig{},
+				DiscoverServiceName:   []string{},
+				LogLevelFields:        []string{},
+
+				QueryTimeout: model.Duration(5 * time.Minute),
+
+				// Rest from new defaults.
+				StreamRetention: []StreamRetention{
+					{
+						Period:   model.Duration(24 * time.Hour),
+						Selector: `{a="b"}`,
+					},
+				},
+				OTLPConfig:                &defaultOTLPConfig,
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{"default-policy": {"foo", "bar"}},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				PolicyOverrideLimits:      map[string]PolicyOverridableLimits{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
 			},
 		},
 	} {
 
 		t.Run(tc.desc, func(t *testing.T) {
 			var out Limits
-			require.Nil(t, yaml.UnmarshalStrict([]byte(tc.yaml), &out))
+			dec := yaml.NewDecoder(bytes.NewReader([]byte(tc.yaml)))
+			dec.KnownFields(true)
+			require.Nil(t, dec.Decode(&out))
+			require.Equal(t, tc.exp, out)
+
+			// Unmarshaling a per-tenant override must never mutate the shared
+			// global default map.
+			require.Equal(t, defaultPolicyEnforcedLabels, defaultLimits.Load().PolicyEnforcedLabels,
+				"unmarshaling must not mutate the shared default policy_enforced_labels map")
+		})
+	}
+}
+
+func TestLimitsValidation(t *testing.T) {
+	for _, tc := range []struct {
+		limits   Limits
+		expected error
+	}{
+		{
+			limits:   Limits{DeletionMode: "disabled", BloomBlockEncoding: "none", OTLPConfig: &push.OTLPConfig{}},
+			expected: nil,
+		},
+		{
+			limits:   Limits{DeletionMode: "filter-only", BloomBlockEncoding: "none", OTLPConfig: &push.OTLPConfig{}},
+			expected: nil,
+		},
+		{
+			limits:   Limits{DeletionMode: "filter-and-delete", BloomBlockEncoding: "none", OTLPConfig: &push.OTLPConfig{}},
+			expected: nil,
+		},
+		{
+			limits:   Limits{DeletionMode: "something-else", BloomBlockEncoding: "none", OTLPConfig: &push.OTLPConfig{}},
+			expected: deletionmode.ErrUnknownMode,
+		},
+		{
+			limits:   Limits{DeletionMode: "disabled", BloomBlockEncoding: "unknown", OTLPConfig: &push.OTLPConfig{}},
+			expected: fmt.Errorf("invalid encoding: unknown, supported: %s", compression.SupportedCodecs()),
+		},
+	} {
+		desc := fmt.Sprintf("%s/%s", tc.limits.DeletionMode, tc.limits.BloomBlockEncoding)
+		t.Run(desc, func(t *testing.T) {
+			tc.limits.TSDBShardingStrategy = logql.PowerOfTwoVersion.String() // hacky but needed for test
+			tc.limits.TSDBMaxBytesPerShard = DefaultTSDBMaxBytesPerShard
+			tc.limits.DataObjMaxBytesPerShard = DefaultDataObjMaxBytesPerShard
+			if tc.expected == nil {
+				require.NoError(t, tc.limits.Validate())
+			} else {
+				require.ErrorContains(t, tc.limits.Validate(), tc.expected.Error())
+			}
+		})
+	}
+}
+
+func Test_PatternIngesterTokenizableJSONFields(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		yaml     string
+		expected []string
+	}{
+		{
+			name: "only defaults",
+			yaml: `
+pattern_ingester_tokenizable_json_fields_default: log,message
+`,
+			expected: []string{"log", "message"},
+		},
+		{
+			name: "with append",
+			yaml: `
+pattern_ingester_tokenizable_json_fields_default: log,message
+pattern_ingester_tokenizable_json_fields_append: msg,body
+`,
+			expected: []string{"log", "message", "msg", "body"},
+		},
+		{
+			name: "with delete",
+			yaml: `
+pattern_ingester_tokenizable_json_fields_default: log,message
+pattern_ingester_tokenizable_json_fields_delete: message
+`,
+			expected: []string{"log"},
+		},
+		{
+			name: "with append and delete from default",
+			yaml: `
+pattern_ingester_tokenizable_json_fields_default: log,message
+pattern_ingester_tokenizable_json_fields_append: msg,body
+pattern_ingester_tokenizable_json_fields_delete: message
+`,
+			expected: []string{"log", "msg", "body"},
+		},
+		{
+			name: "with append and delete from append",
+			yaml: `
+pattern_ingester_tokenizable_json_fields_default: log,message
+pattern_ingester_tokenizable_json_fields_append: msg,body
+pattern_ingester_tokenizable_json_fields_delete: body
+`,
+			expected: []string{"log", "message", "msg"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			overrides := Overrides{
+				defaultLimits: &Limits{},
+			}
+			require.NoError(t, yaml.Unmarshal([]byte(tc.yaml), overrides.defaultLimits))
+
+			actual := overrides.PatternIngesterTokenizableJSONFields("fake")
+			require.ElementsMatch(t, tc.expected, actual)
+		})
+	}
+}
+
+func Test_MetricAggregationEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		yaml     string
+		expected bool
+	}{
+		{
+			name: "when true",
+			yaml: `
+metric_aggregation_enabled: true
+`,
+			expected: true,
+		},
+		{
+			name: "when false",
+			yaml: `
+metric_aggregation_enabled: false
+`,
+			expected: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			overrides := Overrides{
+				defaultLimits: &Limits{},
+			}
+			require.NoError(t, yaml.Unmarshal([]byte(tc.yaml), overrides.defaultLimits))
+
+			actual := overrides.MetricAggregationEnabled("fake")
+			require.Equal(t, tc.expected, actual)
+		})
+	}
+}
+
+func Test_PatternPersistenceEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		yaml     string
+		expected bool
+	}{
+		{
+			name: "when true",
+			yaml: `
+pattern_persistence_enabled: true
+`,
+			expected: true,
+		},
+		{
+			name: "when false",
+			yaml: `
+pattern_persistence_enabled: false
+`,
+			expected: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			overrides := Overrides{
+				defaultLimits: &Limits{},
+			}
+			require.NoError(t, yaml.Unmarshal([]byte(tc.yaml), overrides.defaultLimits))
+
+			actual := overrides.PatternPersistenceEnabled("fake")
+			require.Equal(t, tc.expected, actual)
+		})
+	}
+}
+
+func Test_PersistenceGranularity(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		yaml     string
+		expected time.Duration
+	}{
+		{
+			name: "when set to 5 minutes",
+			yaml: `
+pattern_persistence_granularity: 5m
+`,
+			expected: 5 * time.Minute,
+		},
+		{
+			name: "when set to 1 hour",
+			yaml: `
+pattern_persistence_granularity: 1h
+`,
+			expected: 1 * time.Hour,
+		},
+		{
+			name: "when set to zero",
+			yaml: `
+pattern_persistence_granularity: 0s
+`,
+			expected: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			overrides := Overrides{
+				defaultLimits: &Limits{},
+			}
+			require.NoError(t, yaml.Unmarshal([]byte(tc.yaml), overrides.defaultLimits))
+
+			actual := overrides.PersistenceGranularity("fake")
+			require.Equal(t, tc.expected, actual)
+		})
+	}
+}
+
+func Test_PatternRateThreshold(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		yaml     string
+		expected float64
+	}{
+		{
+			name:     "when using default value",
+			yaml:     `{}`,
+			expected: 1.0,
+		},
+		{
+			name: "when set to 2.5 samples per second",
+			yaml: `
+pattern_rate_threshold: 2.5
+`,
+			expected: 2.5,
+		},
+		{
+			name: "when set to 0.5 samples per second",
+			yaml: `
+pattern_rate_threshold: 0.5
+`,
+			expected: 0.5,
+		},
+		{
+			name: "when set to zero",
+			yaml: `
+pattern_rate_threshold: 0.0
+`,
+			expected: 0.0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			overrides := Overrides{
+				defaultLimits: &Limits{PatternRateThreshold: 1.0},
+			}
+			require.NoError(t, yaml.Unmarshal([]byte(tc.yaml), overrides.defaultLimits))
+
+			actual := overrides.PatternRateThreshold("fake")
+			require.Equal(t, tc.expected, actual)
+		})
+	}
+}
+
+func ptr[T any](v T) *T { return &v }
+
+func TestLimits_PolicyOverrideLimits(t *testing.T) {
+	limits := &Limits{
+		PolicyOverrideLimits: map[string]PolicyOverridableLimits{
+			"finance": {MaxLocalStreamsPerUser: ptr(100), MaxGlobalStreamsPerUser: ptr(1000)},
+			"ops":     {MaxLocalStreamsPerUser: ptr(50), MaxGlobalStreamsPerUser: ptr(500)},
+			// Only local set: the global accessor must report "not overridden" (inherit tenant).
+			"partial": {MaxLocalStreamsPerUser: ptr(7)},
+		},
+	}
+
+	overrides := &Overrides{defaultLimits: limits, tenantLimits: nil}
+
+	v, ok := overrides.PolicyMaxLocalStreamsPerUser("tenant1", "finance")
+	require.True(t, ok)
+	require.Equal(t, 100, v)
+	v, ok = overrides.PolicyMaxGlobalStreamsPerUser("tenant1", "finance")
+	require.True(t, ok)
+	require.Equal(t, 1000, v)
+	v, ok = overrides.PolicyMaxLocalStreamsPerUser("tenant1", "ops")
+	require.True(t, ok)
+	require.Equal(t, 50, v)
+	v, ok = overrides.PolicyMaxGlobalStreamsPerUser("tenant1", "ops")
+	require.True(t, ok)
+	require.Equal(t, 500, v)
+
+	// Partial entry: local overridden, global inherits (footgun fix).
+	v, ok = overrides.PolicyMaxLocalStreamsPerUser("tenant1", "partial")
+	require.True(t, ok)
+	require.Equal(t, 7, v)
+	_, ok = overrides.PolicyMaxGlobalStreamsPerUser("tenant1", "partial")
+	require.False(t, ok)
+
+	// Non-existent / empty policy → not overridden.
+	_, ok = overrides.PolicyMaxLocalStreamsPerUser("tenant1", "nonexistent")
+	require.False(t, ok)
+	_, ok = overrides.PolicyMaxGlobalStreamsPerUser("tenant1", "nonexistent")
+	require.False(t, ok)
+	_, ok = overrides.PolicyMaxLocalStreamsPerUser("tenant1", "")
+	require.False(t, ok)
+
+	// Nil PolicyOverrideLimits → not overridden.
+	limits.PolicyOverrideLimits = nil
+	_, ok = overrides.PolicyMaxLocalStreamsPerUser("tenant1", "finance")
+	require.False(t, ok)
+	_, ok = overrides.PolicyMaxGlobalStreamsPerUser("tenant1", "finance")
+	require.False(t, ok)
+}
+
+func TestLimits_PolicyRateOverrides(t *testing.T) {
+	limits := &Limits{
+		// Tenant per-stream base, to verify burst inherits when only the rate is overridden.
+		PerStreamRateLimit:      flagext.ByteSize(9 * 1024 * 1024),
+		PerStreamRateLimitBurst: flagext.ByteSize(9 * 1024 * 1024),
+		PolicyOverrideLimits: map[string]PolicyOverridableLimits{
+			"finance": {
+				IngestionRateMB:         ptr(2.0),
+				IngestionBurstSizeMB:    ptr(4.0),
+				PerStreamRateLimit:      ptr(flagext.ByteSize(3 * 1024 * 1024)),
+				PerStreamRateLimitBurst: ptr(flagext.ByteSize(5 * 1024 * 1024)),
+			},
+			// Rate set, burst unset → burst accessor reports "not overridden" (inherit tenant burst).
+			"ops": {IngestionRateMB: ptr(1.0)},
+			// Per-stream rate set, burst unset → returned RateLimit inherits the tenant burst.
+			"perstream": {PerStreamRateLimit: ptr(flagext.ByteSize(1 * 1024 * 1024))},
+			// Empty entry overrides nothing (nil-inherits everywhere).
+			"empty": {},
+		},
+	}
+
+	overrides := &Overrides{defaultLimits: limits, tenantLimits: nil}
+
+	// finance: full override present.
+	rateBytes, ok := overrides.PolicyIngestionRateBytes("tenant1", "finance")
+	require.True(t, ok)
+	require.Equal(t, float64(2*bytesInMB), rateBytes)
+	burstBytes, ok := overrides.PolicyIngestionBurstSizeBytes("tenant1", "finance")
+	require.True(t, ok)
+	require.Equal(t, 4*bytesInMB, burstBytes)
+	psrl, ok := overrides.PolicyPerStreamRateLimit("tenant1", "finance")
+	require.True(t, ok)
+	require.Equal(t, RateLimit{Limit: rate.Limit(3 * 1024 * 1024), Burst: 5 * 1024 * 1024}, psrl)
+
+	// ops: rate overridden, burst NOT overridden.
+	rateBytes, ok = overrides.PolicyIngestionRateBytes("tenant1", "ops")
+	require.True(t, ok)
+	require.Equal(t, float64(1*bytesInMB), rateBytes)
+	_, ok = overrides.PolicyIngestionBurstSizeBytes("tenant1", "ops")
+	require.False(t, ok)
+
+	// perstream: rate overridden; burst inherits the tenant per-stream burst.
+	psrl, ok = overrides.PolicyPerStreamRateLimit("tenant1", "perstream")
+	require.True(t, ok)
+	require.Equal(t, rate.Limit(1*1024*1024), psrl.Limit)
+	require.Equal(t, 9*1024*1024, psrl.Burst)
+
+	// empty entry → nothing overridden.
+	_, ok = overrides.PolicyIngestionRateBytes("tenant1", "empty")
+	require.False(t, ok)
+	_, ok = overrides.PolicyPerStreamRateLimit("tenant1", "empty")
+	require.False(t, ok)
+
+	// non-existent / empty policy → false.
+	_, ok = overrides.PolicyIngestionRateBytes("tenant1", "nonexistent")
+	require.False(t, ok)
+	_, ok = overrides.PolicyPerStreamRateLimit("tenant1", "nonexistent")
+	require.False(t, ok)
+	_, ok = overrides.PolicyIngestionRateBytes("tenant1", "")
+	require.False(t, ok)
+
+	// nil map → false.
+	limits.PolicyOverrideLimits = nil
+	_, ok = overrides.PolicyIngestionRateBytes("tenant1", "finance")
+	require.False(t, ok)
+	_, ok = overrides.PolicyPerStreamRateLimit("tenant1", "finance")
+	require.False(t, ok)
+}
+
+func TestLimits_PolicyInheritLimits(t *testing.T) {
+	limits := &Limits{
+		IngestionRateMB:         5,
+		IngestionBurstSizeMB:    10,
+		MaxLocalStreamsPerUser:  100,
+		MaxGlobalStreamsPerUser: 1000,
+		PerStreamRateLimit:      flagext.ByteSize(9 * 1024 * 1024),
+		PerStreamRateLimitBurst: flagext.ByteSize(11 * 1024 * 1024),
+		PolicyOverrideLimits: map[string]PolicyOverridableLimits{
+			// Inherit everything: same values as the tenant, but reported as overridden so usage
+			// is tracked in a policy-specific bucket.
+			"inherit-all": {InheritLimits: true},
+			// Explicit fields win; the rest inherit the tenant value (still overridden).
+			"inherit-partial": {InheritLimits: true, IngestionRateMB: ptr(2.0), MaxLocalStreamsPerUser: ptr(7)},
+		},
+	}
+
+	overrides := &Overrides{defaultLimits: limits, tenantLimits: nil}
+
+	// inherit-all: every accessor returns the tenant value with overridden=true.
+	rateBytes, ok := overrides.PolicyIngestionRateBytes("tenant1", "inherit-all")
+	require.True(t, ok)
+	require.Equal(t, float64(5*bytesInMB), rateBytes)
+	burstBytes, ok := overrides.PolicyIngestionBurstSizeBytes("tenant1", "inherit-all")
+	require.True(t, ok)
+	require.Equal(t, 10*bytesInMB, burstBytes)
+	v, ok := overrides.PolicyMaxLocalStreamsPerUser("tenant1", "inherit-all")
+	require.True(t, ok)
+	require.Equal(t, 100, v)
+	v, ok = overrides.PolicyMaxGlobalStreamsPerUser("tenant1", "inherit-all")
+	require.True(t, ok)
+	require.Equal(t, 1000, v)
+	psrl, ok := overrides.PolicyPerStreamRateLimit("tenant1", "inherit-all")
+	require.True(t, ok)
+	require.Equal(t, RateLimit{Limit: rate.Limit(9 * 1024 * 1024), Burst: 11 * 1024 * 1024}, psrl)
+
+	// inherit-partial: explicit fields win, the rest inherit with overridden=true.
+	rateBytes, ok = overrides.PolicyIngestionRateBytes("tenant1", "inherit-partial")
+	require.True(t, ok)
+	require.Equal(t, float64(2*bytesInMB), rateBytes)
+	v, ok = overrides.PolicyMaxLocalStreamsPerUser("tenant1", "inherit-partial")
+	require.True(t, ok)
+	require.Equal(t, 7, v)
+	burstBytes, ok = overrides.PolicyIngestionBurstSizeBytes("tenant1", "inherit-partial")
+	require.True(t, ok)
+	require.Equal(t, 10*bytesInMB, burstBytes)
+	v, ok = overrides.PolicyMaxGlobalStreamsPerUser("tenant1", "inherit-partial")
+	require.True(t, ok)
+	require.Equal(t, 1000, v)
+
+	// Other policies and tenants without an entry are unaffected.
+	_, ok = overrides.PolicyIngestionRateBytes("tenant1", "other")
+	require.False(t, ok)
+	_, ok = overrides.PolicyIngestionRateBytes("tenant1", "")
+	require.False(t, ok)
+}
+
+func TestLimits_PolicyInheritLimitsYAML(t *testing.T) {
+	var limits Limits
+	yamlConfig := `
+ingestion_rate_mb: 5
+max_global_streams_per_user: 1000
+policy_override_limits:
+  finance:
+    inherit_limits: true
+  ops:
+    inherit_limits: true
+    ingestion_rate_mb: 2
+`
+	require.NoError(t, yaml.Unmarshal([]byte(yamlConfig), &limits))
+
+	overrides := &Overrides{defaultLimits: &limits, tenantLimits: nil}
+
+	rateBytes, ok := overrides.PolicyIngestionRateBytes("tenant1", "finance")
+	require.True(t, ok)
+	require.Equal(t, float64(5*bytesInMB), rateBytes)
+	v, ok := overrides.PolicyMaxGlobalStreamsPerUser("tenant1", "finance")
+	require.True(t, ok)
+	require.Equal(t, 1000, v)
+
+	rateBytes, ok = overrides.PolicyIngestionRateBytes("tenant1", "ops")
+	require.True(t, ok)
+	require.Equal(t, float64(2*bytesInMB), rateBytes)
+}
+
+func TestLimits_PolicyChunkIdlePeriodYAML(t *testing.T) {
+	var defaults Limits
+	defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+	setDefaultLimitsForYAML(t, defaults)
+
+	var l Limits
+	require.NoError(t, yaml.Unmarshal([]byte(`
+policy_override_limits:
+  backfill:
+    chunk_idle_period: 5m
+`), &l))
+	require.NoError(t, l.Validate())
+
+	overrides := &Overrides{defaultLimits: &l}
+	idle, ok := overrides.PolicyChunkIdlePeriod("tenant1", "backfill")
+	require.True(t, ok)
+	require.Equal(t, 5*time.Minute, idle)
+}
+
+func TestPolicyShardStreams(t *testing.T) {
+	timeOn := true
+	desired := flagext.ByteSize(512 * 1024)
+	base := shardstreams.Config{
+		Enabled:                  true,
+		DesiredRate:              flagext.ByteSize(1536 * 1024),
+		TimeShardingEnabled:      false,
+		TimeShardingIgnoreRecent: 40 * time.Minute,
+	}
+	limits := &Limits{
+		ShardStreams: base,
+		PolicyOverrideLimits: map[string]PolicyOverridableLimits{
+			// Only flips time sharding; everything else must inherit the tenant config.
+			"foo": {ShardStreams: &PerPolicyConfigOverride{TimeShardingEnabled: &timeOn}},
+			// Overrides the desired rate only.
+			"finance": {ShardStreams: &PerPolicyConfigOverride{DesiredRate: &desired}},
+			// Policy entry exists but has no shard_streams override → not overridden, tenant config.
+			"ops": {IngestionRateMB: ptr(5.0)},
+		},
+	}
+	overrides := &Overrides{defaultLimits: limits, tenantLimits: nil}
+
+	// No policy → tenant config, not overridden.
+	cfg, ok := overrides.PolicyShardStreams("tenant1", "")
+	require.False(t, ok)
+	require.Equal(t, base, cfg)
+
+	// foo → overridden; only time sharding flipped, rest inherited.
+	got, ok := overrides.PolicyShardStreams("tenant1", "foo")
+	require.True(t, ok)
+	require.True(t, got.TimeShardingEnabled)
+	require.True(t, got.Enabled)
+	require.Equal(t, base.DesiredRate, got.DesiredRate)
+	require.Equal(t, base.TimeShardingIgnoreRecent, got.TimeShardingIgnoreRecent)
+
+	// finance → overridden; only desired rate changed.
+	got, ok = overrides.PolicyShardStreams("tenant1", "finance")
+	require.True(t, ok)
+	require.Equal(t, flagext.ByteSize(512*1024), got.DesiredRate)
+	require.False(t, got.TimeShardingEnabled)
+	require.True(t, got.Enabled)
+
+	// policy entry without a shard_streams override → not overridden, tenant config.
+	cfg, ok = overrides.PolicyShardStreams("tenant1", "ops")
+	require.False(t, ok)
+	require.Equal(t, base, cfg)
+
+	// unknown policy → not overridden, tenant config.
+	cfg, ok = overrides.PolicyShardStreams("tenant1", "unknown")
+	require.False(t, ok)
+	require.Equal(t, base, cfg)
+
+	// nil PolicyOverrideLimits → not overridden, tenant config.
+	limits.PolicyOverrideLimits = nil
+	cfg, ok = overrides.PolicyShardStreams("tenant1", "foo")
+	require.False(t, ok)
+	require.Equal(t, base, cfg)
+}
+
+func TestOTLPConfig(t *testing.T) {
+	initialDefault := defaultLimits.Load()
+	defer func() {
+		defaultLimits.Store(initialDefault)
+	}()
+
+	for _, tc := range []struct {
+		name              string
+		defaultOTLPConfig push.OTLPConfig
+		globalOTLPConfig  push.GlobalOTLPConfig
+		yaml              string
+		exp               Limits
+	}{
+		{
+			name: "no oltp config set",
+			yaml: `
+reject_old_samples: true
+`,
+			exp: Limits{
+				RejectOldSamples: true,
+				OTLPConfig:       &push.OTLPConfig{},
+
+				// set all the values which can't be nil
+				DiscoverServiceName:       []string{},
+				LogLevelFields:            []string{},
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				PolicyOverrideLimits:      map[string]PolicyOverridableLimits{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
+			},
+		},
+		{
+			name: "only default otlp config set",
+			defaultOTLPConfig: push.OTLPConfig{
+				ResourceAttributes: push.ResourceAttributesConfig{
+					AttributesConfig: []push.AttributesConfig{
+						{
+							Action:     push.IndexLabel,
+							Attributes: []string{"foo"},
+						},
+					},
+				},
+				ScopeAttributes: []push.AttributesConfig{
+					{
+						Action:     push.Drop,
+						Attributes: []string{"scope1"},
+					},
+				},
+			},
+			yaml: `
+reject_old_samples: true
+`,
+			exp: Limits{
+				RejectOldSamples: true,
+				OTLPConfig: &push.OTLPConfig{
+					ResourceAttributes: push.ResourceAttributesConfig{
+						AttributesConfig: []push.AttributesConfig{
+							{
+								Action:     push.IndexLabel,
+								Attributes: []string{"foo"},
+							},
+						},
+					},
+					ScopeAttributes: []push.AttributesConfig{
+						{
+							Action:     push.Drop,
+							Attributes: []string{"scope1"},
+						},
+					},
+				},
+
+				// set all the values which can't be nil
+				DiscoverServiceName:       []string{},
+				LogLevelFields:            []string{},
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				PolicyOverrideLimits:      map[string]PolicyOverridableLimits{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
+			},
+		},
+		{
+			name: "only global otlp config set",
+			globalOTLPConfig: push.GlobalOTLPConfig{
+				DefaultOTLPResourceAttributesAsIndexLabels: []string{"bar"},
+			},
+			yaml: `
+reject_old_samples: true
+`,
+			exp: Limits{
+				RejectOldSamples: true,
+				OTLPConfig: &push.OTLPConfig{
+					ResourceAttributes: push.ResourceAttributesConfig{
+						AttributesConfig: []push.AttributesConfig{
+							{
+								Action:     push.IndexLabel,
+								Attributes: []string{"bar"},
+							},
+						},
+					},
+				},
+
+				// set all the values which can't be nil
+				DiscoverServiceName:       []string{},
+				LogLevelFields:            []string{},
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				PolicyOverrideLimits:      map[string]PolicyOverridableLimits{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
+			},
+		},
+		{
+			name: "both global and default otlp config set with no otlp config change in yaml override",
+			globalOTLPConfig: push.GlobalOTLPConfig{
+				DefaultOTLPResourceAttributesAsIndexLabels: []string{"foo"},
+			},
+			defaultOTLPConfig: push.OTLPConfig{
+				ResourceAttributes: push.ResourceAttributesConfig{
+					AttributesConfig: []push.AttributesConfig{
+						{
+							Action:     push.IndexLabel,
+							Attributes: []string{"bar"},
+						},
+					},
+				},
+				ScopeAttributes: []push.AttributesConfig{
+					{
+						Action:     push.Drop,
+						Attributes: []string{"scope1"},
+					},
+				},
+			},
+			yaml: `
+reject_old_samples: true
+`,
+			exp: Limits{
+				RejectOldSamples: true,
+				OTLPConfig: &push.OTLPConfig{
+					ResourceAttributes: push.ResourceAttributesConfig{
+						AttributesConfig: []push.AttributesConfig{
+							{
+								Action:     push.IndexLabel,
+								Attributes: []string{"foo"},
+							},
+							{
+								Action:     push.IndexLabel,
+								Attributes: []string{"bar"},
+							},
+						},
+					},
+					ScopeAttributes: []push.AttributesConfig{
+						{
+							Action:     push.Drop,
+							Attributes: []string{"scope1"},
+						},
+					},
+				},
+
+				// set all the values which can't be nil
+				DiscoverServiceName:       []string{},
+				LogLevelFields:            []string{},
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				PolicyOverrideLimits:      map[string]PolicyOverridableLimits{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
+			},
+		},
+		{
+			name: "global and default otlp config set with additional attribute added by yaml override",
+			globalOTLPConfig: push.GlobalOTLPConfig{
+				DefaultOTLPResourceAttributesAsIndexLabels: []string{"foo"},
+			},
+			defaultOTLPConfig: push.OTLPConfig{
+				ResourceAttributes: push.ResourceAttributesConfig{
+					AttributesConfig: []push.AttributesConfig{
+						{
+							Action:     push.IndexLabel,
+							Attributes: []string{"bar"},
+						},
+					},
+				},
+				ScopeAttributes: []push.AttributesConfig{
+					{
+						Action:     push.Drop,
+						Attributes: []string{"scope1"},
+					},
+				},
+			},
+			yaml: `
+otlp_config:
+  resource_attributes:
+    attributes_config:
+      - action: index_label
+        attributes:
+          - fizz
+`,
+			exp: Limits{
+				OTLPConfig: &push.OTLPConfig{
+					ResourceAttributes: push.ResourceAttributesConfig{
+						AttributesConfig: []push.AttributesConfig{
+							{
+								Action:     push.IndexLabel,
+								Attributes: []string{"foo"},
+							},
+							{
+								Action:     push.IndexLabel,
+								Attributes: []string{"fizz"},
+							},
+						},
+					},
+				},
+
+				// set all the values which can't be nil
+				DiscoverServiceName:       []string{},
+				LogLevelFields:            []string{},
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				PolicyOverrideLimits:      map[string]PolicyOverridableLimits{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
+			},
+		},
+		{
+			name: "global config ignored by yaml override",
+			globalOTLPConfig: push.GlobalOTLPConfig{
+				DefaultOTLPResourceAttributesAsIndexLabels: []string{"foo"},
+			},
+			defaultOTLPConfig: push.OTLPConfig{
+				ResourceAttributes: push.ResourceAttributesConfig{
+					AttributesConfig: []push.AttributesConfig{
+						{
+							Action:     push.IndexLabel,
+							Attributes: []string{"bar"},
+						},
+					},
+				},
+				ScopeAttributes: []push.AttributesConfig{
+					{
+						Action:     push.Drop,
+						Attributes: []string{"scope1"},
+					},
+				},
+			},
+			yaml: `
+otlp_config:
+  resource_attributes:
+    ignore_defaults: true
+    attributes_config:
+      - action: index_label
+        attributes:
+          - fizz
+`,
+			exp: Limits{
+				OTLPConfig: &push.OTLPConfig{
+					ResourceAttributes: push.ResourceAttributesConfig{
+						IgnoreDefaults: true,
+						AttributesConfig: []push.AttributesConfig{
+							{
+								Action:     push.IndexLabel,
+								Attributes: []string{"fizz"},
+							},
+						},
+					},
+				},
+
+				// set all the values which can't be nil
+				DiscoverServiceName:       []string{},
+				LogLevelFields:            []string{},
+				EnforcedLabels:            []string{},
+				PolicyEnforcedLabels:      map[string][]string{},
+				PolicyStreamMapping:       PolicyStreamMapping{},
+				PolicyOverrideLimits:      map[string]PolicyOverridableLimits{},
+				BlockIngestionPolicyUntil: map[string]dskit_flagext.Time{},
+			},
+		},
+	} {
+
+		t.Run(tc.name, func(t *testing.T) {
+			newDefaults := Limits{
+				OTLPConfig: &tc.defaultOTLPConfig,
+			}
+			newDefaults.SetGlobalOTLPConfig(tc.globalOTLPConfig)
+			SetDefaultLimitsForYAMLUnmarshalling(newDefaults)
+
+			var out Limits
+			dec := yaml.NewDecoder(bytes.NewReader([]byte(tc.yaml)))
+			dec.KnownFields(true)
+			require.Nil(t, dec.Decode(&out))
 			require.Equal(t, tc.exp, out)
 		})
 	}
+}
+
+func TestOverrides_DataObjMaxBytesPerShard(t *testing.T) {
+	var defaults Limits
+	defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+
+	t.Run("defaults to 10 times the default of the TSDB setting", func(t *testing.T) {
+		ov, err := NewOverrides(defaults, nil)
+		require.NoError(t, err)
+
+		require.Equal(t, uint64(10*DefaultTSDBMaxBytesPerShard), ov.DataObjMaxBytesPerShard("tenant-1"))
+	})
+
+	t.Run("returns a setting that does not fit in an int that has 32 bits", func(t *testing.T) {
+		tenantLimits := map[string]*Limits{
+			"tenant-1": {DataObjMaxBytesPerShard: 6 << 30},
+		}
+		ov, err := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
+		require.NoError(t, err)
+
+		require.Equal(t, uint64(6<<30), ov.DataObjMaxBytesPerShard("tenant-1"))
+	})
+
+	t.Run("returns the setting of the tenant and the default for other tenants", func(t *testing.T) {
+		tenantLimits := map[string]*Limits{
+			"tenant-1": {DataObjMaxBytesPerShard: 1 << 20},
+		}
+		ov, err := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
+		require.NoError(t, err)
+
+		require.Equal(t, uint64(1<<20), ov.DataObjMaxBytesPerShard("tenant-1"))
+		require.Equal(t, uint64(DefaultDataObjMaxBytesPerShard), ov.DataObjMaxBytesPerShard("tenant-2"))
+	})
+
+	t.Run("fails validation when the setting is 0", func(t *testing.T) {
+		limits := defaults
+		limits.DataObjMaxBytesPerShard = 0
+
+		require.ErrorContains(t, limits.Validate(), "querier.dataobj-max-bytes-per-shard must be greater than 0")
+	})
+}
+
+func TestDataObjCompaction_DefaultsFalse(t *testing.T) {
+	var defaults Limits
+	defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+
+	ov, err := NewOverrides(defaults, nil)
+	require.NoError(t, err)
+
+	runIndex, runLog := ov.CompactionPhases("tenant-29")
+	require.False(t, runIndex)
+	require.False(t, runLog)
+}
+
+func TestDataObjCompaction_IndexOnlyOverride(t *testing.T) {
+	var defaults Limits
+	defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+
+	tenantLimits := map[string]*Limits{
+		"tenant-29": {DataObjIndexCompactionEnabled: true},
+	}
+	ov, err := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
+	require.NoError(t, err)
+
+	runIndex, runLog := ov.CompactionPhases("tenant-29")
+	require.True(t, runIndex, "index compaction runs")
+	require.False(t, runLog, "log compaction does not run when only index is enabled")
+
+	runIndex, runLog = ov.CompactionPhases("tenant-1")
+	require.False(t, runIndex)
+	require.False(t, runLog)
+}
+
+func TestDataObjCompaction_LogImpliesIndex(t *testing.T) {
+	var defaults Limits
+	defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+
+	tenantLimits := map[string]*Limits{
+		"tenant-29": {
+			DataObjIndexCompactionEnabled: true,
+			DataObjLogCompactionEnabled:   true,
+		},
+	}
+	ov, err := NewOverrides(defaults, newMockTenantLimits(tenantLimits))
+	require.NoError(t, err)
+
+	runIndex, runLog := ov.CompactionPhases("tenant-29")
+	require.True(t, runIndex, "log compaction implies index compaction")
+	require.True(t, runLog, "log compaction runs")
+}
+
+func TestDataObjCompaction_ValidateRejectsLogWithoutIndex(t *testing.T) {
+	var l Limits
+	l.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+	l.DataObjLogCompactionEnabled = true
+	l.DataObjIndexCompactionEnabled = false
+	require.ErrorIs(t, l.Validate(), errLogCompactionRequiresIndex)
+}
+
+func TestDataObjCompaction_ValidateAcceptsValidCombinations(t *testing.T) {
+	// Build from RegisterFlags defaults so the other required Validate() fields
+	// (TSDBMaxBytesPerShard, etc.) are
+	// already satisfied; toggle only the two compaction booleans.
+	combos := []struct{ index, log bool }{
+		{false, false},
+		{true, false},
+		{true, true},
+	}
+	for _, c := range combos {
+		t.Run(fmt.Sprintf("index=%v_log=%v", c.index, c.log), func(t *testing.T) {
+			var l Limits
+			l.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+			l.DataObjIndexCompactionEnabled = c.index
+			l.DataObjLogCompactionEnabled = c.log
+			require.NotErrorIs(t, l.Validate(), errLogCompactionRequiresIndex,
+				"index=%v log=%v is a valid combination", c.index, c.log)
+		})
+	}
+}
+
+func TestOverrides_SortSchemaLabelsDefault(t *testing.T) {
+	t.Run("register-flags default", func(t *testing.T) {
+		var defaults Limits
+		defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+		ov, err := NewOverrides(defaults, nil)
+		require.NoError(t, err)
+		require.Equal(t, []string{"label:service_name"}, ov.SortSchemaLabels("any-tenant"))
+	})
+
+	t.Run("flag value is the default for tenants without override", func(t *testing.T) {
+		var defaults Limits
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		defaults.RegisterFlags(fs)
+		require.NoError(t, fs.Parse([]string{"-limits.sort-schema=label:cluster"}))
+		ov, err := NewOverrides(defaults, nil)
+		require.NoError(t, err)
+		require.Equal(t, []string{"label:cluster"}, ov.SortSchemaLabels("any-tenant"))
+	})
+
+	t.Run("per-tenant yaml wins", func(t *testing.T) {
+		var defaults Limits
+		defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+		ov, err := NewOverrides(defaults, newMockTenantLimits(map[string]*Limits{
+			"custom": {SortSchema: SortSchema{"label:app"}},
+		}))
+		require.NoError(t, err)
+		require.Equal(t, []string{"label:app"}, ov.SortSchemaLabels("custom"))
+		require.Equal(t, []string{"label:service_name"}, ov.SortSchemaLabels("other"))
+	})
+}
+
+func TestSortSchema_FlagValue(t *testing.T) {
+	t.Run("string joins fqns", func(t *testing.T) {
+		s := SortSchema{"label:service_name", "label:namespace"}
+		require.Equal(t, "label:service_name,label:namespace", s.String())
+	})
+
+	t.Run("set replaces previous value", func(t *testing.T) {
+		var s SortSchema
+		require.NoError(t, s.Set("label:app"))
+		require.NoError(t, s.Set("label:job, label:ns"))
+		require.Equal(t, SortSchema{"label:job", "label:ns"}, s)
+	})
+
+	t.Run("set skips empty parts", func(t *testing.T) {
+		var s SortSchema
+		require.NoError(t, s.Set("label:app,,label:job,"))
+		require.Equal(t, SortSchema{"label:app", "label:job"}, s)
+	})
+}
+
+func TestSortSchema_RegisterFlags(t *testing.T) {
+	t.Run("default is DefaultSortSchema", func(t *testing.T) {
+		var l Limits
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		l.RegisterFlags(fs)
+		require.Equal(t, DefaultSortSchema, l.SortSchema)
+	})
+
+	t.Run("parses comma-separated keys", func(t *testing.T) {
+		var l Limits
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		l.RegisterFlags(fs)
+		require.NoError(t, fs.Parse([]string{"-limits.sort-schema=label:app,label:ns"}))
+		require.Equal(t, SortSchema{"label:app", "label:ns"}, l.SortSchema)
+		require.NoError(t, l.Validate())
+	})
+
+	t.Run("validate rejects bad fqn after flag parse", func(t *testing.T) {
+		var l Limits
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		l.RegisterFlags(fs)
+		require.NoError(t, fs.Parse([]string{"-limits.sort-schema=not-a-fqn"}))
+		require.Error(t, l.Validate())
+	})
+
+	t.Run("validate rejects duplicates after flag parse", func(t *testing.T) {
+		var l Limits
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		l.RegisterFlags(fs)
+		require.NoError(t, fs.Parse([]string{"-limits.sort-schema=label:app,label:app"}))
+		require.Error(t, l.Validate())
+	})
+}
+
+func Test_LoglineQueryLimits(t *testing.T) {
+	var defaults Limits
+	dskit_flagext.DefaultValues(&defaults)
+	require.Equal(t, "", defaults.LoglineQueryMode, "unset leaves the mode to logline.query and the request header")
+	require.Equal(t, int64(defaultLoglineQueryMinQueryBytesForIndex), defaults.LoglineQueryMinQueryBytesForIndex)
+
+	// A tenant overrides both in the runtime config, like any other limit.
+	tenant := defaults
+	require.NoError(t, yaml.Unmarshal([]byte(`
+logline_query_mode: live
+logline_query_min_query_bytes_for_index: 0
+`), &tenant))
+	overrides, err := NewOverrides(defaults, newMockTenantLimits(map[string]*Limits{"live-tenant": &tenant}))
+	require.NoError(t, err)
+
+	require.Equal(t, "live", overrides.LoglineQueryMode("live-tenant"))
+	require.Equal(t, int64(0), overrides.LoglineQueryMinQueryBytesForIndex("live-tenant"), "an explicit 0 disables the check for that tenant")
+
+	// A tenant without an entry, including a multi-tenant query, gets the defaults.
+	for _, other := range []string{"other", "live-tenant|other"} {
+		require.Equal(t, "", overrides.LoglineQueryMode(other))
+		require.Equal(t, int64(defaultLoglineQueryMinQueryBytesForIndex), overrides.LoglineQueryMinQueryBytesForIndex(other))
+	}
+
+	t.Run("validation", func(t *testing.T) {
+		for _, mode := range []string{"", "off", "dry_run", "live"} {
+			l := defaults
+			l.LoglineQueryMode = mode
+			require.NoError(t, l.Validate(), "mode %q", mode)
+		}
+
+		bad := defaults
+		bad.LoglineQueryMode = "on"
+		require.ErrorContains(t, bad.Validate(), "logline_query_mode")
+
+		negative := defaults
+		negative.LoglineQueryMinQueryBytesForIndex = -1
+		require.ErrorContains(t, negative.Validate(), "logline_query_min_query_bytes_for_index")
+	})
+}
+
+func TestOverrides_DataObjQueryStartTime(t *testing.T) {
+	t.Run("returns the zero time when no start time is set", func(t *testing.T) {
+		var defaults Limits
+		defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+
+		ov, err := NewOverrides(defaults, nil)
+		require.NoError(t, err)
+
+		require.True(t, ov.DataObjQueryStartTime("tenant").IsZero())
+	})
+
+	t.Run("returns the start time a tenant override sets in YAML instead of the CLI flag value", func(t *testing.T) {
+		var defaults Limits
+		fs := flag.NewFlagSet("test", flag.PanicOnError)
+		defaults.RegisterFlags(fs)
+		require.NoError(t, fs.Parse([]string{"-querier.dataobj-query-start-time=2025-06-07T08:09:10Z"}))
+
+		var tenantLimits Limits
+		require.NoError(t, yaml.Unmarshal([]byte(`dataobj_query_start_time: "2026-01-02T03:04:05Z"`), &tenantLimits))
+
+		ov, err := NewOverrides(defaults, newMockTenantLimits(map[string]*Limits{"tenant": &tenantLimits}))
+		require.NoError(t, err)
+
+		require.Equal(t, time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), ov.DataObjQueryStartTime("tenant").UTC())
+		require.Equal(t, time.Date(2025, 6, 7, 8, 9, 10, 0, time.UTC), ov.DataObjQueryStartTime("other-tenant").UTC())
+	})
+}
+
+// setDefaultLimitsForYAML sets the global YAML defaults for the test and
+// restores the previous defaults when the test ends.
+func setDefaultLimitsForYAML(t *testing.T, defaults Limits) {
+	t.Helper()
+	previous := defaultLimits.Load()
+	SetDefaultLimitsForYAMLUnmarshalling(defaults)
+	t.Cleanup(func() { defaultLimits.Store(previous) })
+}
+
+func TestShardFactor_Layout(t *testing.T) {
+	t.Run("returns the default layout for zero", func(t *testing.T) {
+		layout, err := ShardFactor(0).Layout()
+		require.NoError(t, err)
+		require.Equal(t, streams.DefaultShardLayout(), layout)
+	})
+
+	t.Run("returns the layout with the factor as its bucket count", func(t *testing.T) {
+		layout, err := ShardFactor(64).Layout()
+		require.NoError(t, err)
+		require.Equal(t, uint32(64), layout.Buckets())
+	})
+
+	t.Run("returns an error for a factor that is not a power of two", func(t *testing.T) {
+		_, err := ShardFactor(24).Layout()
+		require.ErrorContains(t, err, "not a power of two")
+	})
+}
+
+func TestShardFactor_Validate(t *testing.T) {
+	t.Run("accepts the default factor", func(t *testing.T) {
+		require.NoError(t, ShardFactor(streams.DefaultShardBuckets).Validate())
+	})
+
+	t.Run("accepts zero, which means the default factor", func(t *testing.T) {
+		require.NoError(t, ShardFactor(0).Validate())
+	})
+
+	t.Run("accepts every power of two up to the maximum", func(t *testing.T) {
+		for f := ShardFactor(1); f <= MaxShardFactor; f *= 2 {
+			require.NoError(t, f.Validate(), "factor %d", f)
+		}
+	})
+
+	t.Run("rejects a factor that is not a power of two", func(t *testing.T) {
+		require.EqualError(t, ShardFactor(24).Validate(), "shard bucket count 24 is not a power of two")
+	})
+
+	t.Run("rejects the first power of two above the maximum", func(t *testing.T) {
+		require.EqualError(t, ShardFactor(2*MaxShardFactor).Validate(), "shard factor 512 is more than the maximum 256")
+	})
+
+	t.Run("reports the maximum of the limit for a factor above the maximum of the shard layout", func(t *testing.T) {
+		require.EqualError(t, ShardFactor(1<<20).Validate(), "shard factor 1048576 is more than the maximum 256")
+	})
+}
+
+func TestShardFactor_Set(t *testing.T) {
+	t.Run("string returns the value that set parsed", func(t *testing.T) {
+		var f ShardFactor
+		require.NoError(t, f.Set("32"))
+		require.Equal(t, ShardFactor(32), f)
+		require.Equal(t, "32", f.String())
+	})
+
+	t.Run("returns an error for a value that is not a number", func(t *testing.T) {
+		var f ShardFactor
+		require.Error(t, f.Set("many"))
+	})
+
+	t.Run("returns an error for a negative value", func(t *testing.T) {
+		var f ShardFactor
+		require.Error(t, f.Set("-1"))
+	})
+
+	t.Run("returns an error for a value that overflows uint32", func(t *testing.T) {
+		var f ShardFactor
+		require.Error(t, f.Set("4294967296"))
+		require.Zero(t, f, "a failed set must not change the value")
+	})
+}
+
+func TestLimits_TSDBShardedIndexShardFactor(t *testing.T) {
+	for _, tc := range []struct {
+		factor int
+		err    bool
+	}{
+		{factor: 0},
+		{factor: 1},
+		{factor: 8},
+		{factor: 6, err: true},
+		{factor: -2, err: true},
+	} {
+		t.Run(fmt.Sprintf("factor=%d", tc.factor), func(t *testing.T) {
+			var l Limits
+			l.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+			l.TSDBShardedIndexShardFactor = tc.factor
+			if tc.err {
+				require.ErrorContains(t, l.Validate(), "tsdb_sharded_index_shard_factor")
+				return
+			}
+			require.NoError(t, l.Validate())
+		})
+	}
+}
+
+func TestLimits_DataObjShardFactor(t *testing.T) {
+	t.Run("register flags sets the default factor", func(t *testing.T) {
+		var l Limits
+		l.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+		require.Equal(t, ShardFactor(streams.DefaultShardBuckets), l.DataObjShardFactor)
+		require.NoError(t, l.Validate())
+	})
+
+	t.Run("validation accepts a factor that is a power of two from the flag", func(t *testing.T) {
+		var l Limits
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		l.RegisterFlags(fs)
+		require.NoError(t, fs.Parse([]string{"-limits.dataobj-shard-factor=16"}))
+		require.NoError(t, l.Validate())
+		require.Equal(t, ShardFactor(16), l.DataObjShardFactor)
+	})
+
+	t.Run("validation rejects a factor that is not a power of two from the flag", func(t *testing.T) {
+		var l Limits
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		l.RegisterFlags(fs)
+		require.NoError(t, fs.Parse([]string{"-limits.dataobj-shard-factor=24"}))
+		require.EqualError(t, l.Validate(), "dataobj_shard_factor: shard bucket count 24 is not a power of two")
+	})
+
+	t.Run("yaml without the field keeps the default factor", func(t *testing.T) {
+		var defaults Limits
+		defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+		setDefaultLimitsForYAML(t, defaults)
+
+		var l Limits
+		require.NoError(t, yaml.Unmarshal([]byte(`ingestion_rate_mb: 10`), &l))
+		require.Equal(t, ShardFactor(streams.DefaultShardBuckets), l.DataObjShardFactor)
+	})
+
+	t.Run("validation accepts a factor that is a power of two from yaml", func(t *testing.T) {
+		var defaults Limits
+		defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+		setDefaultLimitsForYAML(t, defaults)
+
+		var l Limits
+		require.NoError(t, yaml.Unmarshal([]byte(`dataobj_shard_factor: 128`), &l))
+		require.NoError(t, l.Validate())
+		require.Equal(t, ShardFactor(128), l.DataObjShardFactor)
+	})
+
+	t.Run("validation rejects a factor above the maximum from yaml", func(t *testing.T) {
+		var defaults Limits
+		defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+		setDefaultLimitsForYAML(t, defaults)
+
+		var l Limits
+		require.NoError(t, yaml.Unmarshal([]byte(`dataobj_shard_factor: 512`), &l))
+		require.EqualError(t, l.Validate(), "dataobj_shard_factor: shard factor 512 is more than the maximum 256")
+	})
+}
+
+func TestOverrides_ShardLayout(t *testing.T) {
+	newDefaults := func() Limits {
+		var defaults Limits
+		defaults.RegisterFlags(flag.NewFlagSet("test", flag.PanicOnError))
+		return defaults
+	}
+
+	t.Run("returns the default layout for tenants without an override", func(t *testing.T) {
+		ov, err := NewOverrides(newDefaults(), nil)
+		require.NoError(t, err)
+		require.Equal(t, streams.DefaultShardLayout(), ov.DataObjShardLayout("any-tenant"))
+	})
+
+	t.Run("returns the default layout when the factor is unset", func(t *testing.T) {
+		ov, err := NewOverrides(Limits{}, nil)
+		require.NoError(t, err)
+		require.Equal(t, streams.DefaultShardLayout(), ov.DataObjShardLayout("any-tenant"))
+	})
+
+	t.Run("returns the layout of the tenant's own override", func(t *testing.T) {
+		tenantLimits := newDefaults()
+		tenantLimits.DataObjShardFactor = 64
+		globalLimits := newDefaults()
+		globalLimits.DataObjShardFactor = 16
+		ov, err := NewOverrides(globalLimits, newMockTenantLimits(map[string]*Limits{"custom": &tenantLimits}))
+		require.NoError(t, err)
+		require.Equal(t, uint32(64), ov.DataObjShardLayout("custom").Buckets())
+		require.Equal(t, uint32(16), ov.DataObjShardLayout("other").Buckets())
+	})
+
+	t.Run("returns the default layout when an unvalidated override has an invalid factor", func(t *testing.T) {
+		tenantLimits := newDefaults()
+		tenantLimits.DataObjShardFactor = 24
+		ov, err := NewOverrides(newDefaults(), newMockTenantLimits(map[string]*Limits{"custom": &tenantLimits}))
+		require.NoError(t, err)
+		require.Equal(t, streams.DefaultShardLayout(), ov.DataObjShardLayout("custom"))
+	})
 }

@@ -2,35 +2,39 @@ package ruler
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"net/url"
+	"maps"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"dario.cat/mergo"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/user"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	promConfig "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/exemplar"
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/prometheus/prometheus/model/relabel"
+	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/storage"
-	"github.com/weaveworks/common/user"
-	"gopkg.in/yaml.v2"
 
-	"github.com/grafana/loki/pkg/ruler/storage/cleaner"
-	"github.com/grafana/loki/pkg/ruler/storage/instance"
-	"github.com/grafana/loki/pkg/ruler/storage/wal"
+	"github.com/grafana/loki/v3/pkg/ruler/storage/cleaner"
+	"github.com/grafana/loki/v3/pkg/ruler/storage/instance"
+	"github.com/grafana/loki/v3/pkg/ruler/storage/wal"
 )
 
 type walRegistry struct {
 	logger  log.Logger
 	manager instance.Manager
 
-	metrics *storageRegistryMetrics
+	metrics     *storageRegistryMetrics
+	overridesMu sync.Mutex
+	refreshMu   sync.Mutex
 
 	config         Config
 	overrides      RulesLimits
@@ -49,6 +53,18 @@ type storageRegistry interface {
 func newWALRegistry(logger log.Logger, reg prometheus.Registerer, config Config, overrides RulesLimits) storageRegistry {
 	if !config.RemoteWrite.Enabled {
 		return nullRegistry{}
+	}
+
+	// Wipe the WAL directory before any per-tenant storage is opened. This runs
+	// exactly once per ruler startup (newWALRegistry is called once), unlike the
+	// per-tenant wal.NewStorage which is re-invoked whenever a tenant instance
+	// restarts. Because the WAL is always discarded here, there is nothing to
+	// replay when the per-tenant storage is later opened.
+	level.Info(logger).Log("msg", "wiping ruler WAL directory on startup", "dir", config.WAL.Dir)
+	if err := os.RemoveAll(config.WAL.Dir); err != nil {
+		// Non-fatal: a failed wipe just leaves stale data on disk, so we log and
+		// continue rather than blocking ruler startup.
+		level.Error(logger).Log("msg", "failed to wipe ruler WAL directory on startup", "dir", config.WAL.Dir, "err", err)
 	}
 
 	manager := createInstanceManager(logger, reg)
@@ -123,8 +139,12 @@ func (r *walRegistry) get(tenant string) storage.Storage {
 }
 
 func (r *walRegistry) Appender(ctx context.Context) storage.Appender {
+	// concurrency-safe retrieval of remote-write config for this tenant, using the global remote-write for defaults
+	r.overridesMu.Lock()
 	tenant, _ := user.ExtractOrgID(ctx)
 	rwCfg, err := r.getTenantRemoteWriteConfig(tenant, r.config.RemoteWrite)
+	r.overridesMu.Unlock()
+
 	if err != nil {
 		level.Error(r.logger).Log("msg", "error retrieving remote-write config; discarding samples", "user", tenant, "err", err)
 		return discardingAppender{}
@@ -143,9 +163,14 @@ func (r *walRegistry) Appender(ctx context.Context) storage.Appender {
 	// we should reconfigure the storage whenever this appender is requested, but since
 	// this can request an appender very often, we hide this behind a gate
 	now := time.Now()
-	if r.lastUpdateTime.Before(now.Add(-r.config.RemoteWrite.ConfigRefreshPeriod)) {
+	r.refreshMu.Lock()
+	shouldRefresh := r.lastUpdateTime.Before(now.Add(-r.config.RemoteWrite.ConfigRefreshPeriod))
+	if shouldRefresh {
 		r.lastUpdateTime = now
+	}
+	r.refreshMu.Unlock()
 
+	if shouldRefresh {
 		level.Debug(r.logger).Log("user", tenant, "msg", "refreshing remote-write configuration")
 		r.configureTenantStorage(tenant)
 	}
@@ -174,6 +199,9 @@ func (r *walRegistry) stop() {
 }
 
 func (r *walRegistry) getTenantConfig(tenant string) (instance.Config, error) {
+	r.overridesMu.Lock()
+	defer r.overridesMu.Unlock()
+
 	conf, err := r.config.WAL.Clone()
 	if err != nil {
 		return instance.Config{}, err
@@ -182,9 +210,6 @@ func (r *walRegistry) getTenantConfig(tenant string) (instance.Config, error) {
 	conf.Name = tenant
 	conf.Tenant = tenant
 
-	// we don't need to send metadata - we have no scrape targets
-	r.config.RemoteWrite.Client.MetadataConfig.Send = false
-
 	// retrieve remote-write config for this tenant, using the global remote-write for defaults
 	rwCfg, err := r.getTenantRemoteWriteConfig(tenant, r.config.RemoteWrite)
 	if err != nil {
@@ -192,23 +217,31 @@ func (r *walRegistry) getTenantConfig(tenant string) (instance.Config, error) {
 	}
 
 	// TODO(dannyk): implement multiple RW configs
+	conf.RemoteWrite = []*config.RemoteWriteConfig{}
 	if rwCfg.Enabled {
-		if rwCfg.Client.Headers == nil {
-			rwCfg.Client.Headers = make(map[string]string)
-		}
-
-		// ensure that no variation of the X-Scope-OrgId header can be added, which might trick authentication
-		for k := range rwCfg.Client.Headers {
-			if strings.ToLower(user.OrgIDHeaderName) == strings.ToLower(strings.TrimSpace(k)) {
-				delete(rwCfg.Client.Headers, k)
+		for id := range r.config.RemoteWrite.Clients {
+			clt := rwCfg.Clients[id]
+			if clt.Headers == nil {
+				clt.Headers = make(map[string]string)
+			} else {
+				clt.Headers = maps.Clone(clt.Headers)
 			}
-		}
 
-		// always inject the X-Scope-OrgId header for multi-tenant metrics backends
-		rwCfg.Client.Headers[user.OrgIDHeaderName] = tenant
+			// ensure that no variation of the X-Scope-OrgId header can be added, which might trick authentication
+			for k := range clt.Headers {
+				if strings.EqualFold(user.OrgIDHeaderName, strings.TrimSpace(k)) {
+					delete(clt.Headers, k)
+				}
+			}
 
-		conf.RemoteWrite = []*config.RemoteWriteConfig{
-			&rwCfg.Client,
+			if rwCfg.AddOrgIDHeader {
+				// inject the X-Scope-OrgId header for multi-tenant metrics backends
+				clt.Headers[user.OrgIDHeaderName] = tenant
+			}
+
+			rwCfg.Clients[id] = clt
+
+			conf.RemoteWrite = append(conf.RemoteWrite, &clt)
 		}
 	} else {
 		// reset if remote-write is disabled at runtime
@@ -224,133 +257,111 @@ func (r *walRegistry) getTenantRemoteWriteConfig(tenant string, base RemoteWrite
 		return nil, fmt.Errorf("error generating tenant remote-write config: %w", err)
 	}
 
-	overrides.Client.Name = fmt.Sprintf("%s-rw", tenant)
-	overrides.Client.SendExemplars = false
-	// TODO(dannyk): configure HTTP client overrides
-	// metadata is only used by prometheus scrape configs
-	overrides.Client.MetadataConfig = config.MetadataConfig{Send: false}
-	overrides.Client.SigV4Config = nil
-
 	if r.overrides.RulerRemoteWriteDisabled(tenant) {
 		overrides.Enabled = false
 	}
 
-	if v := r.overrides.RulerRemoteWriteURL(tenant); v != "" {
-		u, err := url.Parse(v)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing given remote-write URL: %w", err)
+	for id, clt := range overrides.Clients {
+		clt.Name = fmt.Sprintf("%s-rw-%s", tenant, id)
+		clt.SendExemplars = false
+		// TODO(dannyk): configure HTTP client overrides
+		// metadata is only used by prometheus scrape configs
+		clt.MetadataConfig = config.MetadataConfig{Send: false}
+
+		if v := r.overrides.RulerRemoteWriteConfig(tenant, id); v != nil {
+			// overwrite, do not merge
+			if v.Headers != nil {
+				clt.Headers = maps.Clone(v.Headers)
+			}
+
+			// if any relabel configs are defined for a tenant, override all base relabel configs,
+			// even if an empty list is configured; however if this value is not overridden for a tenant,
+			// it should retain the base value
+			if v.WriteRelabelConfigs != nil {
+				clt.WriteRelabelConfigs = v.WriteRelabelConfigs
+			}
+
+			// Cast [rulerconfig.RemoteWriteConfig] to [config.RemoteWriteConfig] so it can be used to merge with [clt].
+			// This can be done safely without copying, because the structs are identical
+			// and mergo only reads [casted].
+			casted := (*config.RemoteWriteConfig)(v)
+			// merge with override
+			if err := mergo.Merge(&clt, casted, mergo.WithOverride); err != nil {
+				return nil, fmt.Errorf("failed to apply remote write clients configs: %w", err)
+			}
 		}
-		overrides.Client.URL = &promConfig.URL{u}
-	}
 
-	if v := r.overrides.RulerRemoteWriteTimeout(tenant); v > 0 {
-		overrides.Client.RemoteTimeout = model.Duration(v)
-	}
+		if err := clt.Validate(model.UTF8Validation); err != nil {
+			return nil, fmt.Errorf("invalid remote write config for tenant %q: %w", clt.Name, err)
+		}
 
-	// overwrite, do not merge
-	if v := r.overrides.RulerRemoteWriteHeaders(tenant); v != nil {
-		overrides.Client.Headers = v
-	}
-
-	relabelConfigs, err := r.createRelabelConfigs(tenant)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse relabel configs: %w", err)
-	}
-
-	// if any relabel configs are defined for a tenant, override all base relabel configs,
-	// even if an empty list is configured; however if this value is not overridden for a tenant,
-	// it should retain the base value
-	if relabelConfigs != nil {
-		overrides.Client.WriteRelabelConfigs = relabelConfigs
-	}
-
-	if v := r.overrides.RulerRemoteWriteQueueCapacity(tenant); v > 0 {
-		overrides.Client.QueueConfig.Capacity = v
-	}
-
-	if v := r.overrides.RulerRemoteWriteQueueMinShards(tenant); v > 0 {
-		overrides.Client.QueueConfig.MinShards = v
-	}
-
-	if v := r.overrides.RulerRemoteWriteQueueMaxShards(tenant); v > 0 {
-		overrides.Client.QueueConfig.MaxShards = v
-	}
-
-	if v := r.overrides.RulerRemoteWriteQueueMaxSamplesPerSend(tenant); v > 0 {
-		overrides.Client.QueueConfig.MaxSamplesPerSend = v
-	}
-
-	if v := r.overrides.RulerRemoteWriteQueueMinBackoff(tenant); v > 0 {
-		overrides.Client.QueueConfig.MinBackoff = model.Duration(v)
-	}
-
-	if v := r.overrides.RulerRemoteWriteQueueMaxBackoff(tenant); v > 0 {
-		overrides.Client.QueueConfig.MaxBackoff = model.Duration(v)
-	}
-
-	if v := r.overrides.RulerRemoteWriteQueueBatchSendDeadline(tenant); v > 0 {
-		overrides.Client.QueueConfig.BatchSendDeadline = model.Duration(v)
-	}
-
-	if v := r.overrides.RulerRemoteWriteQueueRetryOnRateLimit(tenant); v {
-		overrides.Client.QueueConfig.RetryOnRateLimit = v
+		overrides.Clients[id] = clt
 	}
 
 	return overrides, nil
-}
-
-// createRelabelConfigs converts the util.RelabelConfig into relabel.Config to allow for
-// more control over json/yaml unmarshaling
-func (r *walRegistry) createRelabelConfigs(tenant string) ([]*relabel.Config, error) {
-	configs := r.overrides.RulerRemoteWriteRelabelConfigs(tenant)
-
-	// zero value is nil, which we want to treat as "no override"
-	if configs == nil {
-		return nil, nil
-	}
-
-	// we want to treat an empty slice as "no relabel configs"
-	relabelConfigs := make([]*relabel.Config, len(configs))
-	for i, config := range configs {
-		out, err := yaml.Marshal(config)
-		if err != nil {
-			return nil, err
-		}
-
-		var rc relabel.Config
-		if err = yaml.Unmarshal(out, &rc); err != nil {
-			return nil, err
-		}
-
-		relabelConfigs[i] = &rc
-	}
-
-	return relabelConfigs, nil
 }
 
 var errNotReady = errors.New("appender not ready")
 
 type notReadyAppender struct{}
 
-func (n notReadyAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
+func (n notReadyAppender) Append(_ storage.SeriesRef, _ labels.Labels, _ int64, _ float64) (storage.SeriesRef, error) {
 	return 0, errNotReady
 }
-func (n notReadyAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e exemplar.Exemplar) (storage.SeriesRef, error) {
+func (n notReadyAppender) AppendExemplar(_ storage.SeriesRef, _ labels.Labels, _ exemplar.Exemplar) (storage.SeriesRef, error) {
 	return 0, errNotReady
 }
-func (n notReadyAppender) Commit() error   { return errNotReady }
-func (n notReadyAppender) Rollback() error { return errNotReady }
+func (n notReadyAppender) UpdateMetadata(_ storage.SeriesRef, _ labels.Labels, _ metadata.Metadata) (storage.SeriesRef, error) {
+	return 0, errNotReady
+}
+func (n notReadyAppender) AppendHistogram(_ storage.SeriesRef, _ labels.Labels, _ int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, errNotReady
+}
+func (n notReadyAppender) AppendCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64) (storage.SeriesRef, error) {
+	return 0, errNotReady
+}
+func (n notReadyAppender) AppendHistogramCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, errNotReady
+}
+func (n notReadyAppender) AppendHistogramSTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, errNotReady
+}
+func (n notReadyAppender) AppendSTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64) (storage.SeriesRef, error) {
+	return 0, errNotReady
+}
+func (n notReadyAppender) SetOptions(_ *storage.AppendOptions) {}
+func (n notReadyAppender) Commit() error                       { return errNotReady }
+func (n notReadyAppender) Rollback() error                     { return errNotReady }
 
 type discardingAppender struct{}
 
-func (n discardingAppender) Append(ref storage.SeriesRef, l labels.Labels, t int64, v float64) (storage.SeriesRef, error) {
+func (n discardingAppender) Append(_ storage.SeriesRef, _ labels.Labels, _ int64, _ float64) (storage.SeriesRef, error) {
 	return 0, nil
 }
-func (n discardingAppender) AppendExemplar(ref storage.SeriesRef, l labels.Labels, e exemplar.Exemplar) (storage.SeriesRef, error) {
+func (n discardingAppender) AppendExemplar(_ storage.SeriesRef, _ labels.Labels, _ exemplar.Exemplar) (storage.SeriesRef, error) {
 	return 0, nil
 }
-func (n discardingAppender) Commit() error   { return nil }
-func (n discardingAppender) Rollback() error { return nil }
+func (n discardingAppender) UpdateMetadata(_ storage.SeriesRef, _ labels.Labels, _ metadata.Metadata) (storage.SeriesRef, error) {
+	return 0, nil
+}
+func (n discardingAppender) AppendHistogram(_ storage.SeriesRef, _ labels.Labels, _ int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, nil
+}
+func (n discardingAppender) AppendCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64) (storage.SeriesRef, error) {
+	return 0, nil
+}
+func (n discardingAppender) AppendHistogramCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, nil
+}
+func (n discardingAppender) AppendHistogramSTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	return 0, nil
+}
+func (n discardingAppender) AppendSTZeroSample(_ storage.SeriesRef, _ labels.Labels, _ int64, _ int64) (storage.SeriesRef, error) {
+	return 0, nil
+}
+func (n discardingAppender) SetOptions(_ *storage.AppendOptions) {}
+func (n discardingAppender) Commit() error                       { return nil }
+func (n discardingAppender) Rollback() error                     { return nil }
 
 type readyChecker interface {
 	isReady(tenant string) bool
@@ -366,7 +377,7 @@ func (t *tenantWALManager) newInstance(c instance.Config) (instance.ManagedInsta
 		"tenant": c.Tenant,
 	}, t.reg)
 
-	// create metrics here and pass down
+	// create the instance with our custom walFactory
 	return instance.New(reg, c, wal.NewMetrics(reg), t.logger)
 }
 
@@ -396,7 +407,7 @@ func newStorageRegistryMetrics(reg prometheus.Registerer) *storageRegistryMetric
 
 type nullRegistry struct{}
 
-func (n nullRegistry) Appender(ctx context.Context) storage.Appender { return discardingAppender{} }
-func (n nullRegistry) isReady(tenant string) bool                    { return true }
-func (n nullRegistry) stop()                                         {}
-func (n nullRegistry) configureTenantStorage(tenant string)          {}
+func (n nullRegistry) Appender(_ context.Context) storage.Appender { return discardingAppender{} }
+func (n nullRegistry) isReady(_ string) bool                       { return true }
+func (n nullRegistry) stop()                                       {}
+func (n nullRegistry) configureTenantStorage(_ string)             {}

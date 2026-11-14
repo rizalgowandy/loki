@@ -4,22 +4,30 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 	"unsafe"
 
-	"github.com/buger/jsonparser"
+	"github.com/c2h5oh/datasize"
+	"github.com/gorilla/mux"
+	"github.com/grafana/jsonparser"
 	json "github.com/json-iterator/go"
 	"github.com/prometheus/common/model"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logqlmodel/stats"
+	"github.com/grafana/dskit/httpgrpc"
+
+	"github.com/grafana/loki/v3/pkg/logproto"
+	logqlmodel "github.com/grafana/loki/v3/pkg/logql/model"
+	"github.com/grafana/loki/v3/pkg/logql/model/stats"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/util"
 )
 
 var (
-	errEndBeforeStart   = errors.New("end timestamp must not be before or equal to start time")
-	errNegativeStep     = errors.New("zero or negative query resolution step widths are not accepted. Try a positive integer")
-	errStepTooSmall     = errors.New("exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)")
-	errNegativeInterval = errors.New("interval must be >= 0")
+	errEndBeforeStart     = errors.New("end timestamp must not be before or equal to start time")
+	errZeroOrNegativeStep = errors.New("zero or negative query resolution step widths are not accepted. Try a positive integer")
+	errStepTooSmall       = errors.New("exceeded maximum resolution of 11,000 points per time series. Try increasing the value of the step parameter")
+	errNegativeInterval   = errors.New("interval must be >= 0")
 )
 
 // QueryStatus holds the status of a query
@@ -29,12 +37,27 @@ type QueryStatus string
 const (
 	QueryStatusSuccess = "success"
 	QueryStatusFail    = "fail"
+	// How much stack space to allocate for unescaping JSON strings; if a string longer
+	// than this needs to be escaped, it will result in a heap allocation
+	unescapeStackBufSize = 64
+)
+
+// Volume HTTP defaults and validation duplicated here so pkg/loghttp stays free of
+// pkg/storage/stores/index/seriesvolume (AGPL). Keep in sync with that package's
+// DefaultLimit, DefaultAggregateBy, and ValidateAggregateBy.
+const (
+	defaultVolumeLimit       = 100
+	defaultVolumeAggregateBy = "series"
+
+	volumeAggregateByLabels = "labels"
+	volumeAggregateBySeries = "series"
 )
 
 // QueryResponse represents the http json response to a Loki range and instant query
 type QueryResponse struct {
-	Status string            `json:"status"`
-	Data   QueryResponseData `json:"data"`
+	Status   string            `json:"status"`
+	Warnings []string          `json:"warnings,omitempty"`
+	Data     QueryResponseData `json:"data"`
 }
 
 func (q *QueryResponse) UnmarshalJSON(data []byte) error {
@@ -42,6 +65,17 @@ func (q *QueryResponse) UnmarshalJSON(data []byte) error {
 		switch string(key) {
 		case "status":
 			q.Status = string(value)
+		case "warnings":
+			var warnings []string
+			if _, err := jsonparser.ArrayEach(value, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+				if dataType == jsonparser.String {
+					warnings = append(warnings, unescapeJSONString(value))
+				}
+			}); err != nil {
+				return err
+			}
+
+			q.Warnings = warnings
 		case "data":
 			var responseData QueryResponseData
 			if err := responseData.UnmarshalJSON(value); err != nil {
@@ -53,9 +87,110 @@ func (q *QueryResponse) UnmarshalJSON(data []byte) error {
 	})
 }
 
-// PushRequest models a log stream push
+func unescapeJSONString(b []byte) string {
+	var stackbuf [unescapeStackBufSize]byte // stack-allocated array for allocation-free unescaping of small strings
+	bU, err := jsonparser.Unescape(b, stackbuf[:])
+	if err != nil {
+		return ""
+	}
+
+	return string(bU)
+}
+
+// PushRequest models a log stream push but is unmarshalled to proto push format.
 type PushRequest struct {
-	Streams []*Stream `json:"streams"`
+	Streams []LogProtoStream `json:"streams"`
+}
+
+// LogProtoStream is used to unmarshal JSON for push requests.
+// This lets us run code focused on that task rather than the more general code for query responses.
+type LogProtoStream logproto.Stream
+
+func init() {
+	json.RegisterTypeDecoderFunc("loghttp.LogProtoStream", decodeLogProtoStream)
+}
+
+func decodeLogProtoStream(ptr unsafe.Pointer, iter *json.Iterator) { //#nosec G103 -- jsoniter decoder signature; ptr always points to a LogProtoStream -- nosemgrep: use-of-unsafe-block
+	s := (*LogProtoStream)(ptr)
+	for key := iter.ReadObject(); key != ""; key = iter.ReadObject() {
+		switch key {
+		case "stream":
+			if iter.WhatIsNext() != json.ObjectValue {
+				iter.ReportError("reading Stream", "stream must be an object")
+				return
+			}
+			labels := make(LabelSet)
+			for k := iter.ReadObject(); k != ""; k = iter.ReadObject() {
+				if iter.WhatIsNext() == json.StringValue {
+					labels[k] = iter.ReadString()
+				} else {
+					// Keep the raw text of non-string values (e.g. "null", "5"), as jsonparser did.
+					labels[k] = string(iter.SkipAndReturnBytes())
+				}
+			}
+			s.Labels = labels.String()
+		case "values":
+			for iter.ReadArray() {
+				if iter.WhatIsNext() == json.NilValue {
+					iter.Skip()
+					continue
+				}
+				s.Entries = append(s.Entries, logproto.Entry{})
+				decodeLogProtoEntry(iter, &s.Entries[len(s.Entries)-1])
+				if iter.Error != nil {
+					return
+				}
+			}
+		default:
+			iter.ReportError("reading Stream", "found unknown field: "+key)
+			return
+		}
+		if iter.Error != nil {
+			return
+		}
+	}
+}
+
+// decodeLogProtoEntry reads a [timestamp, line, structuredMetadata?] array into e.
+func decodeLogProtoEntry(iter *json.Iterator, e *logproto.Entry) {
+	for i := 0; iter.ReadArray(); i++ {
+		switch i {
+		case 0: // timestamp
+			if iter.WhatIsNext() != json.StringValue {
+				iter.ReportError("reading Entry", "timestamp must be a string")
+				return
+			}
+			ts, err := jsonparser.ParseInt(iter.ReadStringAsSlice())
+			if err != nil {
+				iter.ReportError("reading Entry", err.Error())
+				return
+			}
+			e.Timestamp = time.Unix(0, ts)
+		case 1: // line
+			if iter.WhatIsNext() != json.StringValue {
+				iter.ReportError("reading Entry", "line must be a string")
+				return
+			}
+			e.Line = iter.ReadString()
+		case 2: // structuredMetadata
+			if iter.WhatIsNext() != json.ObjectValue {
+				iter.ReportError("reading Entry", "structured metadata must be an object")
+				return
+			}
+			for k := iter.ReadObject(); k != ""; k = iter.ReadObject() {
+				if iter.WhatIsNext() != json.StringValue {
+					iter.ReportError("reading Entry", "structured metadata value must be a string")
+					return
+				}
+				e.StructuredMetadata = append(e.StructuredMetadata, logproto.LabelAdapter{Name: k, Value: iter.ReadString()})
+			}
+		default:
+			iter.Skip()
+		}
+		if iter.Error != nil {
+			return
+		}
+	}
 }
 
 // ResultType holds the type of the result
@@ -118,10 +253,25 @@ func (s Streams) ToProto() []logproto.Stream {
 	}
 	result := make([]logproto.Stream, 0, len(s))
 	for _, s := range s {
-		entries := *(*[]logproto.Entry)(unsafe.Pointer(&s.Entries))
-		result = append(result, logproto.Stream{Labels: s.Labels.String(), Entries: entries})
+		result = append(result, logproto.Stream{
+			Labels:  s.Labels.String(),
+			Entries: protoEntries(s.Entries),
+		})
 	}
 	return result
+}
+
+func protoEntries(in []Entry) []logproto.Entry {
+	out := make([]logproto.Entry, 0, len(in))
+	for _, ent := range in {
+		out = append(out, logproto.Entry{
+			Timestamp:          ent.Timestamp,
+			Line:               ent.Line,
+			StructuredMetadata: logproto.FromLabelsToLabelAdapters(ent.StructuredMetadata),
+			Parsed:             logproto.FromLabelsToLabelAdapters(ent.Parsed),
+		})
+	}
+	return out
 }
 
 // Stream represents a log stream.  It includes a set of log entries and their labels.
@@ -284,6 +434,24 @@ type RangeQuery struct {
 	Shards    []string
 }
 
+func NewRangeQueryWithDefaults() *RangeQuery {
+	start, end, _ := determineBounds(time.Now(), "", "", "")
+	result := &RangeQuery{
+		Start:     start,
+		End:       end,
+		Limit:     defaultQueryLimit,
+		Direction: defaultDirection,
+		Interval:  0,
+	}
+	result.UpdateStep()
+	return result
+}
+
+// UpdateStep will adjust the step given new start and end.
+func (q *RangeQuery) UpdateStep() {
+	q.Step = time.Duration(defaultQueryRangeStep(q.Start, q.End)) * time.Second
+}
+
 // ParseRangeQuery parses a RangeQuery request from an http request.
 func ParseRangeQuery(r *http.Request) (*RangeQuery, error) {
 	var result RangeQuery
@@ -315,7 +483,7 @@ func ParseRangeQuery(r *http.Request) (*RangeQuery, error) {
 	}
 
 	if result.Step <= 0 {
-		return nil, errNegativeStep
+		return nil, errZeroOrNegativeStep
 	}
 
 	result.Shards = shards(r)
@@ -335,5 +503,242 @@ func ParseRangeQuery(r *http.Request) (*RangeQuery, error) {
 		return nil, errNegativeInterval
 	}
 
+	if GetVersion(r.URL.Path) == VersionLegacy {
+		result.Query, err = parseRegexQuery(r)
+		if err != nil {
+			return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
+		}
+
+		expr, err := syntax.ParseExpr(result.Query)
+		if err != nil {
+			return nil, err
+		}
+
+		// short circuit metric queries
+		if _, ok := expr.(syntax.SampleExpr); ok {
+			return nil, httpgrpc.Errorf(http.StatusBadRequest, "legacy endpoints only support %s result type", logqlmodel.ValueTypeStreams)
+		}
+	}
+
 	return &result, nil
+}
+
+func ParseIndexStatsQuery(r *http.Request) (*RangeQuery, error) {
+	// TODO(owen-d): use a specific type/validation instead
+	// of using range query parameters (superset)
+	return ParseRangeQuery(r)
+}
+
+func ParseIndexShardsQuery(r *http.Request) (*RangeQuery, datasize.ByteSize, error) {
+	// TODO(owen-d): use a specific type/validation instead
+	// of using range query parameters (superset)
+	parsed, err := ParseRangeQuery(r)
+	if err != nil {
+		return nil, 0, err
+	}
+	targetBytes, err := parseBytes(r, "targetBytesPerShard", true)
+	if targetBytes <= 0 {
+		return nil, 0, errors.New("targetBytesPerShard must be a positive value")
+	}
+	return parsed, targetBytes, err
+}
+
+func NewVolumeRangeQueryWithDefaults(matchers string) *logproto.VolumeRequest {
+	start, end, _ := determineBounds(time.Now(), "", "", "")
+	step := (time.Duration(defaultQueryRangeStep(start, end)) * time.Second).Milliseconds()
+	from, through := util.RoundToMilliseconds(start, end)
+	return &logproto.VolumeRequest{
+		From:         from,
+		Through:      through,
+		Matchers:     matchers,
+		Limit:        defaultVolumeLimit,
+		Step:         step,
+		TargetLabels: nil,
+		AggregateBy:  defaultVolumeAggregateBy,
+	}
+}
+
+func NewVolumeInstantQueryWithDefaults(matchers string) *logproto.VolumeRequest {
+	r := NewVolumeRangeQueryWithDefaults(matchers)
+	r.Step = 0
+	return r
+}
+
+type VolumeInstantQuery struct {
+	Start        time.Time
+	End          time.Time
+	Query        string
+	Limit        uint32
+	TargetLabels []string
+	AggregateBy  string
+}
+
+func ParseVolumeInstantQuery(r *http.Request) (*VolumeInstantQuery, error) {
+	err := volumeLimit(r)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := ParseInstantQuery(r)
+	if err != nil {
+		return nil, err
+	}
+
+	aggregateBy, err := volumeAggregateBy(r)
+	if err != nil {
+		return nil, err
+	}
+
+	svInstantQuery := VolumeInstantQuery{
+		Query:        result.Query,
+		Limit:        result.Limit,
+		TargetLabels: targetLabels(r),
+		AggregateBy:  aggregateBy,
+	}
+
+	svInstantQuery.Start, svInstantQuery.End, err = bounds(r)
+	if err != nil {
+		return nil, err
+	}
+
+	if svInstantQuery.End.Before(svInstantQuery.Start) {
+		return nil, errEndBeforeStart
+	}
+
+	return &svInstantQuery, nil
+}
+
+type VolumeRangeQuery struct {
+	Start        time.Time
+	End          time.Time
+	Step         time.Duration
+	Query        string
+	Limit        uint32
+	TargetLabels []string
+	AggregateBy  string
+}
+
+func ParseVolumeRangeQuery(r *http.Request) (*VolumeRangeQuery, error) {
+	err := volumeLimit(r)
+	if err != nil {
+		return nil, err
+	}
+
+	result, err := ParseRangeQuery(r)
+	if err != nil {
+		return nil, err
+	}
+
+	aggregateBy, err := volumeAggregateBy(r)
+	if err != nil {
+		return nil, err
+	}
+
+	return &VolumeRangeQuery{
+		Start:        result.Start,
+		End:          result.End,
+		Step:         result.Step,
+		Query:        result.Query,
+		Limit:        result.Limit,
+		TargetLabels: targetLabels(r),
+		AggregateBy:  aggregateBy,
+	}, nil
+}
+
+func ParseDetectedFieldsQuery(r *http.Request) (*logproto.DetectedFieldsRequest, error) {
+	var err error
+	result := &logproto.DetectedFieldsRequest{}
+
+	result.Query = query(r)
+	result.Values, result.Name = values(r)
+	result.Start, result.End, err = bounds(r)
+	if err != nil {
+		return nil, err
+	}
+
+	if result.End.Before(result.Start) {
+		return nil, errEndBeforeStart
+	}
+
+	result.LineLimit, err = lineLimit(r)
+	if err != nil {
+		return nil, err
+	}
+
+	result.Limit, err = detectedFieldsLimit(r)
+	if err != nil {
+		return nil, err
+	}
+
+	step, err := step(r, result.Start, result.End)
+	result.Step = step.Milliseconds()
+	if err != nil {
+		return nil, err
+	}
+
+	if result.Step <= 0 {
+		return nil, errZeroOrNegativeStep
+	}
+
+	// For safety, limit the number of returned points per timeseries.
+	// This is sufficient for 60s resolution for a week or 1h resolution for a year.
+	if (result.End.Sub(result.Start) / step) > 11000 {
+		return nil, errStepTooSmall
+	}
+
+	return result, nil
+}
+
+func values(r *http.Request) (bool, string) {
+	name, ok := mux.Vars(r)["name"]
+	return ok, name
+}
+
+func targetLabels(r *http.Request) []string {
+	lbls := strings.Split(r.Form.Get("targetLabels"), ",")
+	if (len(lbls) == 1 && lbls[0] == "") || len(lbls) == 0 {
+		return nil
+	}
+
+	return lbls
+}
+
+func volumeLimit(r *http.Request) error {
+	l, err := parseInt(r.Form.Get("limit"), defaultVolumeLimit)
+	if err != nil {
+		return err
+	}
+
+	if l == 0 {
+		r.Form.Set("limit", fmt.Sprint(defaultVolumeLimit))
+		return nil
+	}
+
+	if l <= 0 {
+		return errors.New("limit must be a positive value")
+	}
+
+	return nil
+}
+
+func validateVolumeAggregateBy(aggregateBy string) bool {
+	switch aggregateBy {
+	case volumeAggregateByLabels, volumeAggregateBySeries:
+		return true
+	default:
+		return false
+	}
+}
+
+func volumeAggregateBy(r *http.Request) (string, error) {
+	l := r.Form.Get("aggregateBy")
+	if l == "" {
+		return defaultVolumeAggregateBy, nil
+	}
+
+	if validateVolumeAggregateBy(l) {
+		return l, nil
+	}
+
+	return "", errors.New("invalid aggregation option")
 }

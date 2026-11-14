@@ -1,57 +1,17 @@
 package stages
 
 import (
-	"bytes"
-	"strings"
 	"testing"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
-	"github.com/go-kit/log"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/clients/pkg/promtail/client"
+	"github.com/grafana/loki/v3/clients/pkg/util"
 
-	lokiutil "github.com/grafana/loki/pkg/util"
+	lokiutil "github.com/grafana/loki/v3/pkg/util"
 )
-
-var testTenantYaml = `
-pipeline_stages:
-- json:
-    expressions:
-      customer_id:
-- tenant:
-    source: customer_id
-`
-
-var testTenantLogLineWithMissingKey = `
-{
-	"time":"2012-11-01T22:08:41+00:00",
-	"app":"loki",
-	"component": ["parser","type"],
-	"level" : "WARN"
-}
-`
-
-func TestPipelineWithMissingKey_Tenant(t *testing.T) {
-	var buf bytes.Buffer
-	w := log.NewSyncWriter(&buf)
-	logger := log.NewLogfmtLogger(w)
-	pl, err := NewPipeline(logger, loadConfig(testTenantYaml), nil, prometheus.DefaultRegisterer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	Debug = true
-
-	_ = processEntries(pl, newEntry(nil, nil, testTenantLogLineWithMissingKey, time.Now()))
-	expectedLog := "level=debug msg=\"failed to convert value to string\" err=\"Can't convert <nil> to string\" type=null"
-	if !(strings.Contains(buf.String(), expectedLog)) {
-		t.Errorf("\nexpected: %s\n+actual: %s", expectedLog, buf.String())
-	}
-}
 
 func TestTenantStage_Validation(t *testing.T) {
 	t.Parallel()
@@ -74,34 +34,60 @@ func TestTenantStage_Validation(t *testing.T) {
 		},
 		"should fail on missing source and value": {
 			config:      &TenantConfig{},
-			expectedErr: lokiutil.StringRef(ErrTenantStageEmptySourceOrValue),
+			expectedErr: lokiutil.StringRef(ErrTenantStageEmptyLabelSourceOrValue),
 		},
 		"should fail on empty source": {
 			config: &TenantConfig{
 				Source: "",
 			},
-			expectedErr: lokiutil.StringRef(ErrTenantStageEmptySourceOrValue),
+			expectedErr: lokiutil.StringRef(ErrTenantStageEmptyLabelSourceOrValue),
 		},
 		"should fail on empty value": {
 			config: &TenantConfig{
 				Value: "",
 			},
-			expectedErr: lokiutil.StringRef(ErrTenantStageEmptySourceOrValue),
+			expectedErr: lokiutil.StringRef(ErrTenantStageEmptyLabelSourceOrValue),
+		},
+		"should fail on empty label": {
+			config: &TenantConfig{
+				Label: "",
+			},
+			expectedErr: lokiutil.StringRef(ErrTenantStageEmptyLabelSourceOrValue),
 		},
 		"should fail on both source and value set": {
 			config: &TenantConfig{
 				Source: "tenant",
 				Value:  "team-a",
 			},
-			expectedErr: lokiutil.StringRef(ErrTenantStageConflictingSourceAndValue),
+			expectedErr: lokiutil.StringRef(ErrTenantStageConflictingLabelSourceAndValue),
+		},
+		"should fail on both source and label set": {
+			config: &TenantConfig{
+				Source: "tenant",
+				Label:  "team-a",
+			},
+			expectedErr: lokiutil.StringRef(ErrTenantStageConflictingLabelSourceAndValue),
+		},
+		"should fail on both label and value set": {
+			config: &TenantConfig{
+				Label: "tenant",
+				Value: "team-a",
+			},
+			expectedErr: lokiutil.StringRef(ErrTenantStageConflictingLabelSourceAndValue),
+		},
+		"should fail on all set": {
+			config: &TenantConfig{
+				Label:  "tenant",
+				Source: "tenant",
+				Value:  "team-a",
+			},
+			expectedErr: lokiutil.StringRef(ErrTenantStageConflictingLabelSourceAndValue),
 		},
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
-			stage, err := newTenantStage(util_log.Logger, testData.config)
+			stage, err := newTenantStage(testData.config)
 
 			if testData.expectedErr != nil {
 				assert.EqualError(t, err, *testData.expectedErr)
@@ -131,7 +117,7 @@ func TestTenantStage_Process(t *testing.T) {
 		},
 		"should not override the tenant if the source field is not defined in the extracted map": {
 			config:         &TenantConfig{Source: "tenant_id"},
-			inputLabels:    model.LabelSet{client.ReservedLabelTenantID: "foo"},
+			inputLabels:    model.LabelSet{util.ReservedLabelTenantID: "foo"},
 			inputExtracted: map[string]interface{}{},
 			expectedTenant: lokiutil.StringRef("foo"),
 		},
@@ -141,9 +127,15 @@ func TestTenantStage_Process(t *testing.T) {
 			inputExtracted: map[string]interface{}{"tenant_id": "bar"},
 			expectedTenant: lokiutil.StringRef("bar"),
 		},
+		"should set the tenant if the label is defined in the label map": {
+			config:         &TenantConfig{Label: "tenant_id"},
+			inputLabels:    model.LabelSet{"tenant_id": "bar"},
+			inputExtracted: map[string]interface{}{},
+			expectedTenant: lokiutil.StringRef("bar"),
+		},
 		"should override the tenant if the source field is defined in the extracted map": {
 			config:         &TenantConfig{Source: "tenant_id"},
-			inputLabels:    model.LabelSet{client.ReservedLabelTenantID: "foo"},
+			inputLabels:    model.LabelSet{util.ReservedLabelTenantID: "foo"},
 			inputExtracted: map[string]interface{}{"tenant_id": "bar"},
 			expectedTenant: lokiutil.StringRef("bar"),
 		},
@@ -161,17 +153,15 @@ func TestTenantStage_Process(t *testing.T) {
 		},
 		"should override the tenant with the configured static value": {
 			config:         &TenantConfig{Value: "bar"},
-			inputLabels:    model.LabelSet{client.ReservedLabelTenantID: "foo"},
+			inputLabels:    model.LabelSet{util.ReservedLabelTenantID: "foo"},
 			inputExtracted: map[string]interface{}{},
 			expectedTenant: lokiutil.StringRef("bar"),
 		},
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
-			stage, err := newTenantStage(util_log.Logger, testData.config)
+			stage, err := newTenantStage(testData.config)
 			require.NoError(t, err)
 
 			// Process and dummy line and ensure nothing has changed except
@@ -182,7 +172,7 @@ func TestTenantStage_Process(t *testing.T) {
 			assert.Equal(t, time.Unix(1, 1), out.Timestamp)
 			assert.Equal(t, "hello world", out.Line)
 
-			actualTenant, ok := out.Labels[client.ReservedLabelTenantID]
+			actualTenant, ok := out.Labels[util.ReservedLabelTenantID]
 			if testData.expectedTenant == nil {
 				assert.False(t, ok)
 			} else {

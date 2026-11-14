@@ -1,0 +1,141 @@
+package compactor
+
+import (
+	"flag"
+	"testing"
+	"time"
+
+	"github.com/grafana/dskit/flagext"
+	"github.com/stretchr/testify/require"
+)
+
+// TestConfig_ValidateRejectsBadValues verifies that each new coordinator-loop
+// knob is validated when Enabled is true. The pre-existing
+// MaxRunningCompactionTasks and Scheduler.Endpoint validations are exercised
+// in compactor_test.go.
+func TestConfig_ValidateRejectsBadValues(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr error
+	}{
+		{"polling interval zero", func(c *Config) { c.PollingInterval = 0 }, errInvalidPollingInterval},
+		{"polling interval negative", func(c *Config) { c.PollingInterval = -1 }, errInvalidPollingInterval},
+		{"toc consolidate timeout zero", func(c *Config) { c.ToCConsolidateTimeout = 0 }, errInvalidToCConsolidateTimeout},
+		{"max runs zero", func(c *Config) { c.MaxRunsPerTask = 0 }, errInvalidMaxRunsPerTask},
+		{"max runs negative", func(c *Config) { c.MaxRunsPerTask = -1 }, errInvalidMaxRunsPerTask},
+		{"min backoff zero", func(c *Config) { c.MinBackoff = 0 }, errInvalidMinBackoff},
+		{"min backoff negative", func(c *Config) { c.MinBackoff = -1 }, errInvalidMinBackoff},
+		{"max backoff below min", func(c *Config) { c.MinBackoff = 2 * time.Minute; c.MaxBackoff = time.Minute }, errInvalidMaxBackoff},
+		{"window lookback below one", func(c *Config) { c.WindowLookback = 0 }, errInvalidWindowLookback},
+		{"task retry min backoff zero", func(c *Config) { c.TaskRetryMinBackoff = 0 }, errInvalidTaskRetryMinBackoff},
+		{"task retry max backoff below min", func(c *Config) { c.TaskRetryMinBackoff = time.Minute; c.TaskRetryMaxBackoff = time.Second }, errInvalidTaskRetryMaxBackoff},
+		{"deletion sweep enabled with zero max concurrent sweeps", func(c *Config) { c.DeletionSweep.Enabled = true; c.DeletionSweep.MaxConcurrentSweeps = 0 }, errInvalidMaxConcurrentSweeps},
+		{"deletion sweep enabled without dry run", func(c *Config) { c.DeletionSweep.Enabled = true; c.DeletionSweep.DryRun = false }, errDeletionSweepDryRunRequired},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg Config
+			cfg.RegisterFlags(flag.NewFlagSet("test", flag.ContinueOnError))
+			cfg.Enabled = true                       // validation is gated on Enabled
+			cfg.Scheduler.Endpoint = defaultEndpoint // satisfy existing scheduler-endpoint check
+			tc.mutate(&cfg)
+			err := cfg.Validate()
+			require.ErrorIs(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestConfig_LogMinCompactionSizeValidation(t *testing.T) {
+	// Build a valid enabled config, driving LogMinCompactionSize through the flag
+	// parser so this one test covers both parsing and validation.
+	base := func(t *testing.T, args ...string) Config {
+		t.Helper()
+		var cfg Config
+		fs := flag.NewFlagSet("test", flag.PanicOnError)
+		cfg.RegisterFlagsWithPrefix("dataobj.compaction.", fs)
+		require.NoError(t, fs.Parse(args))
+		cfg.Enabled = true
+		cfg.Scheduler.Endpoint = defaultEndpoint
+		return cfg
+	}
+
+	t.Run("parsed value passes and is applied", func(t *testing.T) {
+		cfg := base(t, "--dataobj.compaction.logs.min-compaction-size=8MB")
+		require.Equal(t, flagext.Bytes(8*1024*1024), cfg.LogMinCompactionSize)
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("zero fails", func(t *testing.T) {
+		cfg := base(t, "--dataobj.compaction.logs.min-compaction-size=0")
+		require.ErrorIs(t, cfg.Validate(), errInvalidLogMinCompactionSize)
+	})
+}
+
+func TestConfig_LogMaxRunsPerTaskValidation(t *testing.T) {
+	base := func(maxRuns int) Config {
+		var cfg Config
+		cfg.RegisterFlags(flag.NewFlagSet("test", flag.ContinueOnError))
+		cfg.Enabled = true
+		cfg.Scheduler.Endpoint = defaultEndpoint
+		cfg.LogMaxRunsPerTask = maxRuns
+		return cfg
+	}
+
+	t.Run("rejects zero", func(t *testing.T) {
+		cfg := base(0)
+		require.ErrorIs(t, cfg.Validate(), errInvalidLogMaxRunsPerTask)
+	})
+
+	t.Run("rejects one because a lone run would trigger compaction forever", func(t *testing.T) {
+		cfg := base(1)
+		require.ErrorIs(t, cfg.Validate(), errInvalidLogMaxRunsPerTask)
+	})
+
+	t.Run("accepts two", func(t *testing.T) {
+		cfg := base(2)
+		require.NoError(t, cfg.Validate())
+	})
+}
+
+func TestConfig_LogMaxKeySize(t *testing.T) {
+	parse := func(t *testing.T, args ...string) Config {
+		t.Helper()
+		var cfg Config
+		fs := flag.NewFlagSet("test", flag.PanicOnError)
+		cfg.RegisterFlagsWithPrefix("dataobj.compaction.", fs)
+		require.NoError(t, fs.Parse(args))
+		return cfg
+	}
+
+	t.Run("defaults to 100GiB", func(t *testing.T) {
+		require.Equal(t, flagext.Bytes(100<<30), parse(t).LogMaxKeySize)
+	})
+
+	t.Run("parses zero to disable the check", func(t *testing.T) {
+		require.Zero(t, parse(t, "--dataobj.compaction.logs.max-key-size=0").LogMaxKeySize)
+	})
+}
+
+func TestConfig_TaskMaxRetriesValidation(t *testing.T) {
+	base := func(t *testing.T, args ...string) Config {
+		t.Helper()
+		var cfg Config
+		fs := flag.NewFlagSet("test", flag.PanicOnError)
+		cfg.RegisterFlagsWithPrefix("dataobj.compaction.", fs)
+		require.NoError(t, fs.Parse(args))
+		cfg.Enabled = true
+		return cfg
+	}
+
+	t.Run("accepts zero", func(t *testing.T) {
+		cfg := base(t, "--dataobj.compaction.task-max-retries=0")
+		require.Equal(t, 0, cfg.TaskMaxRetries)
+		require.NoError(t, cfg.Validate())
+	})
+
+	t.Run("rejects a negative value", func(t *testing.T) {
+		cfg := base(t, "--dataobj.compaction.task-max-retries=-1")
+		require.ErrorIs(t, cfg.Validate(), errInvalidTaskMaxRetries)
+	})
+}

@@ -2,16 +2,20 @@ package ring
 
 import (
 	"fmt"
+	"strings"
 	"time"
-
-	"github.com/pkg/errors"
 )
 
 type ReplicationStrategy interface {
-	// Filter out unhealthy instances and checks if there're enough instances
+	// Filter out unhealthy instances and checks if there are enough instances
 	// for an operation to succeed. Returns an error if there are not enough
 	// instances.
 	Filter(instances []InstanceDesc, op Operation, replicationFactor int, heartbeatTimeout time.Duration, zoneAwarenessEnabled bool) (healthy []InstanceDesc, maxFailures int, err error)
+
+	// SupportsExpandedReplication returns true for replication strategies that
+	// support increasing the replication factor beyond a single instance per zone,
+	// false otherwise.
+	SupportsExpandedReplication() bool
 }
 
 type defaultReplicationStrategy struct{}
@@ -40,10 +44,12 @@ func (s *defaultReplicationStrategy) Filter(instances []InstanceDesc, op Operati
 	// Skip those that have not heartbeated in a while. NB these are still
 	// included in the calculation of minSuccess, so if too many failed instances
 	// will cause the whole write to fail.
+	var unhealthy []string
 	for i := 0; i < len(instances); {
 		if instances[i].IsHealthy(op, heartbeatTimeout, now) {
 			i++
 		} else {
+			unhealthy = append(unhealthy, instances[i].Addr)
 			instances = append(instances[:i], instances[i+1:]...)
 		}
 	}
@@ -52,17 +58,29 @@ func (s *defaultReplicationStrategy) Filter(instances []InstanceDesc, op Operati
 	// after filtering out dead ones, don't even bother trying.
 	if len(instances) < minSuccess {
 		var err error
+		var unhealthyStr string
+		if len(unhealthy) > 0 {
+			unhealthyStr = fmt.Sprintf(" - unhealthy instances: %s", strings.Join(unhealthy, ","))
+		}
 
 		if zoneAwarenessEnabled {
-			err = fmt.Errorf("at least %d live replicas required across different availability zones, could only find %d", minSuccess, len(instances))
+			err = fmt.Errorf("at least %d live replicas required across different availability zones, could only find %d%s", minSuccess, len(instances), unhealthyStr)
 		} else {
-			err = fmt.Errorf("at least %d live replicas required, could only find %d", minSuccess, len(instances))
+			err = fmt.Errorf("at least %d live replicas required, could only find %d%s", minSuccess, len(instances), unhealthyStr)
 		}
 
 		return nil, 0, err
 	}
 
 	return instances, len(instances) - minSuccess, nil
+}
+
+func (s *defaultReplicationStrategy) SupportsExpandedReplication() bool {
+	// defaultReplicationStrategy assumes that a single instance per zone is returned and that
+	// it can treat replication factor as equivalent to the number of zones. This doesn't work
+	// when a per-call replication factor increases it beyond the configured replication factor
+	// and the number of zones.
+	return false
 }
 
 type ignoreUnhealthyInstancesReplicationStrategy struct{}
@@ -74,20 +92,30 @@ func NewIgnoreUnhealthyInstancesReplicationStrategy() ReplicationStrategy {
 func (r *ignoreUnhealthyInstancesReplicationStrategy) Filter(instances []InstanceDesc, op Operation, _ int, heartbeatTimeout time.Duration, _ bool) (healthy []InstanceDesc, maxFailures int, err error) {
 	now := time.Now()
 	// Filter out unhealthy instances.
+	var unhealthy []string
 	for i := 0; i < len(instances); {
 		if instances[i].IsHealthy(op, heartbeatTimeout, now) {
 			i++
 		} else {
+			unhealthy = append(unhealthy, instances[i].Addr)
 			instances = append(instances[:i], instances[i+1:]...)
 		}
 	}
 
 	// We need at least 1 healthy instance no matter what is the replication factor set to.
 	if len(instances) == 0 {
-		return nil, 0, errors.New("at least 1 healthy replica required, could only find 0")
+		var unhealthyStr string
+		if len(unhealthy) > 0 {
+			unhealthyStr = fmt.Sprintf(" - unhealthy instances: %s", strings.Join(unhealthy, ","))
+		}
+		return nil, 0, fmt.Errorf("at least 1 healthy replica required, could only find 0%s", unhealthyStr)
 	}
 
 	return instances, len(instances) - 1, nil
+}
+
+func (r *ignoreUnhealthyInstancesReplicationStrategy) SupportsExpandedReplication() bool {
+	return true
 }
 
 func (r *Ring) IsHealthy(instance *InstanceDesc, op Operation, now time.Time) bool {
@@ -97,12 +125,4 @@ func (r *Ring) IsHealthy(instance *InstanceDesc, op Operation, now time.Time) bo
 // ReplicationFactor of the ring.
 func (r *Ring) ReplicationFactor() int {
 	return r.cfg.ReplicationFactor
-}
-
-// InstancesCount returns the number of instances in the ring.
-func (r *Ring) InstancesCount() int {
-	r.mtx.RLock()
-	c := len(r.ringDesc.Ingesters)
-	r.mtx.RUnlock()
-	return c
 }

@@ -1,6 +1,8 @@
 require: rubocop-rspec
 
 AllCops:
+  TargetRubyVersion: 2.7
+  NewCops: disable
   Exclude:
     - 'bin/**'
     - 'test/**/*.rb'
@@ -24,7 +26,7 @@ Style/GuardClause:
 RSpec/ExampleLength:
   Max: 100
 RSpec/MultipleExpectations:
-  Max: 10
+  Max: 12
 Style/HashEachMethods:
   Enabled: true
 Style/HashTransformKeys:

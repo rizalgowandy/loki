@@ -19,7 +19,8 @@ func TestComparatorEntryReceivedOutOfOrder(t *testing.T) {
 	duplicateEntries = &mockCounter{}
 
 	actual := &bytes.Buffer{}
-	c := NewComparator(actual, 1*time.Hour, 1*time.Hour, 1*time.Hour, 15*time.Minute, 4*time.Hour, 4*time.Hour, 0, 1*time.Minute, 0, 0, 1, make(chan time.Time), make(chan time.Time), nil, false)
+	c := NewComparator(actual, 1*time.Hour, 1*time.Hour, 1*time.Hour, 15*time.Minute, 4*time.Hour, 4*time.Hour, 0, 1*time.Minute, 0, 1*time.Hour, 3*time.Hour, 30*time.Minute, 0, 1, make(chan time.Time), make(chan time.Time), nil, false)
+	defer c.Stop()
 
 	t1 := time.Now()
 	t2 := t1.Add(1 * time.Second)
@@ -60,7 +61,8 @@ func TestComparatorEntryReceivedNotExpected(t *testing.T) {
 	duplicateEntries = &mockCounter{}
 
 	actual := &bytes.Buffer{}
-	c := NewComparator(actual, 1*time.Hour, 1*time.Hour, 1*time.Hour, 15*time.Minute, 4*time.Hour, 4*time.Hour, 0, 1*time.Minute, 0, 0, 1, make(chan time.Time), make(chan time.Time), nil, false)
+	c := NewComparator(actual, 1*time.Hour, 1*time.Hour, 1*time.Hour, 15*time.Minute, 4*time.Hour, 4*time.Hour, 0, 1*time.Minute, 0, 1*time.Hour, 3*time.Hour, 30*time.Minute, 0, 1, make(chan time.Time), make(chan time.Time), nil, false)
+	defer c.Stop()
 
 	t1 := time.Now()
 	t2 := t1.Add(1 * time.Second)
@@ -101,7 +103,8 @@ func TestComparatorEntryReceivedDuplicate(t *testing.T) {
 	duplicateEntries = &mockCounter{}
 
 	actual := &bytes.Buffer{}
-	c := NewComparator(actual, 1*time.Hour, 1*time.Hour, 1*time.Hour, 15*time.Minute, 4*time.Hour, 4*time.Hour, 0, 1*time.Minute, 0, 0, 1, make(chan time.Time), make(chan time.Time), nil, false)
+	c := NewComparator(actual, 1*time.Hour, 1*time.Hour, 1*time.Hour, 15*time.Minute, 4*time.Hour, 4*time.Hour, 0, 1*time.Minute, 0, 1*time.Hour, 3*time.Hour, 30*time.Minute, 0, 1, make(chan time.Time), make(chan time.Time), nil, false)
+	defer c.Stop()
 
 	t1 := time.Unix(0, 0)
 	t2 := t1.Add(1 * time.Second)
@@ -159,7 +162,8 @@ func TestEntryNeverReceived(t *testing.T) {
 	wait := 60 * time.Second
 	maxWait := 300 * time.Second
 	//We set the prune interval timer to a huge value here so that it never runs, instead we call pruneEntries manually below
-	c := NewComparator(actual, wait, maxWait, 50*time.Hour, 15*time.Minute, 4*time.Hour, 4*time.Hour, 0, 1*time.Minute, 0, 0, 1, make(chan time.Time), make(chan time.Time), mr, false)
+	c := NewComparator(actual, wait, maxWait, 50*time.Hour, 15*time.Minute, 4*time.Hour, 4*time.Hour, 0, 1*time.Minute, 0, 1*time.Hour, 3*time.Hour, 30*time.Minute, 0, 1, make(chan time.Time), make(chan time.Time), mr, false)
+	defer c.Stop()
 
 	c.entrySent(t1)
 	c.entrySent(t2)
@@ -218,12 +222,54 @@ func TestEntryNeverReceived(t *testing.T) {
 
 }
 
+// Ensure that if confirmMissing calls pile up and run concurrently, this doesn't cause a panic
+func TestConcurrentConfirmMissing(t *testing.T) {
+	found := []time.Time{
+		time.Unix(0, 0),
+		time.UnixMilli(1),
+		time.UnixMilli(2),
+	}
+	mr := &mockReader{resp: found}
+
+	output := &bytes.Buffer{}
+
+	wait := 30 * time.Millisecond
+	maxWait := 30 * time.Millisecond
+
+	c := NewComparator(output, wait, maxWait, 50*time.Hour, 15*time.Minute, 4*time.Hour, 4*time.Hour, 0, 1*time.Minute, 0, 1*time.Hour, 3*time.Hour, 30*time.Minute, 0, 1, make(chan time.Time), make(chan time.Time), mr, false)
+	defer c.Stop()
+
+	for _, t := range found {
+		tCopy := t
+		c.missingEntries = append(c.missingEntries, &tCopy)
+	}
+
+	wg := sync.WaitGroup{}
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			assert.NotPanics(t, func() { c.confirmMissing(time.UnixMilli(3)) })
+		}()
+	}
+	assert.Eventually(
+		t,
+		func() bool {
+			wg.Wait()
+			return true
+		},
+		time.Second,
+		10*time.Millisecond,
+	)
+}
+
 func TestPruneAckdEntires(t *testing.T) {
 	actual := &bytes.Buffer{}
 	wait := 30 * time.Millisecond
 	maxWait := 30 * time.Millisecond
 	//We set the prune interval timer to a huge value here so that it never runs, instead we call pruneEntries manually below
-	c := NewComparator(actual, wait, maxWait, 50*time.Hour, 15*time.Minute, 4*time.Hour, 4*time.Hour, 0, 1*time.Minute, 0, 0, 1, make(chan time.Time), make(chan time.Time), nil, false)
+	c := NewComparator(actual, wait, maxWait, 50*time.Hour, 15*time.Minute, 4*time.Hour, 4*time.Hour, 0, 1*time.Minute, 0, 1*time.Hour, 3*time.Hour, 30*time.Minute, 0, 1, make(chan time.Time), make(chan time.Time), nil, false)
+	defer c.Stop()
 
 	t1 := time.Unix(0, 0)
 	t2 := t1.Add(1 * time.Millisecond)
@@ -280,7 +326,8 @@ func TestSpotCheck(t *testing.T) {
 	spotCheck := 10 * time.Millisecond
 	spotCheckMax := 20 * time.Millisecond
 	//We set the prune interval timer to a huge value here so that it never runs, instead we call spotCheckEntries manually below
-	c := NewComparator(actual, 1*time.Hour, 1*time.Hour, 50*time.Hour, spotCheck, spotCheckMax, 4*time.Hour, 3*time.Millisecond, 1*time.Minute, 0, 0, 1, make(chan time.Time), make(chan time.Time), mr, false)
+	c := NewComparator(actual, 1*time.Hour, 1*time.Hour, 50*time.Hour, spotCheck, spotCheckMax, 4*time.Hour, 3*time.Millisecond, 1*time.Minute, 0, 1*time.Hour, 3*time.Hour, 30*time.Minute, 0, 1, make(chan time.Time), make(chan time.Time), mr, false)
+	defer c.Stop()
 
 	// Send all the entries
 	for i := range entries {
@@ -320,6 +367,43 @@ func TestSpotCheck(t *testing.T) {
 	prometheus.Unregister(responseLatency)
 }
 
+func TestCacheTest(t *testing.T) {
+	actual := &bytes.Buffer{}
+	mr := &mockReader{}
+	now := time.Now()
+	cacheTestInterval := 500 * time.Millisecond
+	cacheTestRange := 30 * time.Second
+	cacheTestNow := 2 * time.Second
+
+	c := NewComparator(actual, 1*time.Hour, 1*time.Hour, 50*time.Hour, 0, 0, 4*time.Hour, 0, 10*time.Minute, 0, cacheTestInterval, cacheTestRange, cacheTestNow, 1*time.Hour, 1, make(chan time.Time), make(chan time.Time), mr, false)
+	defer c.Stop()
+	// Force the start time to a known value
+	c.startTime = time.Unix(10, 0)
+
+	queryResultsDiff = &mockCounter{}
+	mr.countOverTime = 2.3
+	mr.noCacheCountOvertime = mr.countOverTime // same value for both with and without cache
+	c.cacheTest(now)
+	assert.Equal(t, 0, queryResultsDiff.(*mockCounter).count)
+
+	queryResultsDiff = &mockCounter{} // reset counter
+	mr.countOverTime = 2.3            // value not important
+	mr.noCacheCountOvertime = 2.5     // different than `countOverTime` value.
+	c.cacheTest(now)
+	assert.Equal(t, 1, queryResultsDiff.(*mockCounter).count)
+
+	queryResultsDiff = &mockCounter{}    // reset counter
+	mr.countOverTime = 2.3               // value not important
+	mr.noCacheCountOvertime = 2.30000005 // different than `countOverTime` value but within tolerance
+	c.cacheTest(now)
+	assert.Equal(t, 0, queryResultsDiff.(*mockCounter).count)
+
+	// This avoids a panic on subsequent test execution,
+	// seems ugly but was easy, and multiple instantiations
+	// of the comparator should be an error
+	prometheus.Unregister(responseLatency)
+}
+
 func TestMetricTest(t *testing.T) {
 	metricTestActual = &mockGauge{}
 	metricTestExpected = &mockGauge{}
@@ -331,7 +415,8 @@ func TestMetricTest(t *testing.T) {
 	mr := &mockReader{}
 	metricTestRange := 30 * time.Second
 	//We set the prune interval timer to a huge value here so that it never runs, instead we call spotCheckEntries manually below
-	c := NewComparator(actual, 1*time.Hour, 1*time.Hour, 50*time.Hour, 0, 0, 4*time.Hour, 0, 10*time.Minute, metricTestRange, writeInterval, 1, make(chan time.Time), make(chan time.Time), mr, false)
+	c := NewComparator(actual, 1*time.Hour, 1*time.Hour, 50*time.Hour, 0, 0, 4*time.Hour, 0, 10*time.Minute, metricTestRange, 1*time.Hour, 3*time.Hour, 30*time.Minute, writeInterval, 1, make(chan time.Time), make(chan time.Time), mr, false)
+	defer c.Stop()
 	// Force the start time to a known value
 	c.startTime = time.Unix(10, 0)
 
@@ -467,13 +552,20 @@ type mockReader struct {
 	resp          []time.Time
 	countOverTime float64
 	queryRange    string
+
+	// return this value if called without cache.
+	noCacheCountOvertime float64
 }
 
-func (r *mockReader) Query(start time.Time, end time.Time) ([]time.Time, error) {
+func (r *mockReader) Query(_ time.Time, _ time.Time) ([]time.Time, error) {
 	return r.resp, nil
 }
 
-func (r *mockReader) QueryCountOverTime(queryRange string) (float64, error) {
+func (r *mockReader) QueryCountOverTime(queryRange string, _ time.Time, cache bool) (float64, error) {
 	r.queryRange = queryRange
-	return r.countOverTime, nil
+	res := r.countOverTime
+	if !cache {
+		res = r.noCacheCountOvertime
+	}
+	return res, nil
 }

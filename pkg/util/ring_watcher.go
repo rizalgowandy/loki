@@ -1,11 +1,9 @@
-package util
+package util //nolint:revive
 
 import (
 	"context"
-	"fmt"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/ring"
@@ -19,13 +17,13 @@ const (
 type ringWatcher struct {
 	log           log.Logger
 	ring          ring.ReadRing
-	notifications util.DNSNotifications
+	notifications DNSNotifications
 	lookupPeriod  time.Duration
 	addresses     []string
 }
 
 // NewRingWatcher creates a new Ring watcher and returns a service that is wrapping it.
-func NewRingWatcher(log log.Logger, ring ring.ReadRing, lookupPeriod time.Duration, notifications util.DNSNotifications) (services.Service, error) {
+func NewRingWatcher(log log.Logger, ring ring.ReadRing, lookupPeriod time.Duration, notifications DNSNotifications) (services.Service, error) {
 	w := &ringWatcher{
 		log:           log,
 		ring:          ring,
@@ -86,12 +84,18 @@ func (w *ringWatcher) lookupAddresses() {
 	}
 
 	for _, ta := range toAdd {
-		level.Debug(w.log).Log("msg", fmt.Sprintf("adding connection to address: %s", ta))
+		level.Debug(w.log).Log(
+			"msg", "adding connection to address",
+			"address", ta,
+		)
 		w.notifications.AddressAdded(ta)
 	}
 
 	for _, tr := range toRemove {
-		level.Debug(w.log).Log("msg", fmt.Sprintf("removing connection to address: %s", tr))
+		level.Debug(w.log).Log(
+			"msg", "removing connection to address",
+			"address", tr,
+		)
 		w.notifications.AddressRemoved(tr)
 	}
 

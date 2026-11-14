@@ -4,88 +4,172 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"slices"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/cortexpb"
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
-	"github.com/cortexproject/cortex/pkg/util"
-	"github.com/cortexproject/cortex/pkg/util/spanlogger"
-	"github.com/cortexproject/cortex/pkg/util/validation"
+	"github.com/dustin/go-humanize"
+	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/opentracing/opentracing-go"
+	"github.com/grafana/dskit/httpgrpc"
+	"github.com/grafana/dskit/tenant"
+	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
-	"github.com/weaveworks/common/httpgrpc"
-	"github.com/weaveworks/common/user"
+	attribute "go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/sync/semaphore"
 
-	"github.com/grafana/loki/pkg/tenant"
-
-	"github.com/grafana/loki/pkg/logql"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql"
+	logqlerr "github.com/grafana/loki/v3/pkg/logql/errors"
+	"github.com/grafana/loki/v3/pkg/logql/model/metadata"
+	querystats "github.com/grafana/loki/v3/pkg/logql/model/stats"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/querier/plan"
+	queryrange_limits "github.com/grafana/loki/v3/pkg/querier/queryrange/limits"
+	"github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache/resultscache"
+	"github.com/grafana/loki/v3/pkg/storage/config"
+	"github.com/grafana/loki/v3/pkg/storage/stores/index/stats"
+	"github.com/grafana/loki/v3/pkg/storage/types"
+	"github.com/grafana/loki/v3/pkg/util"
+	"github.com/grafana/loki/v3/pkg/util/httpreq"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/util/querylimits"
+	"github.com/grafana/loki/v3/pkg/util/spanlogger"
+	"github.com/grafana/loki/v3/pkg/util/validation"
 )
 
 const (
-	limitErrTmpl = "maximum of series (%d) reached for a single query"
+	limitErrTmpl                             = "maximum number of series (%d) reached for a single query; consider reducing query cardinality by adding more specific stream selectors, reducing the time range, or aggregating results with functions like sum(), count() or topk()"
+	maxSeriesErrTmpl                         = validation.ErrMaxEntriesLimit
+	requiredLabelsErrTmpl                    = "stream selector is missing required matchers [%s], labels present in the query were [%s]"
+	requiredNumberLabelsErrTmpl              = "stream selector has less label matchers than required: (present: [%s], number_present: %d, required_number_label_matchers: %d)"
+	limErrQueryTooManyBytesTmpl              = "the query would read too many bytes (query: %s, limit: %s); consider adding more specific stream selectors or reduce the time range of the query"
+	limErrQuerierTooManyBytesTmpl            = "query too large to execute on a single querier: (query: %s, limit: %s); consider adding more specific stream selectors, reduce the time range of the query, or adjust parallelization settings"
+	limErrQuerierTooManyBytesUnshardableTmpl = "un-shardable query too large to execute on a single querier: (query: %s, limit: %s); consider adding more specific stream selectors or reduce the time range of the query"
+	limErrQuerierTooManyBytesShardableTmpl   = "shard query is too large to execute on a single querier: (query: %s, limit: %s); consider adding more specific stream selectors or reduce the time range of the query"
 )
 
-// Limits extends the cortex limits interface with support for per tenant splitby parameters
-type Limits interface {
-	queryrange.Limits
-	logql.Limits
-	QuerySplitDuration(string) time.Duration
-	MaxQuerySeries(string) int
-	MaxEntriesLimitPerQuery(string) int
-	MinShardingLookback(string) time.Duration
+// querySizeLimitSpec describes one byte-limit enforcement point.
+type querySizeLimitSpec struct {
+	// limitName is the configuration name of the limit, for operator-facing logs.
+	limitName string
+	// sentinel makes the rejection classifiable with errors.Is, independently of
+	// the message wording.
+	sentinel error
+	// errorTmpl is the client-facing message template. It takes two strings: the
+	// bytes the query would read and the configured limit.
+	errorTmpl string
 }
+
+var (
+	maxQueryBytesReadSpec = querySizeLimitSpec{
+		limitName: "MaxQueryBytesRead",
+		sentinel:  logqlerr.ErrMaxQueryBytesRead,
+		errorTmpl: limErrQueryTooManyBytesTmpl,
+	}
+	maxQuerierBytesReadSpec = querySizeLimitSpec{
+		limitName: "MaxQuerierBytesRead",
+		sentinel:  logqlerr.ErrQuerierTooManyBytes,
+		errorTmpl: limErrQuerierTooManyBytesTmpl,
+	}
+	maxQuerierBytesReadShardableSpec = querySizeLimitSpec{
+		limitName: "MaxQuerierBytesRead",
+		sentinel:  logqlerr.ErrQuerierTooManyBytes,
+		errorTmpl: limErrQuerierTooManyBytesShardableTmpl,
+	}
+	maxQuerierBytesReadUnshardableSpec = querySizeLimitSpec{
+		limitName: "MaxQuerierBytesRead",
+		sentinel:  logqlerr.ErrQuerierTooManyBytes,
+		errorTmpl: limErrQuerierTooManyBytesUnshardableTmpl,
+	}
+)
+
+// exceededErr wraps the client-facing httpgrpc error in the spec's sentinel,
+// which only makes the rejection classifiable with errors.Is.
+func (s querySizeLimitSpec) exceededErr(statsBytesStr, maxBytesReadStr string) error {
+	return fmt.Errorf("%w: %w", s.sentinel, httpgrpc.Errorf(http.StatusBadRequest, s.errorTmpl, statsBytesStr, maxBytesReadStr))
+}
+
+type Limits queryrange_limits.Limits
 
 type limits struct {
 	Limits
-	splitDuration time.Duration
-	overrides     bool
+	// Use pointers so nil value can indicate if the value was set.
+	splitDuration       *time.Duration
+	maxQueryParallelism *int
 }
 
 func (l limits) QuerySplitDuration(user string) time.Duration {
-	if !l.overrides {
-		return l.splitDuration
+	if l.splitDuration == nil {
+		return l.Limits.QuerySplitDuration(user)
 	}
-	dur := l.Limits.QuerySplitDuration(user)
-	if dur == 0 {
-		return l.splitDuration
-	}
-	return dur
+	return *l.splitDuration
 }
 
-// WithDefaults will construct a Limits with a default value for QuerySplitDuration when no overrides are present.
-func WithDefaultLimits(l Limits, conf queryrange.Config) Limits {
-	res := limits{
-		Limits:    l,
-		overrides: true,
+func (l limits) InstantMetricQuerySplitDuration(user string) time.Duration {
+	// NOTE: It returns `splitDuration` for both instant and range queries.
+	// no need to have separate limits for now.
+	if l.splitDuration == nil {
+		return l.Limits.QuerySplitDuration(user)
 	}
+	return *l.splitDuration
+}
 
-	if conf.SplitQueriesByInterval != 0 {
-		res.splitDuration = conf.SplitQueriesByInterval
+func (l limits) TSDBMaxQueryParallelism(ctx context.Context, user string) int {
+	if l.maxQueryParallelism == nil {
+		return l.Limits.TSDBMaxQueryParallelism(ctx, user)
 	}
+	return *l.maxQueryParallelism
+}
 
-	return res
+func (l limits) MaxQueryParallelism(ctx context.Context, user string) int {
+	if l.maxQueryParallelism == nil {
+		return l.Limits.MaxQueryParallelism(ctx, user)
+	}
+	return *l.maxQueryParallelism
 }
 
 // WithSplitByLimits will construct a Limits with a static split by duration.
 func WithSplitByLimits(l Limits, splitBy time.Duration) Limits {
 	return limits{
 		Limits:        l,
-		splitDuration: splitBy,
+		splitDuration: &splitBy,
 	}
 }
+
+func WithMaxParallelism(l Limits, maxParallelism int) Limits {
+	return limits{
+		Limits:              l,
+		maxQueryParallelism: &maxParallelism,
+	}
+}
+
+type UserIDTransformer func(context.Context, string) string
 
 // cacheKeyLimits intersects Limits and CacheSplitter
 type cacheKeyLimits struct {
 	Limits
+	transformer UserIDTransformer
+	iqo         util.IngesterQueryOptions
 }
 
-// GenerateCacheKey will panic if it encounters a 0 split duration. We ensure against this by requiring
-// a nonzero split interval when caching is enabled
-func (l cacheKeyLimits) GenerateCacheKey(userID string, r queryrange.Request) string {
-	split := l.QuerySplitDuration(userID)
-	currentInterval := r.GetStart() / int64(split/time.Millisecond)
+func (l cacheKeyLimits) GenerateCacheKey(ctx context.Context, userID string, r resultscache.Request) string {
+	split := SplitIntervalForTimeRange(l.iqo, l.Limits, l.QuerySplitDuration, []string{userID}, time.Now().UTC(), r.GetEnd().UTC())
+
+	var currentInterval int64
+	if denominator := int64(split / time.Millisecond); denominator > 0 {
+		currentInterval = r.GetStart().UnixMilli() / denominator
+	}
+
+	if l.transformer != nil {
+		userID = l.transformer(ctx, userID)
+	}
+
 	// include both the currentInterval and the split duration in key to ensure
 	// a cache key can't be reused when an interval changes
 	return fmt.Sprintf("%s:%s:%d:%d:%d", userID, r.GetQuery(), r.GetStep(), currentInterval, split)
@@ -93,12 +177,12 @@ func (l cacheKeyLimits) GenerateCacheKey(userID string, r queryrange.Request) st
 
 type limitsMiddleware struct {
 	Limits
-	next queryrange.Handler
+	next queryrangebase.Handler
 }
 
 // NewLimitsMiddleware creates a new Middleware that enforces query limits.
-func NewLimitsMiddleware(l Limits) queryrange.Middleware {
-	return queryrange.MiddlewareFunc(func(next queryrange.Handler) queryrange.Handler {
+func NewLimitsMiddleware(l Limits) queryrangebase.Middleware {
+	return queryrangebase.MiddlewareFunc(func(next queryrangebase.Handler) queryrangebase.Handler {
 		return limitsMiddleware{
 			next:   next,
 			Limits: l,
@@ -106,52 +190,415 @@ func NewLimitsMiddleware(l Limits) queryrange.Middleware {
 	})
 }
 
-func (l limitsMiddleware) Do(ctx context.Context, r queryrange.Request) (queryrange.Response, error) {
-	log, ctx := spanlogger.New(ctx, "limits")
+func (l limitsMiddleware) Do(ctx context.Context, r queryrangebase.Request) (queryrangebase.Response, error) {
+	ctx, span := tracer.Start(ctx, "limits")
+	defer span.End()
+
+	log := spanlogger.FromContext(ctx, util_log.Logger)
 	defer log.Finish()
 
 	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 
 	// Clamp the time range based on the max query lookback.
+	lookbackCapture := func(id string) time.Duration { return l.MaxQueryLookback(ctx, id) }
+	if maxQueryLookback := validation.SmallestPositiveNonZeroDurationPerTenant(tenantIDs, lookbackCapture); maxQueryLookback > 0 {
+		minStartTime := time.Now().Add(-maxQueryLookback)
 
-	if maxQueryLookback := validation.SmallestPositiveNonZeroDurationPerTenant(tenantIDs, l.MaxQueryLookback); maxQueryLookback > 0 {
-		minStartTime := util.TimeToMillis(time.Now().Add(-maxQueryLookback))
-
-		if r.GetEnd() < minStartTime {
+		if r.GetEnd().Before(minStartTime) {
 			// The request is fully outside the allowed range, so we can return an
 			// empty response.
 			level.Debug(log).Log(
 				"msg", "skipping the execution of the query because its time range is before the 'max query lookback' setting",
-				"reqStart", util.FormatTimeMillis(r.GetStart()),
-				"redEnd", util.FormatTimeMillis(r.GetEnd()),
+				"reqStart", r.GetStart().String(),
+				"redEnd", r.GetEnd().String(),
 				"maxQueryLookback", maxQueryLookback)
 
 			return NewEmptyResponse(r)
 		}
 
-		if r.GetStart() < minStartTime {
+		if r.GetStart().Before(minStartTime) {
 			// Replace the start time in the request.
 			level.Debug(log).Log(
 				"msg", "the start time of the query has been manipulated because of the 'max query lookback' setting",
-				"original", util.FormatTimeMillis(r.GetStart()),
-				"updated", util.FormatTimeMillis(minStartTime))
+				"original", r.GetStart().String(),
+				"updated", minStartTime.String())
 
 			r = r.WithStartEnd(minStartTime, r.GetEnd())
 		}
 	}
 
 	// Enforce the max query length.
-	if maxQueryLength := validation.SmallestPositiveNonZeroDurationPerTenant(tenantIDs, l.MaxQueryLength); maxQueryLength > 0 {
-		queryLen := timestamp.Time(r.GetEnd()).Sub(timestamp.Time(r.GetStart()))
+	lengthCapture := func(id string) time.Duration { return l.MaxQueryLength(ctx, id) }
+	if maxQueryLength := validation.SmallestPositiveNonZeroDurationPerTenant(tenantIDs, lengthCapture); maxQueryLength > 0 {
+		queryLen := timestamp.Time(r.GetEnd().UnixMilli()).Sub(timestamp.Time(r.GetStart().UnixMilli()))
 		if queryLen > maxQueryLength {
-			return nil, httpgrpc.Errorf(http.StatusBadRequest, validation.ErrQueryTooLong, queryLen, maxQueryLength)
+			return nil, fmt.Errorf("%w: %w", logqlerr.ErrMaxQueryLength,
+				httpgrpc.Errorf(http.StatusBadRequest, validation.ErrQueryTooLong, queryLen, model.Duration(maxQueryLength)))
 		}
 	}
 
 	return l.next.Do(ctx, r)
+}
+
+type querySizeLimiter struct {
+	logger            log.Logger
+	next              queryrangebase.Handler
+	statsHandler      queryrangebase.Handler
+	maxLookBackPeriod time.Duration
+	limitFunc         func(context.Context, string) int
+	spec              querySizeLimitSpec
+
+	// splitter makes the same splits as the split middleware after the limiter. The
+	// limiter uses it to count the data that the splits of a range aggregation read again.
+	// It is nil when the limiter does not count re-reads.
+	splitter splitter
+
+	// maxQueryLookback returns the max query lookback of a tenant. The limiter does not count
+	// data before the lookback start (now minus the max query lookback), as the index stats
+	// and the queriers do not read it. It is nil when the limiter has no splitter.
+	maxQueryLookback func(context.Context, string) time.Duration
+}
+
+func newQuerySizeLimiter(
+	next queryrangebase.Handler,
+	engineOpts logql.EngineOpts,
+	logger log.Logger,
+	limitFunc func(context.Context, string) int,
+	spec querySizeLimitSpec,
+	statsHandler ...queryrangebase.Handler,
+) *querySizeLimiter {
+	q := &querySizeLimiter{
+		logger:            logger,
+		next:              next,
+		maxLookBackPeriod: engineOpts.MaxLookBackPeriod,
+		limitFunc:         limitFunc,
+		spec:              spec,
+	}
+
+	q.statsHandler = next
+	if len(statsHandler) > 0 {
+		q.statsHandler = statsHandler[0]
+	}
+
+	return q
+}
+
+// NewQuerierSizeLimiterMiddleware creates a new Middleware that enforces query size limits after sharding and splitting.
+func NewQuerierSizeLimiterMiddleware(
+	engineOpts logql.EngineOpts,
+	logger log.Logger,
+	limits Limits,
+	statsHandler ...queryrangebase.Handler,
+) queryrangebase.Middleware {
+	return queryrangebase.MiddlewareFunc(func(next queryrangebase.Handler) queryrangebase.Handler {
+		return newQuerySizeLimiter(next, engineOpts, logger, limits.MaxQuerierBytesRead, maxQuerierBytesReadSpec, statsHandler...)
+	})
+}
+
+// NewQuerySizeLimiterMiddleware creates a new Middleware that enforces query size limits.
+func NewQuerySizeLimiterMiddleware(
+	engineOpts logql.EngineOpts,
+	logger log.Logger,
+	limits Limits,
+	statsHandler ...queryrangebase.Handler,
+) queryrangebase.Middleware {
+	return queryrangebase.MiddlewareFunc(func(next queryrangebase.Handler) queryrangebase.Handler {
+		return newQuerySizeLimiter(next, engineOpts, logger, limits.MaxQueryBytesRead, maxQueryBytesReadSpec, statsHandler...)
+	})
+}
+
+// newSplitQuerySizeLimiterMiddleware creates a new Middleware that enforces
+// max_query_bytes_read on metric range queries that the split middleware then splits by
+// time.
+//
+// The estimate is the bytes that all splits read together. A split of a range aggregation
+// also reads the range vector interval before its start, so the splits read more than the
+// unsplit request. splitter must make the same splits as the split middleware after the
+// limiter. Otherwise the limiter counts reads that do not happen.
+func newSplitQuerySizeLimiterMiddleware(
+	engineOpts logql.EngineOpts,
+	logger log.Logger,
+	limits Limits,
+	splitter splitter,
+	statsHandler queryrangebase.Handler,
+) queryrangebase.Middleware {
+	return queryrangebase.MiddlewareFunc(func(next queryrangebase.Handler) queryrangebase.Handler {
+		q := newQuerySizeLimiter(next, engineOpts, logger, limits.MaxQueryBytesRead, maxQueryBytesReadSpec, statsHandler)
+		q.splitter = splitter
+		q.maxQueryLookback = limits.MaxQueryLookback
+		return q
+	})
+}
+
+// getBytesReadForRequest returns the number of bytes that would be read for the query in r.
+// Since the query expression may contain multiple stream matchers, this function sums up the
+// bytes that will be read for each stream.
+// E.g. for the following query:
+//
+//	count_over_time({job="foo"}[5m]) / count_over_time({job="bar"}[5m] offset 10m)
+//
+// this function will sum the bytes read for each of the following streams, taking into account
+// individual intervals and offsets
+//   - {job="foo"}
+//   - {job="bar"}
+//
+// When the limiter has a splitter, the bytes of r include the data that the splits of r
+// read again. The bytes of the query limits context include them too: the limiter splits
+// the context range with the same splitter and the step of r, because the client sends
+// the same step for all parts of the context. Overlaps at the boundaries of the client's
+// own parts are not counted.
+//
+// The limiter starts the context range at the lookback start (now minus the max query
+// lookback), as the limits middleware does for the request. So the index stats and the
+// splits cover the same range, and the limiter does not split the part of the context range
+// before the lookback start. The estimate does not count a context range that ends before
+// the lookback start.
+func (q *querySizeLimiter) getBytesReadForRequest(ctx context.Context, tenantIDs []string, r queryrangebase.Request) (uint64, error) {
+	ctx, sp := tracer.Start(ctx, "querySizeLimiter.getBytesReadForRequest")
+	defer sp.End()
+
+	lookbackStart := q.lookbackStart(ctx, tenantIDs)
+
+	queryLimitCtx := querylimits.ExtractQueryLimitsContextFromContext(ctx)
+	fullCtxBytes := uint64(0)
+	if queryLimitCtx != nil && queryLimitCtx.Expr != "" && !queryLimitCtx.From.IsZero() && !queryLimitCtx.To.IsZero() {
+		if limitsCtx, ok := withinMaxQueryLookback(*queryLimitCtx, lookbackStart); ok {
+			var err error
+			fullCtxBytes, err = q.getBytesForQueryAndRange(ctx, limitsCtx.Expr, limitsCtx.From, limitsCtx.To, lookbackStart, func() []queryrangebase.Request {
+				if ctxReq := contextRequest(r, &limitsCtx); ctxReq != nil {
+					return q.split(tenantIDs, ctxReq)
+				}
+				return nil
+			})
+			if err != nil {
+				return 0, nil
+			}
+		}
+	}
+
+	queryBytes, err := q.getBytesForQueryAndRange(ctx, r.GetQuery(), r.GetStart(), r.GetEnd(), lookbackStart, func() []queryrangebase.Request {
+		return q.split(tenantIDs, r)
+	})
+	if err != nil {
+		return 0, nil
+	}
+
+	if fullCtxBytes > queryBytes {
+		return fullCtxBytes, nil
+	}
+
+	return queryBytes, nil
+}
+
+// split returns the splits that the splitter makes of r, or nil when r is not split.
+//
+// It does not split requests other than *LokiRequest, because metricQuerySplitter panics
+// on them.
+func (q *querySizeLimiter) split(tenantIDs []string, r queryrangebase.Request) []queryrangebase.Request {
+	if q.splitter == nil {
+		return nil
+	}
+	if _, ok := r.(*LokiRequest); !ok {
+		return nil
+	}
+	splits, enabled := q.splitter.split(time.Now().UTC(), tenantIDs, r)
+	if !enabled {
+		return nil
+	}
+	return splits
+}
+
+// withinMaxQueryLookback returns c with its start moved to lookbackStart, if c starts
+// before it. It returns false when c ends before lookbackStart. A zero lookbackStart
+// returns c unchanged.
+func withinMaxQueryLookback(c querylimits.Context, lookbackStart time.Time) (querylimits.Context, bool) {
+	if lookbackStart.IsZero() {
+		return c, true
+	}
+	if c.To.Before(lookbackStart) {
+		return c, false
+	}
+	if c.From.Before(lookbackStart) {
+		c.From = lookbackStart
+	}
+	return c, true
+}
+
+// lookbackStart returns now minus the max query lookback of the tenants. It returns the
+// zero time when the limiter has no max query lookback or the tenants do not set one.
+func (q *querySizeLimiter) lookbackStart(ctx context.Context, tenantIDs []string) time.Time {
+	if q.maxQueryLookback == nil {
+		return time.Time{}
+	}
+	lookbackCapture := func(id string) time.Duration { return q.maxQueryLookback(ctx, id) }
+	maxQueryLookback := validation.SmallestPositiveNonZeroDurationPerTenant(tenantIDs, lookbackCapture)
+	if maxQueryLookback <= 0 {
+		return time.Time{}
+	}
+	return time.Now().Add(-maxQueryLookback)
+}
+
+// contextRequest returns a request for the range of the query limits context c, with the
+// step of r. It returns nil when r is not a *LokiRequest or the query of c does not parse.
+func contextRequest(r queryrangebase.Request, c *querylimits.Context) *LokiRequest {
+	lokiReq, ok := r.(*LokiRequest)
+	if !ok {
+		return nil
+	}
+	expr, err := syntax.ParseExpr(c.Expr)
+	if err != nil {
+		return nil
+	}
+	return &LokiRequest{
+		Query:     c.Expr,
+		StartTs:   c.From,
+		EndTs:     c.To,
+		Step:      lokiReq.Step,
+		Direction: lokiReq.Direction,
+		Path:      lokiReq.Path,
+		Plan:      &plan.QueryPlan{AST: expr},
+	}
+}
+
+// getBytesForQueryAndRange estimates the bytes that query reads in [from, to].
+//
+// split returns the splits of the query, or nil when the query is not split. When the
+// splits overlap, the estimate is the bytes that they read together. The estimate does not
+// count data before lookbackStart. A zero lookbackStart does not limit it.
+//
+// getBytesForQueryAndRange calls split only after the index stats lookup succeeds, and
+// only when a matcher group has a range vector interval. So a range that fails the max
+// query length check is never split.
+func (q *querySizeLimiter) getBytesForQueryAndRange(ctx context.Context, query string, from, to, lookbackStart time.Time, split func() []queryrangebase.Request) (uint64, error) {
+	expr, err := syntax.ParseExpr(query)
+	if err != nil {
+		return 0, err
+	}
+
+	matcherGroups, err := syntax.MatcherGroups(expr)
+	if err != nil {
+		return 0, err
+	}
+
+	// TODO: Set concurrency dynamically as in shardResolverForConf?
+	start := time.Now()
+	const maxConcurrentIndexReq = 10
+	matcherStats, err := getStatsForMatchers(
+		ctx,
+		q.logger,
+		q.statsHandler,
+		model.Time(from.UnixMilli()),
+		model.Time(to.UnixMilli()),
+		matcherGroups,
+		maxConcurrentIndexReq,
+		q.maxLookBackPeriod,
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	var splits []queryrangebase.Request
+	if split != nil && slices.ContainsFunc(matcherGroups, func(grp syntax.MatcherRange) bool { return grp.Interval > 0 }) {
+		splits = split()
+	}
+
+	combinedStats := stats.MergeStats(matcherStats...)
+	combinedStats.Bytes = 0
+	for i, grp := range matcherGroups {
+		if matcherStats[i] != nil {
+			combinedStats.Bytes += splitBytesRead(matcherStats[i].Bytes, grp, from, to, lookbackStart, splits)
+		}
+	}
+
+	level.Debug(q.logger).Log(
+		append(
+			combinedStats.LoggingKeyValues(),
+			"msg", "queried index",
+			"type", "combined",
+			"len", len(matcherStats),
+			"max_parallelism", maxConcurrentIndexReq,
+			"duration", time.Since(start),
+			"total_bytes", strings.Replace(humanize.Bytes(combinedStats.Bytes), " ", "", 1),
+		)...,
+	)
+
+	return combinedStats.Bytes, nil
+}
+
+func (q *querySizeLimiter) Do(ctx context.Context, r queryrangebase.Request) (queryrangebase.Response, error) {
+	log := spanlogger.FromContext(ctx, q.logger)
+
+	tenantIDs, err := tenant.TenantIDs(ctx)
+	if err != nil {
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
+	}
+
+	limitFuncCapture := func(id string) int { return q.limitFunc(ctx, id) }
+	if maxBytesRead := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, limitFuncCapture); maxBytesRead > 0 {
+		bytesRead, err := q.getBytesReadForRequest(ctx, tenantIDs, r)
+		if err != nil {
+			return nil, httpgrpc.Errorf(http.StatusInternalServerError, "Failed to get bytes read stats for query: %s", err.Error())
+		}
+
+		statsBytesStr := humanize.IBytes(bytesRead)
+		maxBytesReadStr := humanize.IBytes(uint64(maxBytesRead))
+
+		if bytesRead > uint64(maxBytesRead) {
+			level.Warn(log).Log("msg", "Query exceeds limits", "status", "rejected", "limit_name", q.spec.limitName, "limit_bytes", maxBytesReadStr, "resolved_bytes", statsBytesStr)
+			return nil, q.spec.exceededErr(statsBytesStr, maxBytesReadStr)
+		}
+	}
+
+	return q.next.Do(ctx, r)
+}
+
+// splitBytesRead scales bytes to the bytes that splits read together. bytes is the index
+// stats of the matcher group grp for the request range [from, to].
+//
+// A split reads its own time range plus the range vector interval before it. The windows
+// of adjacent splits overlap by about the interval, so each split reads the overlap again.
+// The index stats cover the overlap only once.
+//
+// The index stats and the queriers do not read data before lookbackStart. So both the
+// time that the stats cover and the window of each split start at lookbackStart at the
+// earliest. A zero lookbackStart does not limit them.
+//
+// The scaling assumes that the matcher group stores data at a constant rate. It scales the
+// stats instead of sending one index request per split, so that the index load does not
+// grow with the number of splits.
+func splitBytesRead(bytes uint64, grp syntax.MatcherRange, from, to, lookbackStart time.Time, splits []queryrangebase.Request) uint64 {
+	if grp.Interval <= 0 || len(splits) < 2 {
+		return bytes
+	}
+
+	covered := readWindow(grp, from, to, lookbackStart)
+	var read time.Duration
+	for _, s := range splits {
+		read += readWindow(grp, s.GetStart(), s.GetEnd(), lookbackStart)
+	}
+	if covered <= 0 || read <= covered {
+		return bytes
+	}
+
+	return uint64(float64(bytes) * float64(read) / float64(covered))
+}
+
+// readWindow returns the time that the matcher group grp reads for the range [start, end]:
+// from start minus the interval and offset, but not before lookbackStart, to end minus the
+// offset.
+func readWindow(grp syntax.MatcherRange, start, end, lookbackStart time.Time) time.Duration {
+	windowStart := start.Add(-grp.Interval - grp.Offset)
+	windowEnd := end.Add(-grp.Offset)
+	if !lookbackStart.IsZero() && windowStart.Before(lookbackStart) {
+		windowStart = lookbackStart
+	}
+	if windowEnd.Before(windowStart) {
+		return 0
+	}
+	return windowEnd.Sub(windowStart)
 }
 
 type seriesLimiter struct {
@@ -160,19 +607,19 @@ type seriesLimiter struct {
 	buf    []byte // buf used for hashing to avoid allocations.
 
 	maxSeries int
-	next      queryrange.Handler
+	next      queryrangebase.Handler
 }
 
 type seriesLimiterMiddleware int
 
 // newSeriesLimiter creates a new series limiter middleware for use for a single request.
-func newSeriesLimiter(maxSeries int) queryrange.Middleware {
+func newSeriesLimiter(maxSeries int) queryrangebase.Middleware {
 	return seriesLimiterMiddleware(maxSeries)
 }
 
 // Wrap wraps a global handler and returns a per request limited handler.
 // The handler returned is thread safe.
-func (slm seriesLimiterMiddleware) Wrap(next queryrange.Handler) queryrange.Handler {
+func (slm seriesLimiterMiddleware) Wrap(next queryrangebase.Handler) queryrangebase.Handler {
 	return &seriesLimiter{
 		hashes:    make(map[uint64]struct{}),
 		maxSeries: int(slm),
@@ -181,11 +628,13 @@ func (slm seriesLimiterMiddleware) Wrap(next queryrange.Handler) queryrange.Hand
 	}
 }
 
-func (sl *seriesLimiter) Do(ctx context.Context, req queryrange.Request) (queryrange.Response, error) {
+func (sl *seriesLimiter) Do(ctx context.Context, req queryrangebase.Request) (queryrangebase.Response, error) {
 	// no need to fire a request if the limit is already reached.
-	if sl.isLimitReached() {
+	if sl.isLimitReached() && !httpreq.IsLogsDrilldownRequest(ctx) {
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, limitErrTmpl, sl.maxSeries)
 	}
+
+	metadata := metadata.FromContext(ctx)
 	res, err := sl.next.Do(ctx, req)
 	if err != nil {
 		return res, err
@@ -198,16 +647,29 @@ func (sl *seriesLimiter) Do(ctx context.Context, req queryrange.Request) (queryr
 		return res, nil
 	}
 	sl.rw.Lock()
+	defer sl.rw.Unlock()
+
 	var hash uint64
 	for _, s := range promResponse.Response.Data.Result {
-		lbs := cortexpb.FromLabelAdaptersToLabels(s.Labels)
+		lbs := logproto.FromLabelAdaptersToLabels(s.Labels)
 		hash, sl.buf = lbs.HashWithoutLabels(sl.buf, []string(nil)...)
+
+		if len(sl.hashes) >= sl.maxSeries && httpreq.IsLogsDrilldownRequest(ctx) {
+			// Return the response with its full statistics. Recording them as
+			// discarded work as well would count the same scan twice.
+			metadata.AddWarning(fmt.Sprintf("maximum number of series (%d) reached for a single query; returning partial results", sl.maxSeries))
+			return res, nil
+		}
+
 		sl.hashes[hash] = struct{}{}
+		if len(sl.hashes) > sl.maxSeries {
+			// The query already ran. Preserve its usage before discarding the
+			// successful response; the outer collector will see only the error.
+			querystats.JoinDiscardedWork(ctx, promResponse.Statistics)
+			return nil, httpgrpc.Errorf(http.StatusBadRequest, limitErrTmpl, sl.maxSeries)
+		}
 	}
-	sl.rw.Unlock()
-	if sl.isLimitReached() {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, limitErrTmpl, sl.maxSeries)
-	}
+
 	return res, nil
 }
 
@@ -218,122 +680,299 @@ func (sl *seriesLimiter) isLimitReached() bool {
 }
 
 type limitedRoundTripper struct {
-	next   http.RoundTripper
-	limits Limits
+	configs []config.PeriodConfig
+	next    queryrangebase.Handler
+	limits  Limits
 
-	codec      queryrange.Codec
-	middleware queryrange.Middleware
+	middleware queryrangebase.Middleware
 }
 
+var _ queryrangebase.Handler = limitedRoundTripper{}
+
 // NewLimitedRoundTripper creates a new roundtripper that enforces MaxQueryParallelism to the `next` roundtripper across `middlewares`.
-func NewLimitedRoundTripper(next http.RoundTripper, codec queryrange.Codec, limits Limits, middlewares ...queryrange.Middleware) http.RoundTripper {
+func NewLimitedRoundTripper(next queryrangebase.Handler, limits Limits, configs []config.PeriodConfig, middlewares ...queryrangebase.Middleware) queryrangebase.Handler {
 	transport := limitedRoundTripper{
+		configs:    configs,
 		next:       next,
-		codec:      codec,
 		limits:     limits,
-		middleware: queryrange.MergeMiddlewares(middlewares...),
+		middleware: queryrangebase.MergeMiddlewares(middlewares...),
 	}
 	return transport
 }
 
-type work struct {
-	req    queryrange.Request
-	ctx    context.Context
-	result chan result
+type SemaphoreWithTiming struct {
+	sem *semaphore.Weighted
 }
 
-type result struct {
-	response queryrange.Response
-	err      error
-}
-
-func newWork(ctx context.Context, req queryrange.Request) work {
-	return work{
-		req:    req,
-		ctx:    ctx,
-		result: make(chan result, 1),
+func NewSemaphoreWithTiming(maxVal int64) *SemaphoreWithTiming {
+	return &SemaphoreWithTiming{
+		sem: semaphore.NewWeighted(maxVal),
 	}
 }
 
-func (rt limitedRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
-	var wg sync.WaitGroup
-	intermediate := make(chan work)
+// acquires the semaphore and records the time it takes.
+func (s *SemaphoreWithTiming) Acquire(ctx context.Context, n int64) (time.Duration, error) {
+	start := time.Now()
+
+	if err := s.sem.Acquire(ctx, n); err != nil {
+		return 0, err
+	}
+
+	return time.Since(start), nil
+}
+
+func (rt limitedRoundTripper) Do(c context.Context, request queryrangebase.Request) (queryrangebase.Response, error) {
+	ctx, cancel := context.WithCancel(c)
 	defer func() {
-		wg.Wait()
-		close(intermediate)
+		cancel()
 	}()
 
-	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
+	span := trace.SpanFromContext(ctx)
+	request.LogToSpan(span)
 
-	// Do not forward any request header.
-	request, err := rt.codec.DecodeRequest(ctx, r, nil)
+	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
+	}
+
+	parallelism := MinWeightedParallelism(
+		ctx,
+		tenantIDs,
+		rt.configs,
+		rt.limits,
+		model.Time(request.GetStart().UnixMilli()),
+		model.Time(request.GetEnd().UnixMilli()),
+	)
+
+	if parallelism < 1 {
+		err := fmt.Errorf("%w: %w",
+			logqlerr.ErrMaxQueryParallelism,
+			httpgrpc.Errorf(http.StatusTooManyRequests, "%s", logqlerr.ErrMaxQueryParallelism.Error()),
+		)
+		// Rejected before rt.middleware runs, so the line is emitted here.
+		logFailedQueryUsageForRejection(ctx, request, err)
 		return nil, err
 	}
 
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		request.LogToSpan(span)
-	}
-	userid, err := tenant.TenantID(ctx)
-	if err != nil {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
-	}
+	semWithTiming := NewSemaphoreWithTiming(int64(parallelism))
 
-	parallelism := rt.limits.MaxQueryParallelism(userid)
-
-	for i := 0; i < parallelism; i++ {
-		go func() {
-			for w := range intermediate {
-				resp, err := rt.do(w.ctx, w.req)
-				select {
-				case w.result <- result{response: resp, err: err}:
-				case <-w.ctx.Done():
-					w.result <- result{err: w.ctx.Err()}
-				}
-
+	return rt.middleware.Wrap(
+		queryrangebase.HandlerFunc(func(ctx context.Context, r queryrangebase.Request) (queryrangebase.Response, error) {
+			// This inner handler is called multiple times by
+			// sharding outer middlewares such as the downstreamer.
+			// The number of concurrent calls to `next.RoundTrip` should
+			// be limited, because the downstream calls can be in
+			// the thousands.
+			// Note: It is the responsibility of the caller to run
+			// the handler in parallel.
+			elapsed, err := semWithTiming.Acquire(ctx, int64(1))
+			if err != nil {
+				return nil, fmt.Errorf("could not acquire work: %w", err)
 			}
-		}()
-	}
 
-	response, err := rt.middleware.Wrap(
-		queryrange.HandlerFunc(func(ctx context.Context, r queryrange.Request) (queryrange.Response, error) {
-			wg.Add(1)
-			defer wg.Done()
+			span.SetAttributes(
+				attribute.String("wait_time", elapsed.String()),
+				attribute.Int64("max_parallelism", int64(parallelism)),
+			)
 
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			w := newWork(ctx, r)
-			intermediate <- w
-			select {
-			case response := <-w.result:
-				return response.response, response.err
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
+			defer semWithTiming.sem.Release(int64(1))
+
+			return rt.next.Do(ctx, r)
 		})).Do(ctx, request)
-	if err != nil {
-		return nil, err
-	}
-	return rt.codec.EncodeResponse(ctx, response)
 }
 
-func (rt limitedRoundTripper) do(ctx context.Context, r queryrange.Request) (queryrange.Response, error) {
-	request, err := rt.codec.EncodeRequest(ctx, r)
+// WeightedParallelism will calculate the request parallelism to use
+// based on the two fields:
+// 1) `max_query_parallelism`:
+// 2) `tsdb_max_query_parallelism`:
+// For instance, if the max_query_parallelism=10,
+// tsdb_max_query_parallelism=100, and the request is equally split
+// between tsdb and non-tsdb period configs,
+// the resulting parallelism will be
+// 0.5 * 10 + 0.5 * 100 = 60
+func WeightedParallelism(
+	ctx context.Context,
+	configs []config.PeriodConfig,
+	user string,
+	l Limits,
+	start, end model.Time,
+) int {
+	logger := util_log.WithContext(ctx, util_log.Logger)
+
+	tsdbMaxQueryParallelism := l.TSDBMaxQueryParallelism(ctx, user)
+	regMaxQueryParallelism := l.MaxQueryParallelism(ctx, user)
+	if tsdbMaxQueryParallelism+regMaxQueryParallelism == 0 {
+		level.Info(logger).Log("msg", "querying disabled for tenant")
+		return 0
+	}
+
+	// query end before start would anyways error out so just short circuit and return 1
+	if end < start {
+		level.Warn(logger).Log("msg", "query end time before start, letting downstream code handle it gracefully", "start", start, "end", end)
+		return 1
+	}
+
+	// Return first index of desired period configs
+	i := sort.Search(len(configs), func(i int) bool {
+		// return true when there is no overlap with query & current
+		// config because query is in future
+		// or
+		// there is overlap with current config
+		finalOrFuture := i == len(configs)-1 || configs[i].From.Time.After(end)
+		if finalOrFuture {
+			return true
+		}
+		// qEnd not before start && qStart not after end
+		overlapCurrent := !end.Before(configs[i].From.Time) && !start.After(configs[i+1].From.Time)
+		return overlapCurrent
+	})
+
+	// There was no overlapping index. This can only happen when a time
+	// was requested before the first period config start. In that case, just
+	// use the first period config. It should error elsewhere.
+	if i == len(configs) {
+		i = 0
+	}
+
+	// If start == end, this is an instant query;
+	// use the appropriate parallelism type for
+	// the active configuration
+	if start.Equal(end) {
+		switch configs[i].IndexType {
+		case types.IndexTypeTSDB:
+			return l.TSDBMaxQueryParallelism(ctx, user)
+		}
+		return l.MaxQueryParallelism(ctx, user)
+
+	}
+
+	var tsdbDur, otherDur time.Duration
+
+	for ; i < len(configs) && configs[i].From.Time.Before(end); i++ {
+		_, from := minMaxModelTime(start, configs[i].From.Time)
+		through := end
+		if i+1 < len(configs) {
+			through, _ = minMaxModelTime(end, configs[i+1].From.Time)
+		}
+
+		dur := through.Sub(from)
+
+		if i+1 < len(configs) && configs[i+1].From.Time.Before(end) {
+			dur = configs[i+1].From.Sub(from)
+		}
+		if ty := configs[i].IndexType; ty == types.IndexTypeTSDB {
+			tsdbDur += dur
+		} else {
+			otherDur += dur
+		}
+	}
+
+	// We don't need nanosecond precision here so convert to seconds.
+	// This is also important to prevent overflowing int64 when multiplying by parallelism below.
+	tsdbDur = tsdbDur / 1e9
+	otherDur = otherDur / 1e9
+	totalDur := int(tsdbDur + otherDur)
+	// If totalDur is 0, the query likely does not overlap any of the schema configs so just use parallelism of 1 and
+	// let the downstream code handle it.
+	if totalDur == 0 {
+		level.Warn(logger).Log("msg", "could not determine query overlaps on tsdb vs non-tsdb schemas, likely due to query not overlapping any of the schema configs,"+
+			"letting downstream code handle it gracefully", "start", start, "end", end)
+		return 1
+	}
+
+	tsdbPart := int(tsdbDur) * tsdbMaxQueryParallelism / totalDur
+	regPart := int(otherDur) * regMaxQueryParallelism / totalDur
+
+	if combined := regPart + tsdbPart; combined > 0 {
+		return combined
+	}
+
+	// As long as the actual config is not zero,
+	// ensure at least 1 parallelism to account for integer division
+	// in unlikely edge cases such as two configs with parallelism of 1
+	// being rounded down to zero
+	if (tsdbMaxQueryParallelism > 0 && tsdbDur > 0) || (regMaxQueryParallelism > 0 && otherDur > 0) {
+		return 1
+	}
+
+	return 0
+}
+
+func minMaxModelTime(a, b model.Time) (model.Time, model.Time) {
+	if a.Before(b) {
+		return a, b
+	}
+	return b, a
+}
+
+func MinWeightedParallelism(ctx context.Context, tenantIDs []string, configs []config.PeriodConfig, l Limits, start, end model.Time) int {
+	return validation.SmallestPositiveIntPerTenant(tenantIDs, func(user string) int {
+		return WeightedParallelism(
+			ctx,
+			configs,
+			user,
+			l,
+			start,
+			end,
+		)
+	})
+}
+
+// validates log entries limits
+func validateMaxEntriesLimits(ctx context.Context, reqLimit uint32, limits Limits) error {
+	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
-		return nil, err
+		return httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 
-	if err := user.InjectOrgIDIntoHTTPRequest(ctx, request); err != nil {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
-	}
+	maxEntriesCapture := func(id string) int { return limits.MaxEntriesLimitPerQuery(ctx, id) }
+	maxEntriesLimit := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, maxEntriesCapture)
 
-	response, err := rt.next.RoundTrip(request)
+	if int(reqLimit) > maxEntriesLimit && maxEntriesLimit != 0 {
+		return fmt.Errorf("%w: %w", logqlerr.ErrMaxEntriesLimit,
+			httpgrpc.Errorf(http.StatusBadRequest, maxSeriesErrTmpl, reqLimit, maxEntriesLimit))
+	}
+	return nil
+}
+
+func validateMatchers(ctx context.Context, limits Limits, matchers []*labels.Matcher) error {
+	tenants, err := tenant.TenantIDs(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	defer func() { _ = response.Body.Close() }()
 
-	return rt.codec.DecodeResponse(ctx, response, r)
+	actual := make(map[string]struct{}, len(matchers))
+	var present []string
+	for _, m := range matchers {
+		actual[m.Name] = struct{}{}
+		present = append(present, m.Name)
+	}
+
+	// Enforce RequiredLabels limit
+	for _, tenant := range tenants {
+		required := limits.RequiredLabels(ctx, tenant)
+		var missing []string
+		for _, label := range required {
+			if _, found := actual[label]; !found {
+				missing = append(missing, label)
+			}
+		}
+
+		if len(missing) > 0 {
+			return fmt.Errorf(requiredLabelsErrTmpl, strings.Join(missing, ", "), strings.Join(present, ", "))
+		}
+	}
+
+	// Enforce RequiredNumberLabels limit.
+	// The reason to enforce this one after RequiredLabels is to avoid users
+	// from adding enough label matchers to pass the RequiredNumberLabels limit but then
+	// having to modify them to use the ones required by RequiredLabels.
+	requiredNumberLabelsCapture := func(id string) int { return limits.RequiredNumberLabels(ctx, id) }
+	if requiredNumberLabels := validation.SmallestPositiveNonZeroIntPerTenant(tenants, requiredNumberLabelsCapture); requiredNumberLabels > 0 {
+		if len(present) < requiredNumberLabels {
+			return fmt.Errorf(requiredNumberLabelsErrTmpl, strings.Join(present, ", "), len(present), requiredNumberLabels)
+		}
+	}
+
+	return nil
 }

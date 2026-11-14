@@ -1,4 +1,4 @@
-// Copyright 2017 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,11 +15,9 @@ package labels
 
 import (
 	"bufio"
+	"fmt"
 	"os"
-	"sort"
 	"strings"
-
-	"github.com/pkg/errors"
 )
 
 // Slice is a sortable slice of label sets.
@@ -52,24 +50,25 @@ func ReadLabels(fn string, n int) ([]Labels, error) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
+	b := NewScratchBuilder(0)
 
 	var mets []Labels
 	hashes := map[uint64]struct{}{}
 	i := 0
 
 	for scanner.Scan() && i < n {
-		m := make(Labels, 0, 10)
+		b.Reset()
 
 		r := strings.NewReplacer("\"", "", "{", "", "}", "")
 		s := r.Replace(scanner.Text())
 
-		labelChunks := strings.Split(s, ",")
-		for _, labelChunk := range labelChunks {
+		for labelChunk := range strings.SplitSeq(s, ",") {
 			split := strings.Split(labelChunk, ":")
-			m = append(m, Label{Name: split[0], Value: split[1]})
+			b.Add(split[0], split[1])
 		}
 		// Order of the k/v labels matters, don't assume we'll always receive them already sorted.
-		sort.Sort(m)
+		b.Sort()
+		m := b.Labels()
 
 		h := m.Hash()
 		if _, ok := hashes[h]; ok {
@@ -81,7 +80,7 @@ func ReadLabels(fn string, n int) ([]Labels, error) {
 	}
 
 	if i != n {
-		return mets, errors.Errorf("requested %d metrics but found %d", n, i)
+		return mets, fmt.Errorf("requested %d metrics but found %d", n, i)
 	}
 	return mets, nil
 }

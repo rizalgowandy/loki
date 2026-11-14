@@ -4,22 +4,22 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
+	"io"
 	"net/url"
 	"strings"
 )
 
 // MSIConvertable is an interface that defines methods for converting your
-// custom types to a map[string]interface{} representation.
+// custom types to a map[string]any representation.
 type MSIConvertable interface {
-	// MSI gets a map[string]interface{} (msi) representing the
+	// MSI gets a map[string]any (msi) representing the
 	// object.
-	MSI() map[string]interface{}
+	MSI() map[string]any
 }
 
 // Map provides extended functionality for working with
 // untyped data, in particular map[string]interface (msi).
-type Map map[string]interface{}
+type Map map[string]any
 
 // Value returns the internal value instance
 func (m Map) Value() *Value {
@@ -29,36 +29,35 @@ func (m Map) Value() *Value {
 // Nil represents a nil Map.
 var Nil = New(nil)
 
-// New creates a new Map containing the map[string]interface{} in the data argument.
+// New creates a new Map containing the map[string]any in the data argument.
 // If the data argument is not a map[string]interface, New attempts to call the
 // MSI() method on the MSIConvertable interface to create one.
-func New(data interface{}) Map {
-	if _, ok := data.(map[string]interface{}); !ok {
+func New(data any) Map {
+	if _, ok := data.(map[string]any); !ok {
 		if converter, ok := data.(MSIConvertable); ok {
 			data = converter.MSI()
 		} else {
 			return nil
 		}
 	}
-	return Map(data.(map[string]interface{}))
+	return Map(data.(map[string]any))
 }
 
-// MSI creates a map[string]interface{} and puts it inside a new Map.
+// MSI creates a map[string]any and puts it inside a new Map.
 //
 // The arguments follow a key, value pattern.
 //
-//
 // Returns nil if any key argument is non-string or if there are an odd number of arguments.
 //
-// Example
+// # Example
 //
 // To easily create Maps:
 //
-//     m := objx.MSI("name", "Mat", "age", 29, "subobj", objx.MSI("active", true))
+//	m := objx.MSI("name", "Mat", "age", 29, "subobj", objx.MSI("active", true))
 //
-//     // creates an Map equivalent to
-//     m := objx.Map{"name": "Mat", "age": 29, "subobj": objx.Map{"active": true}}
-func MSI(keyAndValuePairs ...interface{}) Map {
+//	// creates an Map equivalent to
+//	m := objx.Map{"name": "Mat", "age": 29, "subobj": objx.Map{"active": true}}
+func MSI(keyAndValuePairs ...any) Map {
 	newMap := Map{}
 	keyAndValuePairsLen := len(keyAndValuePairs)
 	if keyAndValuePairsLen%2 != 0 {
@@ -92,6 +91,18 @@ func MustFromJSON(jsonString string) Map {
 	return o
 }
 
+// MustFromJSONSlice creates a new slice of Map containing the data specified in the
+// jsonString. Works with jsons with a top level array
+//
+// Panics if the JSON is invalid.
+func MustFromJSONSlice(jsonString string) []Map {
+	slice, err := FromJSONSlice(jsonString)
+	if err != nil {
+		panic("objx: MustFromJSONSlice failed with error: " + err.Error())
+	}
+	return slice
+}
+
 // FromJSON creates a new Map containing the data specified in the
 // jsonString.
 //
@@ -102,45 +113,20 @@ func FromJSON(jsonString string) (Map, error) {
 	if err != nil {
 		return Nil, err
 	}
-	m.tryConvertFloat64()
 	return m, nil
 }
 
-func (m Map) tryConvertFloat64() {
-	for k, v := range m {
-		switch v.(type) {
-		case float64:
-			f := v.(float64)
-			if float64(int(f)) == f {
-				m[k] = int(f)
-			}
-		case map[string]interface{}:
-			t := New(v)
-			t.tryConvertFloat64()
-			m[k] = t
-		case []interface{}:
-			m[k] = tryConvertFloat64InSlice(v.([]interface{}))
-		}
+// FromJSONSlice creates a new slice of Map containing the data specified in the
+// jsonString. Works with jsons with a top level array
+//
+// Returns an error if the JSON is invalid.
+func FromJSONSlice(jsonString string) ([]Map, error) {
+	var slice []Map
+	err := json.Unmarshal([]byte(jsonString), &slice)
+	if err != nil {
+		return nil, err
 	}
-}
-
-func tryConvertFloat64InSlice(s []interface{}) []interface{} {
-	for k, v := range s {
-		switch v.(type) {
-		case float64:
-			f := v.(float64)
-			if float64(int(f)) == f {
-				s[k] = int(f)
-			}
-		case map[string]interface{}:
-			t := New(v)
-			t.tryConvertFloat64()
-			s[k] = t
-		case []interface{}:
-			s[k] = tryConvertFloat64InSlice(v.([]interface{}))
-		}
-	}
-	return s
+	return slice, nil
 }
 
 // FromBase64 creates a new Obj containing the data specified
@@ -149,7 +135,7 @@ func tryConvertFloat64InSlice(s []interface{}) []interface{} {
 // The string is an encoded JSON string returned by Base64
 func FromBase64(base64String string) (Map, error) {
 	decoder := base64.NewDecoder(base64.StdEncoding, strings.NewReader(base64String))
-	decoded, err := ioutil.ReadAll(decoder)
+	decoded, err := io.ReadAll(decoder)
 	if err != nil {
 		return nil, err
 	}

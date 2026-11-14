@@ -1,4 +1,4 @@
-// Copyright 2020 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,6 +14,7 @@
 package discovery
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -21,7 +22,8 @@ import (
 	"strings"
 	"sync"
 
-	"gopkg.in/yaml.v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 )
@@ -40,8 +42,8 @@ var (
 	configTypesMu sync.Mutex
 	configTypes   = make(map[reflect.Type]reflect.Type)
 
-	emptyStructType = reflect.TypeOf(struct{}{})
-	configsType     = reflect.TypeOf(Configs{})
+	emptyStructType = reflect.TypeFor[struct{}]()
+	configsType     = reflect.TypeFor[Configs]()
 )
 
 // RegisterConfig registers the given Config type for YAML marshaling and unmarshaling.
@@ -52,7 +54,7 @@ func RegisterConfig(config Config) {
 func init() {
 	// N.B.: static_configs is the only Config type implemented by default.
 	// All other types are registered at init by their implementing packages.
-	elemTyp := reflect.TypeOf(&targetgroup.Group{})
+	elemTyp := reflect.TypeFor[*targetgroup.Group]()
 	registerConfig(staticConfigsKey, elemTyp, StaticConfig{})
 }
 
@@ -108,9 +110,9 @@ func getConfigType(out reflect.Type) reflect.Type {
 
 // UnmarshalYAMLWithInlineConfigs helps implement yaml.Unmarshal for structs
 // that have a Configs field that should be inlined.
-func UnmarshalYAMLWithInlineConfigs(out interface{}, unmarshal func(interface{}) error) error {
+func UnmarshalYAMLWithInlineConfigs(out any, unmarshal func(any) error) error {
 	outVal := reflect.ValueOf(out)
-	if outVal.Kind() != reflect.Ptr {
+	if outVal.Kind() != reflect.Pointer {
 		return fmt.Errorf("discovery: can only unmarshal into a struct pointer: %T", out)
 	}
 	outVal = outVal.Elem()
@@ -169,7 +171,7 @@ func readConfigs(structVal reflect.Value, startField int) (Configs, error) {
 		}
 		for k := 0; k < field.Len(); k++ {
 			val := field.Index(k)
-			if val.IsZero() || (val.Kind() == reflect.Ptr && val.Elem().IsZero()) {
+			if val.IsZero() || (val.Kind() == reflect.Pointer && val.Elem().IsZero()) {
 				key := configFieldNames[field.Type().Elem()]
 				key = strings.TrimPrefix(key, configFieldPrefix)
 				return nil, fmt.Errorf("empty or null section in %s", key)
@@ -196,9 +198,9 @@ func readConfigs(structVal reflect.Value, startField int) (Configs, error) {
 
 // MarshalYAMLWithInlineConfigs helps implement yaml.Marshal for structs
 // that have a Configs field that should be inlined.
-func MarshalYAMLWithInlineConfigs(in interface{}) (interface{}, error) {
+func MarshalYAMLWithInlineConfigs(in any) (any, error) {
 	inVal := reflect.ValueOf(in)
-	for inVal.Kind() == reflect.Ptr {
+	for inVal.Kind() == reflect.Pointer {
 		inVal = inVal.Elem()
 	}
 	inTyp := inVal.Type()
@@ -247,12 +249,43 @@ func writeConfigs(structVal reflect.Value, configs Configs) error {
 }
 
 func replaceYAMLTypeError(err error, oldTyp, newTyp reflect.Type) error {
-	if e, ok := err.(*yaml.TypeError); ok {
+	if e, ok := errors.AsType[*yaml.TypeError](err); ok {
 		oldStr := oldTyp.String()
 		newStr := newTyp.String()
 		for i, s := range e.Errors {
-			e.Errors[i] = strings.Replace(s, oldStr, newStr, -1)
+			e.Errors[i] = strings.ReplaceAll(s, oldStr, newStr)
 		}
 	}
 	return err
+}
+
+// RegisterSDMetrics registers the metrics used by service discovery mechanisms.
+// RegisterSDMetrics should be called only once during the lifetime of the Prometheus process.
+// There is no need for the Prometheus process to unregister the metrics.
+func RegisterSDMetrics(registerer prometheus.Registerer, rmm RefreshMetricsManager) (map[string]DiscovererMetrics, error) {
+	err := rmm.Register()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create service discovery refresh metrics: %w", err)
+	}
+
+	metrics := make(map[string]DiscovererMetrics)
+	for _, conf := range configNames {
+		currentSdMetrics := conf.NewDiscovererMetrics(registerer, rmm)
+		err = currentSdMetrics.Register()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create service discovery metrics: %w", err)
+		}
+		metrics[conf.Name()] = currentSdMetrics
+	}
+	return metrics, nil
+}
+
+// RegisteredConfigNames returns the names of all registered service discovery providers.
+func RegisteredConfigNames() []string {
+	names := make([]string, 0, len(configNames))
+	for name := range configNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }

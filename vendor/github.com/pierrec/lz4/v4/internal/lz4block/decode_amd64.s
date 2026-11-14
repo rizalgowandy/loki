@@ -1,13 +1,18 @@
-// +build !appengine
-// +build gc
-// +build !noasm
+//go:build gc && !noasm
 
+#include "go_asm.h"
 #include "textflag.h"
 
+// Stream copies at least this long prefetch for ownership (see
+// copy_match_stream64_avx2).
+#define AVX2_PREFETCH_MIN 49152
+
 // AX scratch
-// BX scratch
-// CX scratch
-// DX token
+// BX scratch, match pointer
+// CX literal and match lengths
+// DX token, match offset
+// R10 scratch (match copy)
+// X0, X1 scratch (match copy)
 //
 // DI &dst
 // SI &src
@@ -17,7 +22,7 @@
 // R12 short output end
 // R13 short input end
 // R14 &dict
-// R15 &dict + len(dict)
+// R15 len(dict)
 
 // func decodeBlock(dst, src, dict []byte) int
 TEXT ·decodeBlock(SB), NOSPLIT, $48-80
@@ -34,7 +39,6 @@ TEXT ·decodeBlock(SB), NOSPLIT, $48-80
 
 	MOVQ dict_base+48(FP), R14
 	MOVQ dict_len+56(FP), R15
-	ADDQ R14, R15
 
 	// shortcut ends
 	// short output end
@@ -44,28 +48,26 @@ TEXT ·decodeBlock(SB), NOSPLIT, $48-80
 	MOVQ R9, R13
 	SUBQ $16, R13
 
-loop:
-	// for si < len(src)
-	CMPQ SI, R9
-	JGE end
+	XORL CX, CX
 
+loop:
 	// token := uint32(src[si])
-	MOVBQZX (SI), DX
+	MOVBLZX (SI), DX
 	INCQ SI
 
 	// lit_len = token >> 4
 	// if lit_len > 0
 	// CX = lit_len
-	MOVQ DX, CX
-	SHRQ $4, CX
+	MOVL DX, CX
+	SHRL $4, CX
 
 	// if lit_len != 0xF
-	CMPQ CX, $0xF
-	JEQ lit_len_loop_pre
+	CMPL CX, $0xF
+	JEQ  lit_len_loop
 	CMPQ DI, R12
-	JGE lit_len_loop_pre
+	JAE  copy_literal
 	CMPQ SI, R13
-	JGE lit_len_loop_pre
+	JAE  copy_literal
 
 	// copy shortcut
 
@@ -84,30 +86,32 @@ loop:
 	ADDQ CX, DI
 	ADDQ CX, SI
 
-	MOVQ DX, CX
-	ANDQ $0xF, CX
+	MOVL DX, CX
+	ANDL $0xF, CX
 
 	// The second stage: prepare for match copying, decode full info.
 	// If it doesn't work out, the info won't be wasted.
 	// offset := uint16(data[:2])
-	MOVWQZX (SI), DX
+	MOVWLZX (SI), DX
+	TESTL DX, DX
+	JE err_corrupt
 	ADDQ $2, SI
+	JC err_short_buf
 
 	MOVQ DI, AX
 	SUBQ DX, AX
+	JC err_corrupt
 	CMPQ AX, DI
-	JGT err_short_buf
+	JA err_short_buf
 
 	// if we can't do the second stage then jump straight to read the
 	// match length, we already have the offset.
-	CMPQ CX, $0xF
+	CMPL CX, $0xF
 	JEQ match_len_loop_pre
-	CMPQ DX, R11
-	JLT match_len_loop_pre
-	CMPQ DX, $8
+	CMPL DX, $8
 	JLT match_len_loop_pre
 	CMPQ AX, R11
-	JLT err_short_buf
+	JB match_len_loop_pre
 
 	// memcpy(op + 0, match + 0, 8);
 	MOVQ (AX), BX
@@ -119,68 +123,60 @@ loop:
 	MOVW 16(AX), BX
 	MOVW BX, 16(DI)
 
-	LEAQ 4(DI)(CX*1), DI // minmatch
+	LEAQ const_minMatch(DI)(CX*1), DI
 
 	// shortcut complete, load next token
-	JMP loop
+	JMP loopcheck
 
-lit_len_loop_pre:
-	// if lit_len > 0
-	CMPQ CX, $0
-	JEQ offset
-	CMPQ CX, $0xF
-	JNE copy_literal
-
+	// Read the rest of the literal length:
+	// do { BX = src[si++]; lit_len += BX } while (BX == 0xFF).
 lit_len_loop:
-	// for src[si] == 0xFF
-	CMPB (SI), $0xFF
-	JNE lit_len_finalise
+	CMPQ SI, R9
+	JAE err_short_buf
 
-	// bounds check src[si+1]
-	LEAQ 1(SI), AX
-	CMPQ AX, R9
-	JGT err_short_buf
-
-	// lit_len += 0xFF
-	ADDQ $0xFF, CX
+	MOVBLZX (SI), BX
 	INCQ SI
-	JMP lit_len_loop
+	ADDQ BX, CX
 
-lit_len_finalise:
-	// lit_len += int(src[si])
-	// si++
-	MOVBQZX (SI), AX
-	ADDQ AX, CX
-	INCQ SI
+	CMPB BX, $0xFF
+	JE lit_len_loop
 
 copy_literal:
 	// bounds check src and dst
-	LEAQ (SI)(CX*1), AX
+	MOVQ SI, AX
+	ADDQ CX, AX
+	JC err_short_buf
 	CMPQ AX, R9
-	JGT err_short_buf
+	JA err_short_buf
 
-	LEAQ (DI)(CX*1), AX
-	CMPQ AX, R8
-	JGT err_short_buf
+	MOVQ DI, BX
+	ADDQ CX, BX
+	JC err_short_buf
+	CMPQ BX, R8
+	JA err_short_buf
 
-	// whats a good cut off to call memmove?
-	CMPQ CX, $16
+	// Copy literals of <=48 bytes through the XMM registers.
+	CMPQ CX, $48
 	JGT memmove_lit
 
-	// if len(dst[di:]) < 16
+	// if len(dst[di:]) < 48
 	MOVQ R8, AX
 	SUBQ DI, AX
-	CMPQ AX, $16
+	CMPQ AX, $48
 	JLT memmove_lit
 
-	// if len(src[si:]) < 16
-	MOVQ R9, AX
-	SUBQ SI, AX
-	CMPQ AX, $16
+	// if len(src[si:]) < 48
+	MOVQ R9, BX
+	SUBQ SI, BX
+	CMPQ BX, $48
 	JLT memmove_lit
 
 	MOVOU (SI), X0
+	MOVOU 16(SI), X1
+	MOVOU 32(SI), X2
 	MOVOU X0, (DI)
+	MOVOU X1, 16(DI)
+	MOVOU X2, 32(DI)
 
 	ADDQ CX, SI
 	ADDQ CX, DI
@@ -213,71 +209,62 @@ memmove_lit:
 	ADDQ dst_len+8(FP), R8
 	MOVQ src_base+24(FP), R9
 	ADDQ src_len+32(FP), R9
+	MOVQ dict_base+48(FP), R14
+	MOVQ dict_len+56(FP), R15
 	MOVQ R8, R12
 	SUBQ $32, R12
 	MOVQ R9, R13
 	SUBQ $16, R13
 
 finish_lit_copy:
-	CMPQ SI, R9
-	JGE end
-
-offset:
 	// CX := mLen
 	// free up DX to use for offset
-	MOVQ DX, CX
+	MOVL DX, CX
+	ANDL $0xF, CX
 
-	LEAQ 2(SI), AX
-	CMPQ AX, R9
-	JGT err_short_buf
+	CMPQ SI, R9
+	JAE end
 
 	// offset
-	// DX := int(src[si]) | int(src[si+1])<<8
-	MOVWQZX (SI), DX
+	// si += 2
+	// DX := int(src[si-2]) | int(src[si-1])<<8
 	ADDQ $2, SI
+	JC err_short_buf
+	CMPQ SI, R9
+	JA err_short_buf
+	MOVWQZX -2(SI), DX
 
 	// 0 offset is invalid
-	CMPQ DX, $0
-	JEQ err_corrupt
-
-	ANDB $0xF, CX
+	TESTL DX, DX
+	JEQ   err_corrupt
 
 match_len_loop_pre:
 	// if mlen != 0xF
 	CMPB CX, $0xF
 	JNE copy_match
 
+	// do { BX = src[si++]; mlen += BX } while (BX == 0xFF).
 match_len_loop:
-	// for src[si] == 0xFF
-	// lit_len += 0xFF
-	CMPB (SI), $0xFF
-	JNE match_len_finalise
+	CMPQ SI, R9
+	JAE err_short_buf
 
-	// bounds check src[si+1]
-	LEAQ 1(SI), AX
-	CMPQ AX, R9
-	JGT err_short_buf
-
-	ADDQ $0xFF, CX
+	MOVBLZX (SI), BX
 	INCQ SI
-	JMP match_len_loop
+	ADDQ BX, CX
 
-match_len_finalise:
-	// lit_len += int(src[si])
-	// si++
-	MOVBQZX (SI), AX
-	ADDQ AX, CX
-	INCQ SI
+	CMPB BX, $0xFF
+	JE match_len_loop
 
 copy_match:
-	// mLen += minMatch
-	ADDQ $4, CX
+	ADDQ $const_minMatch, CX
 
 	// check we have match_len bytes left in dst
 	// di+match_len < len(dst)
-	LEAQ (DI)(CX*1), AX
+	MOVQ DI, AX
+	ADDQ CX, AX
+	JC err_short_buf
 	CMPQ AX, R8
-	JGT err_short_buf
+	JA err_short_buf
 
 	// DX = offset
 	// CX = match_len
@@ -287,24 +274,36 @@ copy_match:
 
 	// check BX is within dst
 	// if BX < &dst
+	JC copy_match_from_dict
 	CMPQ BX, R11
-	JLT copy_match_from_dict
+	JB copy_match_from_dict
 
-	// if offset + match_len < di
-	LEAQ (BX)(CX*1), AX
-	CMPQ DI, AX
-	JGT copy_interior_match
+copy_match_dispatch:
+	// DX offset, CX match_len > 0, BX match, DI dst. Also entered from
+	// copy_match_from_dict with BX = &dst, DX = di.
+	CMPQ DX, CX
+	JB   copy_match_overlap
 
-	// AX := len(dst[:di])
-	// MOVQ DI, AX
-	// SUBQ R11, AX
+	// Non-overlapping match (offset >= match_len).
+	CMPQ CX, $16
+	JA   copy_match_nonoverlap_long
 
-	// copy 16 bytes at a time
-	// if di-offset < 16 copy 16-(di-offset) bytes to di
-	// then do the remaining
+	// match_len <= 16: one 16-byte copy if there is room for the overrun.
+	// if len(dst[di:]) < 16
+	MOVQ R8, AX
+	SUBQ DI, AX
+	CMPQ AX, $16
+	JB   copy_match_loop
+
+	MOVOU (BX), X0
+	MOVOU X0, (DI)
+
+	ADDQ CX, DI
+	XORL CX, CX
+	JMP  loopcheck
 
 copy_match_loop:
-	// for match_len >= 0
+	// Byte copy: short overlapping matches and tails without room to overrun.
 	// dst[di] = dst[i]
 	// di++
 	// i++
@@ -313,27 +312,216 @@ copy_match_loop:
 	INCQ DI
 	INCQ BX
 	DECQ CX
+	JNZ copy_match_loop
 
-	CMPQ CX, $0
-	JGT copy_match_loop
+	JMP loopcheck
 
-	JMP loop
+copy_match_nonoverlap_long:
+	// 17..255 bytes: inline 16-byte loop, last chunk ends exactly at
+	// di+match_len. 256 and up still call memmove.
+	CMPQ CX, $256
+	JAE  memmove_match
 
-copy_interior_match:
-	CMPQ CX, $16
-	JGT memmove_match
-
-	// if len(dst[di:]) < 16
-	MOVQ R8, AX
-	SUBQ DI, AX
-	CMPQ AX, $16
-	JLT memmove_match
-
+	MOVOU -16(BX)(CX*1), X1 // tail; the match does not overlap, so load it up front
+	LEAQ  -16(DI)(CX*1), R10
+copy_match_nonoverlap_loop:
 	MOVOU (BX), X0
 	MOVOU X0, (DI)
+	ADDQ  $16, BX
+	ADDQ  $16, DI
+	CMPQ  DI, R10
+	JB    copy_match_nonoverlap_loop
 
-	ADDQ CX, DI
-	JMP loop
+	MOVOU X1, (R10)
+	LEAQ  16(R10), DI
+	XORL  CX, CX
+	JMP   loopcheck
+
+copy_match_overlap:
+	// Overlapping: the output is periodic with period offset.
+	CMPQ DX, $32
+	JAE  copy_match_overlap32
+	CMPQ DX, $16
+	JA   copy_match_overlap17 // 17..31
+	JE   copy_match_splat16
+
+	// offset < 16: byte loop if short, else splat (1, 2, 4, 8) or tile.
+	CMPQ CX, $16
+	JB   copy_match_loop
+	CMPQ DX, $8
+	JA   copy_match_tile // 9..15
+	JE   copy_match_splat8
+	CMPQ DX, $4
+	JA   copy_match_tile // 5, 6, 7
+	JE   copy_match_splat4
+	CMPQ DX, $2
+	JA   copy_match_tile // 3
+	JE   copy_match_splat2
+
+	// offset == 1: replicate the byte across X0.
+	MOVBQZX    (BX), AX
+	MOVQ       $0x0101010101010101, R10
+	IMULQ      R10, AX
+	MOVQ       AX, X0
+	PUNPCKLQDQ X0, X0
+	MOVQ       $16, R10
+	JMP        copy_match_tile_loop
+
+copy_match_splat2:
+	MOVWQZX    (BX), AX
+	MOVQ       $0x0001000100010001, R10
+	IMULQ      R10, AX
+	MOVQ       AX, X0
+	PUNPCKLQDQ X0, X0
+	MOVQ       $16, R10
+	JMP        copy_match_tile_loop
+
+copy_match_splat4:
+	MOVL   (BX), X0
+	PSHUFD $0, X0, X0
+	MOVQ   $16, R10
+	JMP    copy_match_tile_loop
+
+copy_match_splat8:
+	MOVQ       (BX), X0
+	PUNPCKLQDQ X0, X0
+	MOVQ       $16, R10
+	JMP        copy_match_tile_loop
+
+copy_match_splat16:
+	MOVOU (BX), X0
+	MOVQ  $16, R10
+	JMP   copy_match_tile_loop
+
+copy_match_tile:
+	// Prefill step = (16/offset)*offset bytes so [match, di) holds a full
+	// tile and di is phase-aligned; then store the tile every step bytes.
+	LEAQ    tileStep<>(SB), R10
+	MOVBQZX (R10)(DX*1), R10
+	SUBQ    R10, CX
+	LEAQ    (DI)(R10*1), AX // prefill end
+copy_match_tile_prefill:
+	MOVB (BX), R10
+	MOVB R10, (DI)
+	INCQ BX
+	INCQ DI
+	CMPQ DI, AX
+	JB   copy_match_tile_prefill
+
+	LEAQ    tileStep<>(SB), R10
+	MOVBQZX (R10)(DX*1), R10
+	MOVQ    DI, AX
+	SUBQ    R10, AX
+	SUBQ    DX, AX // AX = match: the tile source
+	MOVOU   (AX), X0
+
+copy_match_tile_loop:
+	// X0 tile, R10 step (16 for splats), CX bytes left. Splats store four
+	// tiles per iteration while at least 64 bytes are left: long runs such
+	// as zeros are bound by stores, not by loop overhead. (Unrolling the
+	// 12..15-byte steps too made them slower on Sapphire Rapids at 4MiB.)
+	CMPQ CX, $64
+	JB   copy_match_tile_loop1
+	CMPQ R10, $16
+	JNE  copy_match_tile_loop1
+
+copy_match_tile_loop4:
+	MOVOU X0, (DI)
+	MOVOU X0, 16(DI)
+	MOVOU X0, 32(DI)
+	MOVOU X0, 48(DI)
+	ADDQ  $64, DI
+	SUBQ  $64, CX
+	CMPQ  CX, $64
+	JAE   copy_match_tile_loop4
+
+copy_match_tile_loop1:
+	CMPQ  CX, $16
+	JB    copy_match_tile_tail
+	MOVOU X0, (DI)
+	ADDQ  R10, DI
+	SUBQ  R10, CX
+	JMP   copy_match_tile_loop1
+
+copy_match_tile_tail:
+	// 0..15 left: one more tile if it fits in dst, else bytes.
+	TESTQ CX, CX
+	JZ    loopcheck
+	MOVQ  R8, AX
+	SUBQ  DI, AX
+	CMPQ  AX, $16
+	JB    copy_match_tail_bytes
+	MOVOU X0, (DI)
+	ADDQ  CX, DI
+	XORL  CX, CX
+	JMP   loopcheck
+
+copy_match_tail_bytes:
+	MOVQ DI, BX
+	SUBQ DX, BX
+	JMP  copy_match_loop
+
+copy_match_overlap17:
+	// 17..31: prefill one period with two 16-byte copies (both inside
+	// [di, di+offset)), then store the 32-byte tile at match every offset bytes.
+	MOVOU (BX), X0
+	MOVOU X0, (DI)
+	MOVOU -16(BX)(DX*1), X1
+	MOVOU X1, -16(DI)(DX*1)
+	ADDQ  DX, DI
+	SUBQ  DX, CX
+	MOVOU 16(BX), X1
+
+copy_match_overlap17_loop:
+	CMPQ  CX, $32
+	JB    copy_match_overlap17_tail
+	MOVOU X0, (DI)
+	MOVOU X1, 16(DI)
+	ADDQ  DX, DI
+	SUBQ  DX, CX
+	JMP   copy_match_overlap17_loop
+
+copy_match_overlap17_tail:
+	// 0..31 left: one more tile if it fits in dst, else bytes.
+	TESTQ CX, CX
+	JZ    loopcheck
+	MOVQ  R8, AX
+	SUBQ  DI, AX
+	CMPQ  AX, $32
+	JB    copy_match_tail_bytes
+	MOVOU X0, (DI)
+	MOVOU X1, 16(DI)
+	ADDQ  CX, DI
+	XORL  CX, CX
+	JMP   loopcheck
+
+copy_match_overlap32:
+	// offset >= 32. Long matches take copy_match_far, out of line, unless
+	// the offset is so large that its source is out of L1 anyway: there
+	// the loop below was as fast (Sapphire Rapids, 1MiB match at 64KiB).
+	CMPQ CX, $256
+	JB   copy_match_overlap32_short
+	CMPQ DX, $16384
+	JB   copy_match_far
+
+copy_match_overlap32_short:
+	// The last chunk ends exactly at di+match_len and is loaded after the
+	// loop; loads never touch the previous iteration's store.
+	LEAQ -16(DI)(CX*1), R10
+	LEAQ -16(BX)(CX*1), AX
+copy_match_overlap32_loop:
+	MOVOU (BX), X0
+	MOVOU X0, (DI)
+	ADDQ  $16, BX
+	ADDQ  $16, DI
+	CMPQ  DI, R10
+	JB    copy_match_overlap32_loop
+
+	MOVOU (AX), X1
+	MOVOU X1, (R10)
+	LEAQ  16(R10), DI
+	XORL  CX, CX
+	JMP   loopcheck
 
 copy_match_from_dict:
 	// CX = match_len
@@ -343,18 +531,16 @@ copy_match_from_dict:
 	MOVQ R11, AX
 	SUBQ BX, AX
 
-	// BX = &dict_end - dict_bytes_available
+	// BX = len(dict) - dict_bytes_available
 	MOVQ R15, BX
 	SUBQ AX, BX
+	JS err_short_dict
 
-	// check BX is within dict
-	// if BX < &dict
-	CMPQ BX, R14
-	JLT err_short_dict
+	ADDQ R14, BX
 
-	// if match_len > dict_bytes_available, match fits entirely within external dictionary : just copy
+	// if match_len <= dict_bytes_available, match fits entirely within external dictionary : just copy
 	CMPQ CX, AX
-	JLT memmove_match
+	JBE memmove_match
 
 	// The match stretches over the dictionary and our block
 	// 1) copy what comes from the dictionary
@@ -387,7 +573,6 @@ copy_match_from_dict:
 	ADDQ src_len+32(FP), R9
 	MOVQ dict_base+48(FP), R14
 	MOVQ dict_len+56(FP), R15
-	ADDQ R14, R15
 	MOVQ R8, R12
 	SUBQ $32, R12
 	MOVQ R9, R13
@@ -396,19 +581,13 @@ copy_match_from_dict:
 	// di+=copy_size
 	ADDQ AX, DI
 
-	// 2) copy the rest from the current block
-	// CX = match_len - copy_size = rest_size
+	// 2) copy the rest (> 0 bytes) from the start of the current block:
+	// a match at offset di from &dst.
 	SUBQ AX, CX
 	MOVQ R11, BX
-
-	// check if we have a copy overlap
-	// AX = &dst + rest_size
-	MOVQ CX, AX
-	ADDQ BX, AX
-	// if &dst + rest_size > di, copy byte by byte
-	CMPQ AX, DI
-
-	JGT copy_match_loop
+	MOVQ DI, DX
+	SUBQ R11, DX
+	JMP  copy_match_dispatch
 
 memmove_match:
 	// memmove(to, from, len)
@@ -439,9 +618,25 @@ memmove_match:
 	SUBQ $16, R13
 	MOVQ dict_base+48(FP), R14
 	MOVQ dict_len+56(FP), R15
-	ADDQ R14, R15
+	XORL CX, CX
 
-	JMP loop
+	// Every sequence that does not take the shortcut ends here: keep this
+	// jump target aligned, so that code added above cannot shift it. Its
+	// placement moved short-match decoding by several percent.
+	PCALIGN $32
+loopcheck:
+	// for si < len(src)
+	CMPQ SI, R9
+	JB   loop
+
+end:
+	// Remaining length must be zero.
+	TESTQ CX, CX
+	JNE   err_corrupt
+
+	SUBQ R11, DI
+	MOVQ DI, ret+72(FP)
+	RET
 
 err_corrupt:
 	MOVQ $-1, ret+72(FP)
@@ -455,7 +650,155 @@ err_short_dict:
 	MOVQ $-3, ret+72(FP)
 	RET
 
-end:
-	SUBQ R11, DI
-	MOVQ DI, ret+72(FP)
-	RET
+	// Out-of-line blocks.
+copy_match_far:
+	// Overlapping match, 32 <= offset < 16KiB, len >= 256. First grow the copy
+	// distance: with P bytes of pattern before DI (P a multiple of the
+	// offset), copying [DI-P, DI) to DI doubles it. From P >= 512 on,
+	// stream 64 bytes per iteration from DI-P: those loads are of bytes
+	// stored long before, so they do not wait on store forwarding as loads
+	// from DI-offset do.
+	MOVQ DX, AX
+
+copy_match_grow:
+	// AX = P >= 32, CX > 0 bytes left.
+	CMPQ AX, $512
+	JAE  copy_match_stream
+	CMPQ CX, AX
+	JBE  copy_match_stream
+	MOVQ DI, BX
+	SUBQ AX, BX
+	MOVQ AX, R10
+copy_match_grow_loop:
+	MOVOU (BX), X0
+	MOVOU X0, (DI)
+	ADDQ  $16, BX
+	ADDQ  $16, DI
+	SUBQ  $16, R10
+	CMPQ  R10, $16
+	JAE   copy_match_grow_loop
+	// 0..15 left: the last 16 bytes of the source, which ends at the old DI.
+	MOVOU -16(BX)(R10*1), X0
+	MOVOU X0, -16(DI)(R10*1)
+	ADDQ  R10, DI
+	SUBQ  AX, CX
+	SHLQ  $1, AX
+	JMP   copy_match_grow
+
+copy_match_stream:
+	// P >= 512, or CX <= P: all loads are below DI. BX starts at the
+	// beginning of the pattern, so the end-aligned last copy below needs
+	// 16 bytes behind it: under 16 bytes left at the start, copy bytes.
+	MOVQ DI, BX
+	SUBQ AX, BX
+	CMPQ CX, $16
+	JB   copy_match_stream_bytes
+	CMPQ CX, $64
+	JB   copy_match_stream_tail
+	CMPB ·hasAVX2(SB), $0
+	JNE  copy_match_stream64_avx2
+copy_match_stream64:
+	MOVOU (BX), X0
+	MOVOU 16(BX), X1
+	MOVOU 32(BX), X2
+	MOVOU 48(BX), X3
+	MOVOU X0, (DI)
+	MOVOU X1, 16(DI)
+	MOVOU X2, 32(DI)
+	MOVOU X3, 48(DI)
+	ADDQ  $64, BX
+	ADDQ  $64, DI
+	SUBQ  $64, CX
+	CMPQ  CX, $64
+	JAE   copy_match_stream64
+
+copy_match_stream_tail:
+	// 0..63 left. The match is at least 256 bytes, so the last 16 bytes
+	// can be copied ending exactly at its end.
+	CMPQ  CX, $16
+	JBE   copy_match_stream_last
+	MOVOU (BX), X0
+	MOVOU X0, (DI)
+	ADDQ  $16, BX
+	ADDQ  $16, DI
+	SUBQ  $16, CX
+	JMP   copy_match_stream_tail
+
+copy_match_stream_last:
+	MOVOU -16(BX)(CX*1), X0
+	MOVOU X0, -16(DI)(CX*1)
+	ADDQ  CX, DI
+	XORL  CX, CX
+	JMP   loopcheck
+
+copy_match_stream_bytes:
+	MOVB (BX), R10
+	MOVB R10, (DI)
+	INCQ BX
+	INCQ DI
+	DECQ CX
+	JNZ  copy_match_stream_bytes
+	JMP  loopcheck
+
+	// AVX2 variant of copy_match_stream64, out of line so that it moves
+	// no other code: two 32-byte loads and stores per 64 bytes.
+	//
+	// PCALIGN $64 also aligns decodeBlock itself to 64 bytes. Without
+	// it the function is only 32-byte aligned, and whether it lands on a
+	// 64-byte boundary depends on the code linked before it: the other
+	// half moved every hot loop and cost Zen 4/5 2-6% on real data.
+	PCALIGN $64
+copy_match_stream64_avx2:
+	// Long copies store faster than Intel's Golden Cove-class cores
+	// (Sapphire and Granite Rapids) prefetch lines for ownership: once the
+	// destination leaves L1d, 32-byte stores send about 6x as many demand
+	// RFOs to L2 as 16-byte ones, fill the fill and store buffers, and run
+	// 4-14% slower than the SSE loop. Prefetching for ownership 512 bytes
+	// ahead prevents that; shorter copies stay in L1d and skip it, as do
+	// CPUs that do not enumerate PREFETCHW (Haswell).
+	CMPQ    CX, $AVX2_PREFETCH_MIN
+	JB      copy_match_stream64_avx2_loop
+	CMPB    ·hasPrefetchW(SB), $0
+	JNE     copy_match_stream64_avx2_pfw
+	JMP     copy_match_stream64_avx2_loop
+
+	// Each loop starts on a 64-byte boundary so that it fits in one 64-byte
+	// fetch window: straddling one cost Sapphire Rapids 20% at 4-32K. Every
+	// block before a PCALIGN here ends in a jump, so no padding executes.
+	PCALIGN $64
+copy_match_stream64_avx2_loop:
+	VMOVDQU (BX), Y0
+	VMOVDQU 32(BX), Y1
+	VMOVDQU Y0, (DI)
+	VMOVDQU Y1, 32(DI)
+	ADDQ    $64, BX
+	ADDQ    $64, DI
+	SUBQ    $64, CX
+	CMPQ    CX, $64
+	JAE     copy_match_stream64_avx2_loop
+	// The tail and the rest of the decoder use legacy SSE encodings.
+	VZEROUPPER
+	JMP     copy_match_stream_tail
+
+	PCALIGN $64
+copy_match_stream64_avx2_pfw:
+	// PREFETCHW 512(DI), which the Go assembler does not know. Only
+	// reached when hasPrefetchW is set.
+	BYTE    $0x0f; BYTE $0x0d; BYTE $0x8f
+	BYTE    $0x00; BYTE $0x02; BYTE $0x00; BYTE $0x00
+	VMOVDQU (BX), Y0
+	VMOVDQU 32(BX), Y1
+	VMOVDQU Y0, (DI)
+	VMOVDQU Y1, 32(DI)
+	ADDQ    $64, BX
+	ADDQ    $64, DI
+	SUBQ    $64, CX
+	CMPQ    CX, $64
+	JAE     copy_match_stream64_avx2_pfw
+	VZEROUPPER
+	JMP     copy_match_stream_tail
+
+// tileStep[offset] = (16/offset)*offset for offsets 3, 5, 6, 7, 9..15.
+DATA tileStep<>+0(SB)/8, $0x0e0c0f100f101000
+DATA tileStep<>+8(SB)/8, $0x0f0e0d0c0b0a0910
+GLOBL tileStep<>(SB), RODATA|NOPTR, $16

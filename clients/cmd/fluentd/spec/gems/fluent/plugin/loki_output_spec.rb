@@ -1,6 +1,9 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'fileutils'
+require 'openssl'
+require 'tmpdir'
 require 'time'
 require 'yajl'
 require 'fluent/test'
@@ -25,6 +28,8 @@ RSpec.describe Fluent::Plugin::LokiOutput do
       drop_single_key true
       remove_keys a, b
       insecure_tls true
+      ciphers abc:def
+      min_version TLS1_3
       <label>
         job
         instance instance
@@ -41,6 +46,8 @@ RSpec.describe Fluent::Plugin::LokiOutput do
     expect(driver.instance.remove_keys).to eq %w[a b]
     expect(driver.instance.drop_single_key).to eq true
     expect(driver.instance.insecure_tls).to eq true
+    expect(driver.instance.ciphers).to eq 'abc:def'
+    expect(driver.instance.min_version).to eq 'TLS1_3'
   end
 
   it 'converts syslog output to loki output' do
@@ -50,12 +57,12 @@ RSpec.describe Fluent::Plugin::LokiOutput do
     driver = Fluent::Test::Driver::Output.new(described_class)
     driver.configure(config)
     content = File.readlines('spec/gems/fluent/plugin/data/syslog2')
-    single_chunk = [Time.at(1_546_270_458), content]
-    payload = driver.instance.generic_to_loki([single_chunk])
-    body = { 'streams': payload }
-    expect(body[:streams][0]['stream'].empty?).to eq true
-    expect(body[:streams][0]['values'].count).to eq 1
-    expect(body[:streams][0]['values'][0][0]).to eq '1546270458000000000'
+    chunk = [Time.at(1_546_270_458), content[0]]
+    payload = driver.instance.generic_to_loki([chunk])
+    expect(payload[0]['stream'].empty?).to eq true
+    expect(payload[0]['values'].count).to eq 1
+    expect(payload[0]['values'][0][0]).to eq '1546270458000000000'
+    expect(payload[0]['values'][0][1]).to eq content[0]
   end
 
   it 'converts syslog output with extra labels to loki output' do
@@ -66,12 +73,12 @@ RSpec.describe Fluent::Plugin::LokiOutput do
     driver = Fluent::Test::Driver::Output.new(described_class)
     driver.configure(config)
     content = File.readlines('spec/gems/fluent/plugin/data/syslog2')
-    single_chunk = [Time.at(1_546_270_458), content]
-    payload = driver.instance.generic_to_loki([single_chunk])
-    body = { 'streams': payload }
-    expect(body[:streams][0]['stream']).to eq('env' => 'test')
-    expect(body[:streams][0]['values'].count).to eq 1
-    expect(body[:streams][0]['values'][0][0]).to eq '1546270458000000000'
+    chunk = [Time.at(1_546_270_458), content[0]]
+    payload = driver.instance.generic_to_loki([chunk])
+    expect(payload[0]['stream']).to eq('env' => 'test')
+    expect(payload[0]['values'].count).to eq 1
+    expect(payload[0]['values'][0][0]).to eq '1546270458000000000'
+    expect(payload[0]['values'][0][1]).to eq content[0]
   end
 
   it 'converts multiple syslog output lines to loki output' do
@@ -84,11 +91,12 @@ RSpec.describe Fluent::Plugin::LokiOutput do
     line1 = [Time.at(1_546_270_458), content[0]]
     line2 = [Time.at(1_546_270_460), content[1]]
     payload = driver.instance.generic_to_loki([line1, line2])
-    body = { 'streams': payload }
-    expect(body[:streams][0]['stream'].empty?).to eq true
-    expect(body[:streams][0]['values'].count).to eq 2
-    expect(body[:streams][0]['values'][0][0]).to eq '1546270458000000000'
-    expect(body[:streams][0]['values'][1][0]).to eq '1546270460000000000'
+    expect(payload[0]['stream'].empty?).to eq true
+    expect(payload[0]['values'].count).to eq 2
+    expect(payload[0]['values'][0][0]).to eq '1546270458000000000'
+    expect(payload[0]['values'][0][1]).to eq content[0]
+    expect(payload[0]['values'][1][0]).to eq '1546270460000000000'
+    expect(payload[0]['values'][1][1]).to eq content[1]
   end
 
   it 'converts multiple syslog output lines with extra labels to loki output' do
@@ -102,11 +110,45 @@ RSpec.describe Fluent::Plugin::LokiOutput do
     line1 = [Time.at(1_546_270_458), content[0]]
     line2 = [Time.at(1_546_270_460), content[1]]
     payload = driver.instance.generic_to_loki([line1, line2])
-    body = { 'streams': payload }
-    expect(body[:streams][0]['stream']).to eq('env' => 'test')
-    expect(body[:streams][0]['values'].count).to eq 2
-    expect(body[:streams][0]['values'][0][0]).to eq '1546270458000000000'
-    expect(body[:streams][0]['values'][1][0]).to eq '1546270460000000000'
+    expect(payload[0]['stream']).to eq('env' => 'test')
+    expect(payload[0]['values'].count).to eq 2
+    expect(payload[0]['values'][0][0]).to eq '1546270458000000000'
+    expect(payload[0]['values'][0][1]).to eq content[0]
+    expect(payload[0]['values'][1][0]).to eq '1546270460000000000'
+    expect(payload[0]['values'][1][1]).to eq content[1]
+  end
+
+  it 'removed non utf-8 characters from log lines' do
+    config = <<-CONF
+      url     https://logs-us-west1.grafana.net
+    CONF
+    driver = Fluent::Test::Driver::Output.new(described_class)
+    driver.configure(config)
+    content = File.readlines('spec/gems/fluent/plugin/data/non_utf8.log')[0]
+    chunk = [Time.at(1_546_270_458), { 'message' => content, 'number': 1.2345, 'stream' => 'stdout' }]
+    payload = driver.instance.generic_to_loki([chunk])
+    expect(payload[0]['stream'].empty?).to eq true
+    expect(payload[0]['values'].count).to eq 1
+    expect(payload[0]['values'][0][0]).to eq '1546270458000000000'
+    expect(payload[0]['values'][0][1]).to eq 'message="? rest of line" number=1.2345 stream=stdout'
+  end
+
+  it 'handle non utf-8 characters from log lines in json format' do
+    config = <<-CONF
+      url         https://logs-us-west1.grafana.net
+      line_format json
+    CONF
+    driver = Fluent::Test::Driver::Output.new(described_class)
+    driver.configure(config)
+    content = File.readlines('spec/gems/fluent/plugin/data/non_utf8.log')[0]
+    chunk = [Time.at(1_546_270_458), { 'message' => content, 'number': 1.2345, 'stream' => 'stdout' }]
+    payload = driver.instance.generic_to_loki([chunk])
+    expect(payload[0]['stream'].empty?).to eq true
+    expect(payload[0]['values'].count).to eq 1
+    expect(payload[0]['values'][0][0]).to eq '1546270458000000000'
+    expect(payload[0]['values'][0][1]).to eq(
+      "{\"message\":\"\xC1 rest of line\",\"number\":1.2345,\"stream\":\"stdout\"}"
+    )
   end
 
   it 'formats record hash as key_value' do
@@ -122,7 +164,7 @@ RSpec.describe Fluent::Plugin::LokiOutput do
     expect(body[:streams][0]['stream'].empty?).to eq true
     expect(body[:streams][0]['values'].count).to eq 1
     expect(body[:streams][0]['values'][0][0]).to eq '1546270458000000000'
-    expect(body[:streams][0]['values'][0][1]).to eq 'message="' + content[0] + '" stream="stdout"'
+    expect(body[:streams][0]['values'][0][1]).to eq "message=\"#{content[0]}\" stream=stdout"
   end
 
   it 'formats record hash as json' do
@@ -278,5 +320,161 @@ RSpec.describe Fluent::Plugin::LokiOutput do
     allow(driver.instance).to receive(:loki_http_request) { server_error }
     allow(server_error).to receive(:body).and_return('fake body')
     expect { driver.instance.write(lines) }.to raise_error(described_class::LogPostError)
+  end
+
+  context 'when output is multi-thread' do
+    let(:thread) do
+      class_double(
+        'Thread',
+        current: { _fluentd_plugin_helper_thread_title: 'thread1' }
+      ).as_stubbed_const
+    end
+
+    before do
+      allow(Thread).to receive(:new).and_yield(thread)
+    end
+
+    it 'adds the fluentd_label by default' do
+      config = <<-CONF
+        url https://logs-us-west1.grafana.net
+
+        <buffer>
+          @type memory
+          flush_thread_count 2
+        </buffer>
+      CONF
+      driver = Fluent::Test::Driver::Output.new(described_class)
+      driver.configure(config)
+      content = File.readlines('spec/gems/fluent/plugin/data/syslog2')
+      chunk = [Time.at(1_546_270_458), content[0]]
+      payload = driver.instance.generic_to_loki([chunk])
+      expect(payload[0]['stream']).to eq('fluentd_thread' => 'thread1')
+    end
+
+    it 'does not add the fluentd_label when configured' do
+      config = <<-CONF
+        url https://logs-us-west1.grafana.net
+        include_thread_label  false
+
+        <buffer>
+          @type memory
+          flush_thread_count 2
+        </buffer>
+      CONF
+      driver = Fluent::Test::Driver::Output.new(described_class)
+      driver.configure(config)
+      content = File.readlines('spec/gems/fluent/plugin/data/syslog2')
+      chunk = [Time.at(1_546_270_458), content[0]]
+      payload = driver.instance.generic_to_loki([chunk])
+      expect(payload[0]['stream'].empty?).to eq(true)
+    end
+  end
+
+  context 'when client cert and key are configured' do
+    let(:tmpdir) { Dir.mktmpdir }
+
+    after do
+      FileUtils.remove_entry(tmpdir)
+    end
+
+    def self_signed_pair(cn)
+      key = OpenSSL::PKey::RSA.new(1024)
+      cert = OpenSSL::X509::Certificate.new
+      cert.subject = OpenSSL::X509::Name.parse("/CN=#{cn}")
+      cert.issuer = cert.subject
+      cert.public_key = key.public_key
+      cert.not_before = Time.now - 3600
+      cert.not_after = Time.now + 3600
+      cert.serial = OpenSSL::BN.rand(64)
+      cert.version = 2
+      cert.sign(key, OpenSSL::Digest.new('SHA256'))
+      [cert, key]
+    end
+
+    let(:leaf_pair) { self_signed_pair('leaf') }
+    let(:leaf_cert) { leaf_pair.first }
+    let(:leaf_key) { leaf_pair.last }
+    let(:intermediate_cert) { self_signed_pair('intermediate').first }
+
+    let(:chain_cert_path) do
+      p = File.join(tmpdir, 'chain.pem')
+      File.write(p, leaf_cert.to_pem + intermediate_cert.to_pem)
+      p
+    end
+
+    let(:single_cert_path) do
+      p = File.join(tmpdir, 'single.pem')
+      File.write(p, leaf_cert.to_pem)
+      p
+    end
+
+    let(:key_path) do
+      p = File.join(tmpdir, 'leaf.key')
+      File.write(p, leaf_key.to_pem)
+      p
+    end
+
+    let(:https_uri) { URI.parse('https://logs-us-west1.grafana.net/loki/api/v1/push') }
+
+    it 'includes extra_chain_cert in http_request_opts when chain file has multiple PEMs and stdlib supports it' do
+      allow(described_class).to receive(:extra_chain_cert_supported?).and_return(true)
+
+      driver = Fluent::Test::Driver::Output.new(described_class)
+      driver.configure(<<-CONF)
+        url https://logs-us-west1.grafana.net
+        cert #{chain_cert_path}
+        key #{key_path}
+        insecure_tls true
+      CONF
+
+      opts = driver.instance.http_request_opts(https_uri)
+      expect(opts[:extra_chain_cert]).to be_a(Array)
+      expect(opts[:extra_chain_cert].length).to eq(1)
+      expect(opts[:extra_chain_cert].first).to be_a(OpenSSL::X509::Certificate)
+    end
+
+    it 'does not pass extra_chain_cert when stdlib does not support it' do
+      allow(described_class).to receive(:extra_chain_cert_supported?).and_return(false)
+
+      driver = Fluent::Test::Driver::Output.new(described_class)
+      driver.configure(<<-CONF)
+        url https://logs-us-west1.grafana.net
+        cert #{chain_cert_path}
+        key #{key_path}
+        insecure_tls true
+      CONF
+
+      opts = driver.instance.http_request_opts(https_uri)
+      expect(opts).not_to have_key(:extra_chain_cert)
+    end
+
+    it 'logs once when multiple PEMs are present but stdlib does not support extra_chain_cert' do
+      allow(described_class).to receive(:extra_chain_cert_supported?).and_return(false)
+
+      driver = Fluent::Test::Driver::Output.new(described_class)
+      expect(driver.instance.log).to receive(:warn).with(/multiple PEM blocks/).once
+
+      driver.configure(<<-CONF)
+        url https://logs-us-west1.grafana.net
+        cert #{chain_cert_path}
+        key #{key_path}
+        insecure_tls true
+      CONF
+    end
+
+    it 'does not set extra_chain_cert for a single PEM file when stdlib supports it' do
+      allow(described_class).to receive(:extra_chain_cert_supported?).and_return(true)
+
+      driver = Fluent::Test::Driver::Output.new(described_class)
+      driver.configure(<<-CONF)
+        url https://logs-us-west1.grafana.net
+        cert #{single_cert_path}
+        key #{key_path}
+        insecure_tls true
+      CONF
+
+      opts = driver.instance.http_request_opts(https_uri)
+      expect(opts).not_to have_key(:extra_chain_cert)
+    end
   end
 end

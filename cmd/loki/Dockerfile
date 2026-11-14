@@ -1,26 +1,32 @@
-FROM golang:1.17.2 as build
+ARG GO_VERSION=1.26
 
+# Go build stage
+FROM golang:${GO_VERSION} AS build
+ARG IMAGE_TAG
 COPY . /src/loki
 WORKDIR /src/loki
-RUN make clean && make BUILD_IN_CONTAINER=false loki
+RUN make clean && make BUILD_IN_CONTAINER=false IMAGE_TAG=${IMAGE_TAG} loki
 
-FROM alpine:3.13
-
-RUN apk add --no-cache ca-certificates libcap
-
-COPY --from=build /src/loki/cmd/loki/loki /usr/bin/loki
-COPY cmd/loki/loki-docker-config.yaml /etc/loki/local-config.yaml
-
-RUN addgroup -g 10001 -S loki && \
-    adduser -u 10001 -S loki -G loki
-RUN mkdir -p /loki/rules && \
-    mkdir -p /loki/rules-temp && \
+# Prepare filesystem stage
+FROM golang:${GO_VERSION} AS filesystem
+COPY cmd/loki/loki-docker-config.yaml /local-config.yaml
+RUN mkdir -p /etc/loki /loki/rules /loki/rules-temp && \
+    cp /local-config.yaml /etc/loki/local-config.yaml && \
+    addgroup --gid 10001 loki && \
+    adduser --uid 10001 --gid 10001 --disabled-password --gecos "" loki && \
     chown -R loki:loki /etc/loki /loki
 
-# See https://github.com/grafana/loki/issues/1928
-RUN [ ! -e /etc/nsswitch.conf ] && echo 'hosts: files dns' > /etc/nsswitch.conf
+# Final stage
+FROM gcr.io/distroless/static:nonroot
 
-USER loki
+COPY --from=build /src/loki/cmd/loki/loki /usr/bin/loki
+COPY --from=filesystem --chown=10001:10001 /etc/loki /etc/loki
+COPY --from=filesystem --chown=10001:10001 /loki /loki
+COPY --from=filesystem /etc/passwd /etc/passwd
+COPY --from=filesystem /etc/group /etc/group
+
+USER 10001
+WORKDIR /
 EXPOSE 3100
 ENTRYPOINT [ "/usr/bin/loki" ]
 CMD ["-config.file=/etc/loki/local-config.yaml"]

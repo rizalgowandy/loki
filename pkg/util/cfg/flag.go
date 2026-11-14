@@ -6,6 +6,9 @@ import (
 	"sort"
 	"strings"
 
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
 	"github.com/grafana/dskit/flagext"
 	"github.com/pkg/errors"
 )
@@ -33,7 +36,7 @@ func Flags(args []string, fs *flag.FlagSet) Source {
 
 // dFlags parses the flagset, applying all values set on the slice
 func dFlags(fs *flag.FlagSet, args []string) Source {
-	return func(dst Cloneable) error {
+	return func(_ Cloneable) error {
 		// parse the final flagset
 		return fs.Parse(args)
 	}
@@ -91,7 +94,7 @@ func categorizedUsage(fs *flag.FlagSet) func() {
 			if name == "" {
 				continue
 			}
-			fmt.Fprintf(fs.Output(), " %s:\n", strings.Title(name))
+			fmt.Fprintf(fs.Output(), " %s:\n", cases.Title(language.Und, cases.NoLower).String(name))
 			for _, u := range categories[name] {
 				fmt.Fprintln(fs.Output(), u)
 			}

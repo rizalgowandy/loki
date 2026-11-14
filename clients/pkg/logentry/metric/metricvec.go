@@ -1,10 +1,9 @@
 package metric
 
 import (
+	"strings"
 	"sync"
 	"time"
-
-	"github.com/grafana/loki/pkg/util"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
@@ -32,7 +31,7 @@ func newMetricVec(factory func(labels map[string]string) prometheus.Metric, maxA
 
 // Describe implements prometheus.Collector and doesn't declare any metrics on purpose to bypass prometheus validation.
 // see https://godoc.org/github.com/prometheus/client_golang/prometheus#hdr-Custom_Collectors_and_constant_Metrics search for "unchecked"
-func (c *metricVec) Describe(ch chan<- *prometheus.Desc) {}
+func (c *metricVec) Describe(_ chan<- *prometheus.Desc) {}
 
 // Collect implements prometheus.Collector
 func (c *metricVec) Collect(ch chan<- prometheus.Metric) {
@@ -52,10 +51,24 @@ func (c *metricVec) With(labels model.LabelSet) prometheus.Metric {
 	var ok bool
 	var metric prometheus.Metric
 	if metric, ok = c.metrics[fp]; !ok {
-		metric = c.factory(util.ModelLabelSetToMap(labels))
+		metric = c.factory(cleanLabels(labels))
 		c.metrics[fp] = metric
 	}
 	return metric
+}
+
+// cleanLabels removes labels whose label name is not a valid prometheus one, or has the reserved `__` prefix.
+func cleanLabels(set model.LabelSet) map[string]string {
+	out := make(map[string]string, len(set))
+	for k, v := range set {
+		// Performing the same label validity check the prometheus go client library does.
+		// https://github.com/prometheus/client_golang/blob/618194de6ad3db637313666104533639011b470d/prometheus/labels.go#L85
+		if !model.UTF8Validation.IsValidLabelName(string(k)) || strings.HasPrefix(string(k), "__") {
+			continue
+		}
+		out[string(k)] = string(v)
+	}
+	return out
 }
 
 func (c *metricVec) Delete(labels model.LabelSet) bool {
@@ -67,6 +80,12 @@ func (c *metricVec) Delete(labels model.LabelSet) bool {
 		delete(c.metrics, fp)
 	}
 	return ok
+}
+
+func (c *metricVec) DeleteAll() {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.metrics = map[model.Fingerprint]prometheus.Metric{}
 }
 
 // prune will remove all metrics which implement the Expirable interface and have expired

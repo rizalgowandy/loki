@@ -9,9 +9,9 @@ import (
 	json "github.com/json-iterator/go"
 	"github.com/stretchr/testify/require"
 
-	loghttp "github.com/grafana/loki/pkg/loghttp/legacy"
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logqlmodel"
+	loghttp "github.com/grafana/loki/v3/pkg/loghttp/legacy"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	logqlmodel "github.com/grafana/loki/v3/pkg/logql/model"
 )
 
 // covers responses from /api/prom/query
@@ -27,6 +27,14 @@ var queryTests = []struct {
 						Timestamp: mustParse(time.RFC3339Nano, "2019-09-13T18:32:22.380001319Z"),
 						Line:      "super line",
 					},
+					{
+						Timestamp: mustParse(time.RFC3339Nano, "2019-09-13T18:32:23.380001319Z"),
+						Line:      "super line with labels",
+						StructuredMetadata: []logproto.LabelAdapter{
+							{Name: "foo", Value: "a"},
+							{Name: "bar", Value: "b"},
+						},
+					},
 				},
 				Labels: `{test="test"}`,
 			},
@@ -39,23 +47,61 @@ var queryTests = []struct {
 						{
 							"ts": "2019-09-13T18:32:22.380001319Z",
 							"line": "super line"
+						},
+						{
+							"ts": "2019-09-13T18:32:23.380001319Z",
+							"line": "super line with labels"
 						}
 					]
 				}
 			],
 			"stats" : {
+				"index": {
+					"bloomFilterTime": 0,
+					"chunkRefsLookupTime": 0,
+					"postFilterChunks": 0,
+					"totalChunks": 0,
+					"totalStreams": 0,
+					"usedBloomFilters": false,
+					"shardsDuration": 0
+				},
 				"ingester" : {
 					"store": {
 						"chunksDownloadTime": 0,
+						"congestionControlLatency": 0,
 						"totalChunksRef": 0,
 						"totalChunksDownloaded": 0,
+						"chunkRefsFetchTime": 0,
+						"queryReferencedStructuredMetadata": false,
+				 		"pipelineWrapperFilteredLines": 0,
+						"chunkFetchFailures": 0,
 						"chunk" :{
 							"compressedBytes": 0,
 							"decompressedBytes": 0,
 							"decompressedLines": 0,
+							"decompressedStructuredMetadataBytes": 0,
 							"headChunkBytes": 0,
 							"headChunkLines": 0,
+							"headChunkStructuredMetadataBytes": 0,
+							"postFilterLines": 0,
 							"totalDuplicates": 0
+						},
+						"dataobj":{
+							"pageBatches": 0,
+							"pagesDownloaded": 0,
+							"pagesDownloadedBytes": 0,
+							"pagesScanned": 0,
+							"postFilterRows": 0,
+							"postPredicateRows": 0,
+							"postPredicateDecompressedBytes": 0,
+							"postPredicateStructuredMetadataBytes": 0,
+							"prePredicateDecompressedRows": 0,
+							"prePredicateDecompressedBytes": 0,
+							"prePredicateDecompressedStructuredMetadataBytes": 0,
+							"sectionsResolutionMaxTime": 0,
+							"totalPageDownloadTime": 0,
+							"totalRowsAvailable": 0,
+							"wireBytesTransferred": 0
 						}
 					},
 					"totalBatches": 0,
@@ -64,26 +110,143 @@ var queryTests = []struct {
 					"totalReached": 0
 				},
 				"querier": {
+					"querierExecTime": 0,
 					"store": {
 						"chunksDownloadTime": 0,
+						"congestionControlLatency": 0,
 						"totalChunksRef": 0,
 						"totalChunksDownloaded": 0,
+						"chunkRefsFetchTime": 0,
+						"queryReferencedStructuredMetadata": false,
+		                "pipelineWrapperFilteredLines": 0,
+						"chunkFetchFailures": 0,
 						"chunk" :{
 							"compressedBytes": 0,
 							"decompressedBytes": 0,
 							"decompressedLines": 0,
+							"decompressedStructuredMetadataBytes": 0,
 							"headChunkBytes": 0,
 							"headChunkLines": 0,
+							"headChunkStructuredMetadataBytes": 0,
+							"postFilterLines": 0,
 							"totalDuplicates": 0
+						},
+						"dataobj":{
+							"pageBatches": 0,
+							"pagesDownloaded": 0,
+							"pagesDownloadedBytes": 0,
+							"pagesScanned": 0,
+							"postFilterRows": 0,
+							"postPredicateRows": 0,
+							"postPredicateDecompressedBytes": 0,
+							"postPredicateStructuredMetadataBytes": 0,
+							"prePredicateDecompressedRows": 0,
+							"prePredicateDecompressedBytes": 0,
+							"prePredicateDecompressedStructuredMetadataBytes": 0,
+							"sectionsResolutionMaxTime": 0,
+							"totalPageDownloadTime": 0,
+							"totalRowsAvailable": 0,
+							"wireBytesTransferred": 0
 						}
+					}
+				},
+				"cache": {
+					"chunk": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"index": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"statsResult": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"seriesResult": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"labelResult": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"volumeResult": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"instantMetricResult": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
+					},
+					"result": {
+						"entriesFound": 0,
+						"entriesRequested": 0,
+						"entriesStored": 0,
+						"bytesReceived": 0,
+						"bytesSent": 0,
+						"requests": 0,
+						"downloadTime": 0,
+						"queryLengthServed": 0
 					}
 				},
 				"summary": {
 					"bytesProcessedPerSecond": 0,
 					"execTime": 0,
 					"linesProcessedPerSecond": 0,
-					"totalBytesProcessed":0,
-					"totalLinesProcessed":0
+					"queueTime": 0,
+                    "shards": 0,
+                    "splits": 0,
+					"streamFirstQueries": 0,
+					"subqueries": 0,
+					"timestampFirstQueries": 0,
+					"totalBytesProcessed": 0,
+                    "totalEntriesReturned": 0,
+					"totalLinesProcessed": 0,
+					"totalStructuredMetadataBytesProcessed": 0,
+                    "totalPostFilterLines": 0
 				}
 			}
 		}`,
@@ -121,6 +284,14 @@ var tailTests = []struct {
 							Timestamp: mustParse(time.RFC3339Nano, "2019-09-13T18:32:22.380001319Z"),
 							Line:      "super line",
 						},
+						{
+							Timestamp: mustParse(time.RFC3339Nano, "2019-09-13T18:32:23.380001319Z"),
+							Line:      "super line with labels",
+							StructuredMetadata: []logproto.LabelAdapter{
+								{Name: "foo", Value: "a"},
+								{Name: "bar", Value: "b"},
+							},
+						},
 					},
 					Labels: "{test=\"test\"}",
 				},
@@ -140,6 +311,10 @@ var tailTests = []struct {
 						{
 							"ts": "2019-09-13T18:32:22.380001319Z",
 							"line": "super line"
+						},
+						{
+							"ts": "2019-09-13T18:32:23.380001319Z",
+							"line": "super line with labels"
 						}
 					]
 				}
@@ -195,20 +370,6 @@ func Test_QueryResponseMarshalLoop(t *testing.T) {
 		require.NoError(t, err)
 
 		testJSONBytesEqual(t, []byte(queryTest.expected), jsonOut, "Query Marshal Loop %d failed", i)
-	}
-}
-
-func Test_LabelResponseMarshalLoop(t *testing.T) {
-	for i, labelTest := range labelTests {
-		var r loghttp.LabelResponse
-
-		err := json.Unmarshal([]byte(labelTest.expected), &r)
-		require.NoError(t, err)
-
-		jsonOut, err := json.Marshal(r)
-		require.NoError(t, err)
-
-		testJSONBytesEqual(t, []byte(labelTest.expected), jsonOut, "Label Marshal Loop %d failed", i)
 	}
 }
 

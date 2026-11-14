@@ -1,90 +1,108 @@
 package loki
 
 import (
-	"flag"
 	"testing"
 	"time"
 
-	"github.com/grafana/loki/pkg/ingester"
-	"github.com/grafana/loki/pkg/storage"
-	"github.com/grafana/loki/pkg/storage/chunk"
-
+	"github.com/grafana/dskit/flagext"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
+
+	"github.com/grafana/loki/v3/pkg/ingester"
+	"github.com/grafana/loki/v3/pkg/storage/config"
+	"github.com/grafana/loki/v3/pkg/storage/types"
 )
 
 func TestCrossComponentValidation(t *testing.T) {
 	for _, tc := range []struct {
-		desc string
-		base *Config
-		err  bool
+		desc  string
+		setup func(*Config)
+		err   string
 	}{
 		{
 			desc: "correct shards",
-			base: &Config{
-				Ingester: ingester.Config{
-					IndexShards: 32,
-				},
-				SchemaConfig: storage.SchemaConfig{
-					SchemaConfig: chunk.SchemaConfig{
-						Configs: []chunk.PeriodConfig{
-							{
-								// zero should not error
-								RowShards: 0,
-								Schema:    "v6",
-								From: chunk.DayTime{
-									Time: model.Now().Add(-48 * time.Hour),
-								},
-							},
-							{
-								RowShards: 16,
-								Schema:    "v11",
-								From: chunk.DayTime{
-									Time: model.Now(),
-								},
-							},
-						},
-					},
-				},
-			},
-			err: false,
 		},
 		{
-			desc: "correct shards",
-			base: &Config{
-				Ingester: ingester.Config{
-					IndexShards: 32,
-				},
-				SchemaConfig: storage.SchemaConfig{
-					SchemaConfig: chunk.SchemaConfig{
-						Configs: []chunk.PeriodConfig{
-							{
-								RowShards: 16,
-								Schema:    "v11",
-								From: chunk.DayTime{
-									Time: model.Now().Add(-48 * time.Hour),
-								},
-							},
-							{
-								RowShards: 17,
-								Schema:    "v11",
-								From: chunk.DayTime{
-									Time: model.Now(),
-								},
+			desc: "storage lag too short for the ToC resolver with data objects disabled",
+			setup: func(c *Config) {
+				c.DataObj.StorageLag = time.Minute
+			},
+		},
+		{
+			desc: "storage lag too short for the ToC resolver with data objects enabled",
+			setup: func(c *Config) {
+				c.DataObj.Enabled = true
+				c.DataObj.StorageLag = time.Minute
+			},
+			err: "CONFIG ERROR: invalid dataobj metastore config: twice the refresh interval of the ToC resolver (2m0s) must not exceed a tenth of the storage lag (1m0s)",
+		},
+		{
+			desc: "invalid uploader config with data objects enabled and Kafka ingestion disabled",
+			setup: func(c *Config) {
+				c.DataObj.Enabled = true
+				c.DataObj.Uploader.SHAPrefixSize = 0
+			},
+			err: "CONFIG ERROR: invalid dataobj config: SHAPrefixSize must be greater than 0",
+		},
+		{
+			desc: "data object builder without a topic with data objects enabled and Kafka ingestion disabled",
+			setup: func(c *Config) {
+				c.DataObj.Enabled = true
+			},
+		},
+		{
+			desc: "data object builder without a topic with data objects enabled and Kafka ingestion enabled",
+			setup: func(c *Config) {
+				c.Ingester.KafkaIngestion.Enabled = true
+				c.KafkaConfig.Topic = "ingest"
+				c.DataObj.Enabled = true
+			},
+			err: "CONFIG ERROR: invalid dataobj config: topic is required",
+		},
+	} {
+		cfg := &Config{
+			Ingester: ingester.Config{
+				IndexShards: 32,
+			},
+			SchemaConfig: config.SchemaConfig{
+				Configs: []config.PeriodConfig{
+					{
+						From: config.DayTime{
+							Time: model.Now(),
+						},
+						IndexType:  types.IndexTypeTSDB,
+						ObjectType: types.StorageTypeS3,
+						Schema:     "v11",
+						IndexTables: config.IndexPeriodicTableConfig{
+							PeriodicTableConfig: config.PeriodicTableConfig{
+								Period: 24 * time.Hour,
 							},
 						},
 					},
 				},
 			},
-			err: true,
-		},
-	} {
-		tc.base.RegisterFlags(flag.NewFlagSet(tc.desc, 0))
-		err := tc.base.Validate()
-		if tc.err {
-			require.NotNil(t, err)
+		}
+		flagext.DefaultValues(cfg)
+		// This test predates the newer schema required for structured metadata
+		cfg.LimitsConfig.AllowStructuredMetadata = false
+		// Several caches will error if not configured, disabled them for this test
+		cfg.QueryRange.CacheIndexStatsResults = false
+		cfg.QueryRange.CacheSeriesResults = false
+		cfg.QueryRange.CacheLabelResults = false
+		cfg.QueryRange.CacheVolumeResults = false
+		// Several other validations are required
+		cfg.CompactorConfig.WorkingDirectory = "tmp"
+		cfg.StorageConfig.TSDBShipperConfig.ActiveIndexDirectory = "tmp"
+		cfg.StorageConfig.TSDBShipperConfig.CacheLocation = "tmp"
+		if tc.setup != nil {
+			tc.setup(cfg)
+		}
+
+		err := cfg.Validate()
+		if tc.err != "" {
+			require.EqualError(t, err, tc.err, tc.desc)
 		} else {
-			require.Nil(t, err)
+			require.NoError(t, err, tc.desc)
 		}
 	}
 }

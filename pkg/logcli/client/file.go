@@ -5,22 +5,24 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 
-	"github.com/grafana/loki/pkg/iter"
-	"github.com/grafana/loki/pkg/loghttp"
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql"
-	logqllog "github.com/grafana/loki/pkg/logql/log"
-	"github.com/grafana/loki/pkg/util/marshal"
+	"github.com/grafana/loki/v3/pkg/iter"
+	"github.com/grafana/loki/v3/pkg/logcli/volume"
+	"github.com/grafana/loki/v3/pkg/loghttp"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql"
+	logqllog "github.com/grafana/loki/v3/pkg/logql/log"
+	"github.com/grafana/loki/v3/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/util/marshal"
+	"github.com/grafana/loki/v3/pkg/util/validation"
 
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/prometheus/model/labels"
-	"github.com/weaveworks/common/user"
 )
 
 const (
@@ -31,9 +33,7 @@ const (
 	defaultMaxFileSize       = 20 * (1 << 20) // 20MB
 )
 
-var (
-	ErrNotSupported = errors.New("not supported")
-)
+var ErrNotSupported = errors.New("not supported")
 
 // FileClient is a type of LogCLI client that do LogQL on log lines from
 // the given file directly, instead get log lines from Loki servers.
@@ -42,19 +42,16 @@ type FileClient struct {
 	labels      []string
 	labelValues []string
 	orgID       string
-	engine      *logql.Engine
+	engine      logql.Engine
 }
 
 // NewFileClient returns the new instance of FileClient for the given `io.ReadCloser`
 func NewFileClient(r io.ReadCloser) *FileClient {
-	lbs := []labels.Label{
-		{
-			Name:  defaultLabelKey,
-			Value: defaultLabelValue,
-		},
-	}
+	lbs := labels.New(
+		labels.Label{Name: defaultLabelKey, Value: defaultLabelValue},
+	)
 
-	eng := logql.NewEngine(logql.EngineOpts{}, &querier{r: r, labels: lbs}, &limiter{n: defaultMetricSeriesLimit})
+	eng := logql.NewEngine(logql.EngineOpts{}, &querier{r: r, labels: lbs}, &limiter{n: defaultMetricSeriesLimit}, log.Logger)
 	return &FileClient{
 		r:           r,
 		orgID:       defaultOrgID,
@@ -62,15 +59,14 @@ func NewFileClient(r io.ReadCloser) *FileClient {
 		labels:      []string{defaultLabelKey},
 		labelValues: []string{defaultLabelValue},
 	}
-
 }
 
-func (f *FileClient) Query(q string, limit int, t time.Time, direction logproto.Direction, quiet bool) (*loghttp.QueryResponse, error) {
+func (f *FileClient) Query(q string, limit int, t time.Time, direction logproto.Direction, _ bool) (*loghttp.QueryResponse, error) {
 	ctx := context.Background()
 
 	ctx = user.InjectOrgID(ctx, f.orgID)
 
-	params := logql.NewLiteralParams(
+	params, err := logql.NewLiteralParams(
 		q,
 		t, t,
 		0,
@@ -78,7 +74,11 @@ func (f *FileClient) Query(q string, limit int, t time.Time, direction logproto.
 		direction,
 		uint32(limit),
 		nil,
+		nil,
 	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse query: %w", err)
+	}
 
 	query := f.engine.Query(params)
 
@@ -102,12 +102,12 @@ func (f *FileClient) Query(q string, limit int, t time.Time, direction logproto.
 	}, nil
 }
 
-func (f *FileClient) QueryRange(queryStr string, limit int, start, end time.Time, direction logproto.Direction, step, interval time.Duration, quiet bool) (*loghttp.QueryResponse, error) {
+func (f *FileClient) QueryRange(queryStr string, limit int, start, end time.Time, direction logproto.Direction, step, interval time.Duration, _ bool) (*loghttp.QueryResponse, error) {
 	ctx := context.Background()
 
 	ctx = user.InjectOrgID(ctx, f.orgID)
 
-	params := logql.NewLiteralParams(
+	params, err := logql.NewLiteralParams(
 		queryStr,
 		start,
 		end,
@@ -116,7 +116,11 @@ func (f *FileClient) QueryRange(queryStr string, limit int, start, end time.Time
 		direction,
 		uint32(limit),
 		nil,
+		nil,
 	)
+	if err != nil {
+		return nil, err
+	}
 
 	query := f.engine.Query(params)
 
@@ -140,16 +144,21 @@ func (f *FileClient) QueryRange(queryStr string, limit int, start, end time.Time
 	}, nil
 }
 
-func (f *FileClient) ListLabelNames(quiet bool, start, end time.Time) (*loghttp.LabelResponse, error) {
+func (f *FileClient) ListLabelNames(_ bool, _, _ time.Time) (*loghttp.LabelResponse, error) {
 	return &loghttp.LabelResponse{
 		Status: loghttp.QueryStatusSuccess,
 		Data:   f.labels,
 	}, nil
 }
 
-func (f *FileClient) ListLabelValues(name string, quiet bool, start, end time.Time) (*loghttp.LabelResponse, error) {
+func (f *FileClient) ListLabelValues(name string, _ bool, _, _ time.Time) (*loghttp.LabelResponse, error) {
+	// f.labels is sorted, so a binary search returns the index at which name
+	// would be inserted. The label only exists when that index is in range and
+	// the element there is an exact match; sort.SearchStrings never returns a
+	// negative value, so the previous i < 0 check could never detect a missing
+	// label and would return a wrong value or panic with an out-of-range index.
 	i := sort.SearchStrings(f.labels, name)
-	if i < 0 {
+	if i >= len(f.labels) || f.labels[i] != name {
 		return &loghttp.LabelResponse{}, nil
 	}
 
@@ -159,7 +168,7 @@ func (f *FileClient) ListLabelValues(name string, quiet bool, start, end time.Ti
 	}, nil
 }
 
-func (f *FileClient) Series(matchers []string, start, end time.Time, quiet bool) (*loghttp.SeriesResponse, error) {
+func (f *FileClient) Series(_ []string, _, _ time.Time, _ bool) (*loghttp.SeriesResponse, error) {
 	m := len(f.labels)
 	if m > len(f.labelValues) {
 		m = len(f.labelValues)
@@ -176,7 +185,7 @@ func (f *FileClient) Series(matchers []string, start, end time.Time, quiet bool)
 	}, nil
 }
 
-func (f *FileClient) LiveTailQueryConn(queryStr string, delayFor time.Duration, limit int, start time.Time, quiet bool) (*websocket.Conn, error) {
+func (f *FileClient) LiveTailQueryConn(_ string, _ time.Duration, _ int, _ time.Time, _ bool) (*websocket.Conn, error) {
 	return nil, fmt.Errorf("LiveTailQuery: %w", ErrNotSupported)
 }
 
@@ -184,12 +193,70 @@ func (f *FileClient) GetOrgID() string {
 	return f.orgID
 }
 
+func (f *FileClient) GetStats(_ string, _, _ time.Time, _ bool) (*logproto.IndexStatsResponse, error) {
+	// TODO(twhitney): could we teach logcli to read from an actual index file?
+	return nil, ErrNotSupported
+}
+
+func (f *FileClient) GetVolume(_ *volume.Query) (*loghttp.QueryResponse, error) {
+	// TODO(twhitney): could we teach logcli to read from an actual index file?
+	return nil, ErrNotSupported
+}
+
+func (f *FileClient) GetVolumeRange(_ *volume.Query) (*loghttp.QueryResponse, error) {
+	// TODO(twhitney): could we teach logcli to read from an actual index file?
+	return nil, ErrNotSupported
+}
+
+func (f *FileClient) GetDetectedFields(
+	_, _ string,
+	_, _ int,
+	_, _ time.Time,
+	_ time.Duration,
+	_ bool,
+) (*loghttp.DetectedFieldsResponse, error) {
+	// TODO(twhitney): could we teach logcli to do this?
+	return nil, ErrNotSupported
+}
+
+func (f *FileClient) CreateDeleteRequest(_ DeleteRequestParams, _ bool) error {
+	return ErrNotSupported
+}
+
+func (f *FileClient) ListDeleteRequests(_ bool) ([]DeleteRequest, error) {
+	return nil, ErrNotSupported
+}
+
+func (f *FileClient) CancelDeleteRequest(_ string, _ bool, _ bool) error {
+	return ErrNotSupported
+}
+
 type limiter struct {
 	n int
 }
 
-func (l *limiter) MaxQuerySeries(userID string) int {
+func (l *limiter) MaxQuerySeries(_ string) int {
 	return l.n
+}
+
+func (l *limiter) MaxQueryRange(_ context.Context, _ string) time.Duration {
+	return 0 * time.Second
+}
+
+func (l *limiter) QueryTimeout(_ context.Context, _ string) time.Duration {
+	return time.Minute * 5
+}
+
+func (l *limiter) BlockedQueries(_ context.Context, _ string) []*validation.BlockedQuery {
+	return []*validation.BlockedQuery{}
+}
+
+func (l *limiter) RequiredLabels(_ context.Context, _ string) []string {
+	return nil
+}
+
+func (l *limiter) StreamFirstExecutionEnabled(_ string) bool {
+	return false
 }
 
 type querier struct {
@@ -197,7 +264,7 @@ type querier struct {
 	labels labels.Labels
 }
 
-func (q *querier) SelectLogs(ctx context.Context, params logql.SelectLogParams) (iter.EntryIterator, error) {
+func (q *querier) SelectLogs(_ context.Context, params logql.SelectLogParams) (iter.EntryIterator, error) {
 	expr, err := params.LogSelector()
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract selector for logs: %w", err)
@@ -206,22 +273,21 @@ func (q *querier) SelectLogs(ctx context.Context, params logql.SelectLogParams) 
 	if err != nil {
 		return nil, fmt.Errorf("failed to extract pipeline for logs: %w", err)
 	}
-	return newFileIterator(ctx, q.r, params, pipeline.ForStream(q.labels))
+	return newFileIterator(q.r, params, pipeline.ForStream(q.labels))
 }
 
-func (q *querier) SelectSamples(ctx context.Context, params logql.SelectSampleParams) (iter.SampleIterator, error) {
-	return nil, fmt.Errorf("Metrics Query: %w", ErrNotSupported)
+func (q *querier) SelectSamples(_ context.Context, _ logql.SelectSampleParams) (iter.SampleIterator, error) {
+	return nil, fmt.Errorf("metrics Query: %w", ErrNotSupported)
 }
 
 func newFileIterator(
-	ctx context.Context,
 	r io.Reader,
 	params logql.SelectLogParams,
 	pipeline logqllog.StreamPipeline,
 ) (iter.EntryIterator, error) {
 
 	lr := io.LimitReader(r, defaultMaxFileSize)
-	b, err := ioutil.ReadAll(lr)
+	b, err := io.ReadAll(lr)
 	if err != nil {
 		return nil, err
 	}
@@ -230,19 +296,21 @@ func newFileIterator(
 	})
 
 	if len(lines) == 0 {
-		return iter.NoopIterator, nil
+		return iter.NoopEntryIterator, nil
 	}
 
 	streams := map[uint64]*logproto.Stream{}
 
 	processLine := func(line string) {
-		parsedLine, parsedLabels, ok := pipeline.ProcessString(line)
-		if !ok {
+		ts := time.Now()
+		parsedLine, parsedLabels, matches := pipeline.ProcessString(ts.UnixNano(), line, labels.EmptyLabels())
+		if !matches {
 			return
 		}
 
 		var stream *logproto.Stream
 		lhash := parsedLabels.Hash()
+		var ok bool
 		if stream, ok = streams[lhash]; !ok {
 			stream = &logproto.Stream{
 				Labels: parsedLabels.String(),
@@ -251,7 +319,7 @@ func newFileIterator(
 		}
 
 		stream.Entries = append(stream.Entries, logproto.Entry{
-			Timestamp: time.Now(),
+			Timestamp: ts,
 			Line:      parsedLine,
 		})
 	}
@@ -267,7 +335,7 @@ func newFileIterator(
 	}
 
 	if len(streams) == 0 {
-		return iter.NoopIterator, nil
+		return iter.NoopEntryIterator, nil
 	}
 
 	streamResult := make([]logproto.Stream, 0, len(streams))
@@ -277,7 +345,6 @@ func newFileIterator(
 	}
 
 	return iter.NewStreamsIterator(
-		ctx,
 		streamResult,
 		params.Direction,
 	), nil

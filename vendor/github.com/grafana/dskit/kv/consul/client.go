@@ -14,10 +14,12 @@ import (
 	consul "github.com/hashicorp/consul/api"
 	"github.com/hashicorp/go-cleanhttp"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/weaveworks/common/instrument"
 	"golang.org/x/time/rate"
 
+	"github.com/grafana/dskit/instrument"
+
 	"github.com/grafana/dskit/backoff"
+	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/kv/codec"
 )
 
@@ -29,7 +31,7 @@ var (
 	writeOptions = &consul.WriteOptions{}
 
 	// ErrNotFound is returned by ConsulClient.Get.
-	ErrNotFound = fmt.Errorf("Not found")
+	ErrNotFound = fmt.Errorf("not found")
 
 	backoffConfig = backoff.Config{
 		MinBackoff: 1 * time.Second,
@@ -39,16 +41,16 @@ var (
 
 // Config to create a ConsulClient
 type Config struct {
-	Host              string        `yaml:"host"`
-	ACLToken          string        `yaml:"acl_token"`
-	HTTPClientTimeout time.Duration `yaml:"http_client_timeout"`
-	ConsistentReads   bool          `yaml:"consistent_reads"`
-	WatchKeyRateLimit float64       `yaml:"watch_rate_limit"` // Zero disables rate limit
-	WatchKeyBurstSize int           `yaml:"watch_burst_size"` // Burst when doing rate-limit, defaults to 1
+	Host              string         `yaml:"host"`
+	ACLToken          flagext.Secret `yaml:"acl_token" category:"advanced"`
+	HTTPClientTimeout time.Duration  `yaml:"http_client_timeout" category:"advanced"`
+	ConsistentReads   bool           `yaml:"consistent_reads" category:"advanced"`
+	WatchKeyRateLimit float64        `yaml:"watch_rate_limit" category:"advanced"` // Zero disables rate limit
+	WatchKeyBurstSize int            `yaml:"watch_burst_size" category:"advanced"` // Burst when doing rate-limit, defaults to 1
+	CasRetryDelay     time.Duration  `yaml:"cas_retry_delay" category:"advanced"`
 
 	// Used in tests only.
-	MaxCasRetries int           `yaml:"-"`
-	CasRetryDelay time.Duration `yaml:"-"`
+	MaxCasRetries int `yaml:"-"`
 }
 
 type kv interface {
@@ -59,7 +61,7 @@ type kv interface {
 	Put(p *consul.KVPair, q *consul.WriteOptions) (*consul.WriteMeta, error)
 }
 
-// Client is a KV.Client for Consul.
+// Client is a kv.Client for Consul.
 type Client struct {
 	kv
 	codec         codec.Codec
@@ -72,18 +74,19 @@ type Client struct {
 // If prefix is not an empty string it should end with a period.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet, prefix string) {
 	f.StringVar(&cfg.Host, prefix+"consul.hostname", "localhost:8500", "Hostname and port of Consul.")
-	f.StringVar(&cfg.ACLToken, prefix+"consul.acl-token", "", "ACL Token used to interact with Consul.")
+	f.Var(&cfg.ACLToken, prefix+"consul.acl-token", "ACL Token used to interact with Consul.")
 	f.DurationVar(&cfg.HTTPClientTimeout, prefix+"consul.client-timeout", 2*longPollDuration, "HTTP timeout when talking to Consul")
 	f.BoolVar(&cfg.ConsistentReads, prefix+"consul.consistent-reads", false, "Enable consistent reads to Consul.")
 	f.Float64Var(&cfg.WatchKeyRateLimit, prefix+"consul.watch-rate-limit", 1, "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit.")
 	f.IntVar(&cfg.WatchKeyBurstSize, prefix+"consul.watch-burst-size", 1, "Burst size used in rate limit. Values less than 1 are treated as 1.")
+	f.DurationVar(&cfg.CasRetryDelay, prefix+"consul.cas-retry-delay", 1*time.Second, "Maximum duration to wait before retrying a Compare And Swap (CAS) operation.")
 }
 
 // NewClient returns a new Client.
 func NewClient(cfg Config, codec codec.Codec, logger log.Logger, registerer prometheus.Registerer) (*Client, error) {
 	client, err := consul.NewClient(&consul.Config{
 		Address: cfg.Host,
-		Token:   cfg.ACLToken,
+		Token:   cfg.ACLToken.String(),
 		Scheme:  "http",
 		HttpClient: &http.Client{
 			Transport: cleanhttp.DefaultPooledTransport(),
@@ -113,7 +116,7 @@ func (c *Client) Put(ctx context.Context, key string, value interface{}) error {
 		return err
 	}
 
-	return instrument.CollectedRequest(ctx, "Put", c.consulMetrics.consulRequestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+	return instrument.CollectedRequest(ctx, "Put", c.consulMetrics.consulRequestDuration, instrument.ErrorCode, func(context.Context) error {
 		_, err := c.kv.Put(&consul.KVPair{
 			Key:   key,
 			Value: bytes,
@@ -234,7 +237,6 @@ func (c *Client) WatchKey(ctx context.Context, key string, f func(interface{}) b
 		}
 
 		kvp, meta, err := c.kv.Get(key, queryOptions.WithContext(ctx))
-
 		// Don't backoff if value is not found (kvp == nil). In that case, Consul still returns index value,
 		// and next call to Get will block as expected. We handle missing value below.
 		if err != nil {
@@ -251,7 +253,7 @@ func (c *Client) WatchKey(ctx context.Context, key string, f func(interface{}) b
 		}
 
 		if kvp == nil {
-			level.Info(c.logger).Log("msg", "value is nil", "key", key, "index", index)
+			level.Debug(c.logger).Log("msg", "value is nil", "key", key, "index", index)
 			continue
 		}
 
@@ -374,16 +376,18 @@ func checkLastIndex(index, metaLastIndex uint64) (newIndex uint64, skip bool) {
 		// Don't just keep using index=0.
 		// After blocking request, returned index must be at least 1.
 		return 1, false
-	} else if metaLastIndex < index {
+	}
+	if metaLastIndex < index {
 		// Index reset.
 		return 0, false
-	} else if index == metaLastIndex {
+	}
+	if index == metaLastIndex {
 		// Skip if the index is the same as last time, because the key value is
 		// guaranteed to be the same as last time
 		return metaLastIndex, true
-	} else {
-		return metaLastIndex, false
 	}
+
+	return metaLastIndex, false
 }
 
 func (c *Client) createRateLimiter() *rate.Limiter {
@@ -396,4 +400,11 @@ func (c *Client) createRateLimiter() *rate.Limiter {
 		burst = 1
 	}
 	return rate.NewLimiter(rate.Limit(c.cfg.WatchKeyRateLimit), burst)
+}
+
+// WithCodec Clones and changes the codec of the consul client.
+func (c *Client) WithCodec(codec codec.Codec) *Client {
+	n := *c
+	n.codec = codec
+	return &n
 }

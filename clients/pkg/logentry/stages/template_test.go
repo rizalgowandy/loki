@@ -1,17 +1,15 @@
 package stages
 
 import (
-	"bytes"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
+
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var testTemplateYaml = `
@@ -46,16 +44,6 @@ var testTemplateLogLine = `
 }
 `
 
-var testTemplateLogLineWithMissingKey = `
-{
-	"time":"2012-11-01T22:08:41+00:00",
-	"component": ["parser","type"],
-	"level" : "WARN",
-	"nested" : {"child":"value"},
-	"message" : "this is a log line"
-}
-`
-
 func TestPipeline_Template(t *testing.T) {
 	pl, err := NewPipeline(util_log.Logger, loadConfig(testTemplateYaml), nil, prometheus.DefaultRegisterer)
 	if err != nil {
@@ -68,23 +56,6 @@ func TestPipeline_Template(t *testing.T) {
 	}
 	out := processEntries(pl, newEntry(nil, nil, testTemplateLogLine, time.Now()))[0]
 	assert.Equal(t, expectedLbls, out.Labels)
-}
-
-func TestPipelineWithMissingKey_Template(t *testing.T) {
-	var buf bytes.Buffer
-	w := log.NewSyncWriter(&buf)
-	logger := log.NewLogfmtLogger(w)
-	pl, err := NewPipeline(logger, loadConfig(testTemplateYaml), nil, prometheus.DefaultRegisterer)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_ = processEntries(pl, newEntry(nil, nil, testTemplateLogLineWithMissingKey, time.Now()))
-
-	expectedLog := "level=debug msg=\"extracted template could not be converted to a string\" err=\"Can't convert <nil> to string\" type=null"
-	if !(strings.Contains(buf.String(), expectedLog)) {
-		t.Errorf("\nexpected: %s\n+actual: %s", expectedLog, buf.String())
-	}
 }
 
 func TestTemplateValidation(t *testing.T) {
@@ -104,7 +75,6 @@ func TestTemplateValidation(t *testing.T) {
 		},
 	}
 	for name, test := range tests {
-		test := test
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			_, err := validateTemplateConfig(test.config)
@@ -374,10 +344,9 @@ func TestTemplateStage_Process(t *testing.T) {
 		},
 	}
 	for name, test := range tests {
-		test := test
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			st, err := newTemplateStage(util_log.Logger, test.config)
+			st, err := newTemplateStage(test.config)
 			if err != nil {
 				t.Fatal(err)
 			}

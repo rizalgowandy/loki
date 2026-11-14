@@ -1,21 +1,19 @@
 package stages
 
 import (
-	"bytes"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
-	"github.com/go-kit/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	lokiutil "github.com/grafana/loki/pkg/util"
+	lokiutil "github.com/grafana/loki/v3/pkg/util"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var testTimestampYaml = `
@@ -37,14 +35,6 @@ var testTimestampLogLine = `
 }
 `
 
-var testTimestampLogLineWithMissingKey = `
-{
-	"app":"loki",
-	"component": ["parser","type"],
-	"level" : "WARN"
-}
-`
-
 func TestTimestampPipeline(t *testing.T) {
 	pl, err := NewPipeline(util_log.Logger, loadConfig(testTimestampYaml), nil, prometheus.DefaultRegisterer)
 	if err != nil {
@@ -59,23 +49,6 @@ var (
 	validLocationString   = "America/New_York"
 	validLocation, _      = time.LoadLocation(validLocationString)
 )
-
-func TestPipelineWithMissingKey_Timestamp(t *testing.T) {
-	var buf bytes.Buffer
-	w := log.NewSyncWriter(&buf)
-	logger := log.NewLogfmtLogger(w)
-	pl, err := NewPipeline(logger, loadConfig(testTimestampYaml), nil, prometheus.DefaultRegisterer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	Debug = true
-	_ = processEntries(pl, newEntry(nil, nil, testTimestampLogLineWithMissingKey, time.Now()))
-
-	expectedLog := fmt.Sprintf("level=debug msg=\"%s\" err=\"Can't convert <nil> to string\" type=null", ErrTimestampConversionFailed)
-	if !(strings.Contains(buf.String(), expectedLog)) {
-		t.Errorf("\nexpected: %s\n+actual: %s", expectedLog, buf.String())
-	}
-}
 
 func TestTimestampValidation(t *testing.T) {
 	tests := map[string]struct {
@@ -174,7 +147,6 @@ func TestTimestampValidation(t *testing.T) {
 		},
 	}
 	for name, test := range tests {
-		test := test
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			parser, err := validateTimestampConfig(test.config)
@@ -295,10 +267,9 @@ func TestTimestampStage_Process(t *testing.T) {
 		},
 	}
 	for name, test := range tests {
-		test := test
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			st, err := newTimestampStage(util_log.Logger, test.config)
+			st, err := newTimestampStage(test.config)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -431,15 +402,13 @@ func TestTimestampStage_ProcessActionOnFailure(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
 
 			// Ensure the test has been correctly set
 			require.Equal(t, len(testData.inputEntries), len(testData.expectedTimestamps))
 
-			s, err := newTimestampStage(util_log.Logger, testData.config)
+			s, err := newTimestampStage(testData.config)
 			require.NoError(t, err)
 
 			for i, inputEntry := range testData.inputEntries {

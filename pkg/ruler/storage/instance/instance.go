@@ -24,11 +24,13 @@ import (
 	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/storage/remote"
-	"gopkg.in/yaml.v2"
+	"github.com/prometheus/prometheus/tsdb/wlog"
+	yaml "go.yaml.in/yaml/v4"
 
-	"github.com/grafana/loki/pkg/ruler/storage/util"
-	"github.com/grafana/loki/pkg/ruler/storage/wal"
-	"github.com/grafana/loki/pkg/util/build"
+	"github.com/grafana/loki/v3/pkg/ruler/storage/util"
+	"github.com/grafana/loki/v3/pkg/ruler/storage/wal"
+	"github.com/grafana/loki/v3/pkg/util/build"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 func init() {
@@ -53,9 +55,9 @@ var (
 // Config is a specific agent that runs within the overall Prometheus
 // agent. It has its own set of scrape_configs and remote_write rules.
 type Config struct {
-	Tenant      string
-	Name        string
-	RemoteWrite []*config.RemoteWriteConfig
+	Tenant      string                      `doc:"hidden"`
+	Name        string                      `doc:"hidden"`
+	RemoteWrite []*config.RemoteWriteConfig `doc:"hidden"`
 
 	Dir string `yaml:"dir"`
 
@@ -66,15 +68,17 @@ type Config struct {
 	MinAge time.Duration `yaml:"min_age,omitempty"`
 	MaxAge time.Duration `yaml:"max_age,omitempty"`
 
-	RemoteFlushDeadline time.Duration `yaml:"remote_flush_deadline,omitempty"`
+	RemoteFlushDeadline time.Duration `yaml:"remote_flush_deadline,omitempty" doc:"hidden"`
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler.
-func (c *Config) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (c *Config) UnmarshalYAML(value *yaml.Node) error {
 	*c = DefaultConfig
 
-	type plain Config
-	return unmarshal((*plain)(c))
+	type raw Config
+	// We always want strict config parsing
+	// See https://github.com/yaml/go-yaml/issues/321 and https://github.com/yaml/go-yaml/pull/332
+	return value.Load((*raw)(c), yaml.WithKnownFields(true))
 }
 
 // MarshalYAML implements yaml.Marshaler.
@@ -87,13 +91,18 @@ func (c Config) MarshalYAML() (interface{}, error) {
 		return nil, err
 	}
 
-	// Use a yaml.MapSlice rather than a map[string]interface{} so
-	// order of keys is retained compared to just calling MarshalConfig.
-	var m yaml.MapSlice
-	if err := yaml.Unmarshal(bb, &m); err != nil {
+	// Use a yaml.Node to preserve key order compared to map[string]interface{}.
+	// yaml.Unmarshal into a Node produces a DocumentNode wrapper; unwrap it
+	// to return the actual mapping node so the caller's marshaler doesn't
+	// encounter a nested document-start marker.
+	var doc yaml.Node
+	if err := yaml.Unmarshal(bb, &doc); err != nil {
 		return nil, err
 	}
-	return m, nil
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		return doc.Content[0], nil
+	}
+	return &doc, nil
 }
 
 // ApplyDefaults applies default configurations to the configuration to all
@@ -143,8 +152,8 @@ func (c *Config) Clone() (Config, error) {
 }
 
 func (c *Config) RegisterFlags(f *flag.FlagSet) {
-	f.StringVar(&c.Dir, "ruler.wal.dir", DefaultConfig.Dir, "Directory to store the WAL and/or recover from WAL.")
-	f.DurationVar(&c.TruncateFrequency, "ruler.wal.truncate-frequency", DefaultConfig.TruncateFrequency, "How often to run the WAL truncation.")
+	f.StringVar(&c.Dir, "ruler.wal.dir", DefaultConfig.Dir, "The directory in which to write tenant WAL files. Each tenant will have its own directory one level below this directory.")
+	f.DurationVar(&c.TruncateFrequency, "ruler.wal.truncate-frequency", DefaultConfig.TruncateFrequency, "Frequency with which to run the WAL truncation process.")
 	f.DurationVar(&c.MinAge, "ruler.wal.min-age", DefaultConfig.MinAge, "Minimum age that samples must exist in the WAL before being truncated.")
 	f.DurationVar(&c.MaxAge, "ruler.wal.max-age", DefaultConfig.MaxAge, "Maximum age that samples must exist in the WAL before being truncated.")
 }
@@ -207,6 +216,9 @@ func newInstance(cfg Config, reg prometheus.Registerer, logger log.Logger, newWa
 }
 
 func (i *Instance) Storage() storage.Storage {
+	i.mut.Lock()
+	defer i.mut.Unlock()
+
 	return i.storage
 }
 
@@ -258,7 +270,7 @@ func (i *Instance) Run(ctx context.Context) error {
 				level.Info(i.logger).Log("msg", "truncation loop stopped")
 				return nil
 			},
-			func(err error) {
+			func(_ error) {
 				level.Info(i.logger).Log("msg", "stopping truncation loop...")
 				contextCancel()
 			},
@@ -276,7 +288,11 @@ func (i *Instance) Run(ctx context.Context) error {
 type noopScrapeManager struct{}
 
 func (n noopScrapeManager) Get() (*scrape.Manager, error) {
-	return nil, nil
+	return nil, errors.New("no-op Scrape manager not ready")
+}
+
+func (n noopScrapeManager) Ready() bool {
+	return false
 }
 
 // initialize sets up the various Prometheus components with their initial
@@ -284,11 +300,11 @@ func (n noopScrapeManager) Get() (*scrape.Manager, error) {
 // components cannot be reused after they are stopped so we need to recreate them
 // each run.
 func (i *Instance) initialize(_ context.Context, reg prometheus.Registerer, cfg *Config) error {
-	// explicitly set this in case this function is called multiple times
-	i.initialized = false
-
 	i.mut.Lock()
 	defer i.mut.Unlock()
+
+	// explicitly set this in case this function is called multiple times
+	i.initialized = false
 
 	var err error
 
@@ -299,7 +315,7 @@ func (i *Instance) initialize(_ context.Context, reg prometheus.Registerer, cfg 
 
 	// Setup the remote storage
 	remoteLogger := log.With(i.logger, "component", "remote")
-	i.remoteStore = remote.NewStorage(remoteLogger, reg, i.wal.StartTime, i.wal.Directory(), cfg.RemoteFlushDeadline, noopScrapeManager{})
+	i.remoteStore = remote.NewStorage(util_log.SlogFromGoKit(remoteLogger), reg, i.wal.StartTime, i.wal.Directory(), cfg.RemoteFlushDeadline, noopScrapeManager{}, false)
 	err = i.remoteStore.ApplyConfig(&config.Config{
 		RemoteWriteConfigs: cfg.RemoteWrite,
 	})
@@ -307,7 +323,8 @@ func (i *Instance) initialize(_ context.Context, reg prometheus.Registerer, cfg 
 		return fmt.Errorf("failed applying config to remote storage: %w", err)
 	}
 
-	i.storage = storage.NewFanout(i.logger, i.wal, i.remoteStore)
+	i.storage = storage.NewFanout(util_log.SlogFromGoKit(i.logger), i.wal, i.remoteStore)
+	i.wal.SetWriteNotified(i.remoteStore)
 	i.initialized = true
 
 	return nil
@@ -373,6 +390,9 @@ func (i *Instance) Update(c Config) (err error) {
 
 // Ready indicates if the instance is ready for processing.
 func (i *Instance) Ready() bool {
+	i.mut.Lock()
+	defer i.mut.Unlock()
+
 	return i.initialized
 }
 
@@ -507,7 +527,9 @@ type walStorage interface {
 
 	StartTime() (int64, error)
 	WriteStalenessMarkers(remoteTsFunc func() int64) error
+	SetWriteNotified(wlog.WriteNotified)
 	Appender(context.Context) storage.Appender
+	AppenderV2(context.Context) storage.AppenderV2
 	Truncate(mint int64) error
 
 	Close() error

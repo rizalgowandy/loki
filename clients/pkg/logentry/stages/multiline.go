@@ -2,20 +2,17 @@ package stages
 
 import (
 	"bytes"
-	"fmt"
 	"regexp"
 	"sync"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/util"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 const (
@@ -69,8 +66,7 @@ func validateMultilineConfig(cfg *MultilineConfig) error {
 
 // multilineStage matches lines to determine whether the following lines belong to a block and should be collapsed
 type multilineStage struct {
-	logger log.Logger
-	cfg    *MultilineConfig
+	cfg *MultilineConfig
 }
 
 // multilineState captures the internal state of a running multiline stage.
@@ -80,8 +76,8 @@ type multilineState struct {
 	currentLines   uint64        // The number of lines of the current multiline block.
 }
 
-// newMulitlineStage creates a MulitlineStage from config
-func newMultilineStage(logger log.Logger, config interface{}) (Stage, error) {
+// newMultilineStage creates a MulitlineStage from config
+func newMultilineStage(config interface{}) (Stage, error) {
 	cfg := &MultilineConfig{}
 	err := mapstructure.WeakDecode(config, cfg)
 	if err != nil {
@@ -93,8 +89,7 @@ func newMultilineStage(logger log.Logger, config interface{}) (Stage, error) {
 	}
 
 	return &multilineStage{
-		logger: log.With(logger, "component", "stage", "type", "multiline"),
-		cfg:    cfg,
+		cfg: cfg,
 	}, nil
 }
 
@@ -112,24 +107,15 @@ func (m *multilineStage) Run(in chan Entry) chan Entry {
 			if !ok {
 				// Pass through entries until we hit first start line.
 				if !m.cfg.regex.MatchString(e.Line) {
-					if Debug {
-						level.Debug(m.logger).Log("msg", "pass through entry", "stream", key)
-					}
 					out <- e
 					continue
 				}
 
-				if Debug {
-					level.Debug(m.logger).Log("msg", "creating new stream", "stream", key)
-				}
 				s = make(chan Entry)
 				streams[key] = s
 
 				wg.Add(1)
 				go m.runMultiline(s, out, wg)
-			}
-			if Debug {
-				level.Debug(m.logger).Log("msg", "pass entry", "stream", key, "line", e.Line)
 			}
 			s <- e
 		}
@@ -154,28 +140,16 @@ func (m *multilineStage) runMultiline(in chan Entry, out chan Entry, wg *sync.Wa
 	for {
 		select {
 		case <-time.After(m.cfg.maxWait):
-			if Debug {
-				level.Debug(m.logger).Log("msg", fmt.Sprintf("flush multiline block due to %v timeout", m.cfg.maxWait), "block", state.buffer.String())
-			}
 			m.flush(out, state)
 		case e, ok := <-in:
-			if Debug {
-				level.Debug(m.logger).Log("msg", "processing line", "line", e.Line, "stream", e.Labels.FastFingerprint())
-			}
 
 			if !ok {
-				if Debug {
-					level.Debug(m.logger).Log("msg", "flush multiline block because inbound closed", "block", state.buffer.String(), "stream", e.Labels.FastFingerprint())
-				}
 				m.flush(out, state)
 				return
 			}
 
 			isFirstLine := m.cfg.regex.MatchString(e.Line)
 			if isFirstLine {
-				if Debug {
-					level.Debug(m.logger).Log("msg", "flush multiline block because new start line", "block", state.buffer.String(), "stream", e.Labels.FastFingerprint())
-				}
 				m.flush(out, state)
 
 				// The start line entry is used to set timestamp and labels in the flush method.
@@ -199,9 +173,6 @@ func (m *multilineStage) runMultiline(in chan Entry, out chan Entry, wg *sync.Wa
 
 func (m *multilineStage) flush(out chan Entry, s *multilineState) {
 	if s.buffer.Len() == 0 {
-		if Debug {
-			level.Debug(m.logger).Log("msg", "nothing to flush", "buffer_len", s.buffer.Len())
-		}
 		return
 	}
 	// copy extracted data.
@@ -211,10 +182,10 @@ func (m *multilineStage) flush(out chan Entry, s *multilineState) {
 	}
 	collapsed := Entry{
 		Extracted: extracted,
-		Entry: api.Entry{
-			Labels: s.startLineEntry.Entry.Labels.Clone(),
+		Entry: util.Entry{
+			Labels: s.startLineEntry.Labels.Clone(),
 			Entry: logproto.Entry{
-				Timestamp: s.startLineEntry.Entry.Entry.Timestamp,
+				Timestamp: s.startLineEntry.Timestamp,
 				Line:      s.buffer.String(),
 			},
 		},
@@ -228,4 +199,9 @@ func (m *multilineStage) flush(out chan Entry, s *multilineState) {
 // Name implements Stage
 func (m *multilineStage) Name() string {
 	return StageTypeMultiline
+}
+
+// Cleanup implements Stage.
+func (*multilineStage) Cleanup() {
+	// no-op
 }

@@ -1,6 +1,8 @@
 package loghttp
 
 import (
+	"fmt"
+	"math"
 	"net/http/httptest"
 	"reflect"
 	"testing"
@@ -9,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 func TestHttp_defaultQueryRangeStep(t *testing.T) {
@@ -38,10 +40,168 @@ func TestHttp_defaultQueryRangeStep(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
 			assert.Equal(t, testData.expected, defaultQueryRangeStep(testData.start, testData.end))
+		})
+	}
+}
+
+func Test_uint32QueryParamBounds(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		reqPath string
+		parse   func(*testing.T, string) (uint32, error)
+		wantErr string
+	}{
+		{
+			name:    "limit rejects overflow",
+			reqPath: fmt.Sprintf("/loki/api/v1/query_range?limit=%d", uint64(math.MaxUint32)+1),
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return limit(req)
+			},
+			wantErr: "limit value",
+		},
+		{
+			name:    "limit rejects negative values",
+			reqPath: "/loki/api/v1/query_range?limit=-1",
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return limit(req)
+			},
+			wantErr: "limit must be a positive value",
+		},
+		{
+			name:    "line_limit rejects overflow",
+			reqPath: fmt.Sprintf("/loki/api/v1/query_range?line_limit=%d", uint64(math.MaxUint32)+1),
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return lineLimit(req)
+			},
+			wantErr: "line_limit value",
+		},
+		{
+			name:    "line_limit rejects negative values",
+			reqPath: "/loki/api/v1/query_range?line_limit=-1",
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return lineLimit(req)
+			},
+			wantErr: "limit must be a positive value",
+		},
+		{
+			name:    "detected fields limit rejects overflow",
+			reqPath: fmt.Sprintf("/loki/api/v1/detected_fields?limit=%d", uint64(math.MaxUint32)+1),
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return detectedFieldsLimit(req)
+			},
+			wantErr: "limit value",
+		},
+		{
+			name:    "detected fields limit rejects negative values",
+			reqPath: "/loki/api/v1/detected_fields?limit=-1",
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return detectedFieldsLimit(req)
+			},
+			wantErr: "limit must be a positive value",
+		},
+		{
+			name:    "tail delay rejects overflow",
+			reqPath: fmt.Sprintf("/loki/api/v1/tail?delay_for=%d", uint64(math.MaxUint32)+1),
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return tailDelay(req)
+			},
+			wantErr: "delay_for value",
+		},
+		{
+			name:    "tail delay rejects negative values",
+			reqPath: "/loki/api/v1/tail?delay_for=-1",
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return tailDelay(req)
+			},
+			wantErr: "delay_for value",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := tt.parse(t, tt.reqPath)
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+func Test_uint32QueryParamValidValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		reqPath string
+		parse   func(*testing.T, string) (uint32, error)
+		want    uint32
+	}{
+		{
+			name:    "limit accepts max uint32",
+			reqPath: fmt.Sprintf("/loki/api/v1/query_range?limit=%d", uint64(math.MaxUint32)),
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return limit(req)
+			},
+			want: math.MaxUint32,
+		},
+		{
+			name:    "line_limit accepts max uint32",
+			reqPath: fmt.Sprintf("/loki/api/v1/query_range?line_limit=%d", uint64(math.MaxUint32)),
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return lineLimit(req)
+			},
+			want: math.MaxUint32,
+		},
+		{
+			name:    "detected fields limit accepts max uint32",
+			reqPath: fmt.Sprintf("/loki/api/v1/detected_fields?limit=%d", uint64(math.MaxUint32)),
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return detectedFieldsLimit(req)
+			},
+			want: math.MaxUint32,
+		},
+		{
+			name:    "tail delay accepts max uint32",
+			reqPath: fmt.Sprintf("/loki/api/v1/tail?delay_for=%d", uint64(math.MaxUint32)),
+			parse: func(t *testing.T, reqPath string) (uint32, error) {
+				req := httptest.NewRequest("GET", reqPath, nil)
+				require.NoError(t, req.ParseForm())
+				return tailDelay(req)
+			},
+			want: math.MaxUint32,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := tt.parse(t, tt.reqPath)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -122,8 +282,6 @@ func TestHttp_ParseRangeQuery_Step(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
 			req := httptest.NewRequest("GET", testData.reqPath, nil)
 			err := req.ParseForm()
@@ -175,8 +333,6 @@ func Test_interval(t *testing.T) {
 		},
 	}
 	for _, testData := range tests {
-		testData := testData
-
 		t.Run(testData.name, func(t *testing.T) {
 			req := httptest.NewRequest("GET", testData.reqPath, nil)
 			err := req.ParseForm()
@@ -220,6 +376,147 @@ func Test_parseTimestamp(t *testing.T) {
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("parseTimestamp() = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func Test_determineBounds(t *testing.T) {
+	type args struct {
+		now         time.Time
+		startString string
+		endString   string
+		sinceString string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		start   time.Time
+		end     time.Time
+		wantErr assert.ErrorAssertionFunc
+	}{
+		{
+			name: "no start, end, since",
+			args: args{
+				now:         time.Unix(3600, 0),
+				startString: "",
+				endString:   "",
+				sinceString: "",
+			},
+			start:   time.Unix(0, 0),    // Default start is one hour before 'now' if nothing is provided
+			end:     time.Unix(3600, 0), // Default end is 'now' if nothing is provided
+			wantErr: assert.NoError,
+		},
+		{
+			name: "no since or no start with end in the future",
+			args: args{
+				now:         time.Unix(3600, 0),
+				startString: "",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "",
+			},
+			start:   time.Unix(0, 0), // Default should be one hour before now
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "no since, valid start and end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "2022-12-17T00:00:00Z",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "",
+			},
+			start:   time.Date(2022, 12, 17, 0, 0, 0, 0, time.UTC),
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "invalid end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "2022-12-17T00:00:00Z",
+				endString:   "WHAT TIME IS IT?",
+				sinceString: "",
+			},
+			start: time.Time{},
+			end:   time.Time{},
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				return assert.ErrorContains(t, err, "could not parse 'end' parameter:", i...)
+			},
+		},
+		{
+			name: "invalid start",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "LET'S GOOO",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "",
+			},
+			start: time.Time{},
+			end:   time.Time{},
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				return assert.ErrorContains(t, err, "could not parse 'start' parameter:", i...)
+			},
+		},
+		{
+			name: "invalid since",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "2022-12-17T00:00:00Z",
+				endString:   "2022-12-18T00:00:00Z",
+				sinceString: "HI!",
+			},
+			start: time.Time{},
+			end:   time.Time{},
+			wantErr: func(t assert.TestingT, err error, i ...interface{}) bool {
+				return assert.ErrorContains(t, err, "could not parse 'since' parameter:", i...)
+			},
+		},
+		{
+			name: "since 1h with no start or end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "",
+				endString:   "",
+				sinceString: "1h",
+			},
+			start:   time.Date(2022, 12, 17, 23, 0, 0, 0, time.UTC),
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "since 1d with no start or end",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "",
+				endString:   "",
+				sinceString: "1d",
+			},
+			start:   time.Date(2022, 12, 17, 0, 0, 0, 0, time.UTC),
+			end:     time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+		{
+			name: "since 1h with no start and end time in the past",
+			args: args{
+				now:         time.Date(2022, 12, 18, 0, 0, 0, 0, time.UTC),
+				startString: "",
+				endString:   "2022-12-17T00:00:00Z",
+				sinceString: "1h",
+			},
+			start:   time.Date(2022, 12, 16, 23, 0, 0, 0, time.UTC), // start should be calculated relative to end when end is specified
+			end:     time.Date(2022, 12, 17, 0, 0, 0, 0, time.UTC),
+			wantErr: assert.NoError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, got1, err := determineBounds(tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)
+			if !tt.wantErr(t, err, fmt.Sprintf("determineBounds(%v, %v, %v, %v)", tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)) {
+				return
+			}
+			assert.Equalf(t, tt.start, got, "determineBounds(%v, %v, %v, %v)", tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)
+			assert.Equalf(t, tt.end, got1, "determineBounds(%v, %v, %v, %v)", tt.args.now, tt.args.startString, tt.args.endString, tt.args.sinceString)
 		})
 	}
 }

@@ -10,10 +10,15 @@ import (
 	"github.com/fluent/fluent-bit-go/output"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	dslog "github.com/grafana/dskit/log"
 	"github.com/prometheus/common/version"
-	"github.com/weaveworks/common/logging"
 
-	_ "github.com/grafana/loki/pkg/util/build"
+	_ "github.com/grafana/loki/v3/pkg/util/build"
+)
+import (
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/grafana/loki/v3/clients/pkg/util"
 )
 
 var (
@@ -23,7 +28,7 @@ var (
 )
 
 func init() {
-	var logLevel logging.Level
+	var logLevel dslog.Level
 	_ = logLevel.Set("info")
 	logger = newLogger(logLevel)
 }
@@ -38,16 +43,20 @@ func (c *pluginConfig) Get(key string) string {
 
 //export FLBPluginRegister
 func FLBPluginRegister(ctx unsafe.Pointer) int {
-	return output.FLBPluginRegister(ctx, "grafana-loki", "Ship fluent-bit logs to Grafana Loki")
+	return output.FLBPluginRegisterWithOptions(ctx,
+		output.WithName("grafana-loki"),
+		output.WithDescription("Ship fluent-bit logs to Grafana Loki"),
+	)
 }
 
-//export FLBPluginInit
 // (fluentbit will call this)
 // ctx (context) pointer to fluentbit context (state/ c code)
+//
+//export FLBPluginInit
 func FLBPluginInit(ctx unsafe.Pointer) int {
 	conf, err := parseConfig(&pluginConfig{ctx: ctx})
 	if err != nil {
-		level.Error(logger).Log("[flb-go]", "failed to launch", "error", err)
+		level.Error(logger).Log("[flb-go]", "failed to parse plugin config for out-grafana-loki", "error", err)
 		return output.FLB_ERROR
 	}
 
@@ -57,7 +66,7 @@ func FLBPluginInit(ctx unsafe.Pointer) int {
 
 	level.Info(logger).Log("[flb-go]", "Starting fluent-bit-go-loki", "version", version.Info())
 	paramLogger := log.With(logger, "[flb-go]", "provided parameter")
-	level.Info(paramLogger).Log("URL", conf.clientConfig.URL)
+	level.Info(paramLogger).Log("URL", conf.clientConfig.URL.Redacted())
 	level.Info(paramLogger).Log("TenantID", conf.clientConfig.TenantID)
 	level.Info(paramLogger).Log("BatchWait", fmt.Sprintf("%.3fs", conf.clientConfig.BatchWait.Seconds()))
 	level.Info(paramLogger).Log("BatchSize", conf.clientConfig.BatchSize)
@@ -83,7 +92,8 @@ func FLBPluginInit(ctx unsafe.Pointer) int {
 	level.Info(paramLogger).Log("key_file", conf.clientConfig.Client.TLSConfig.KeyFile)
 	level.Info(paramLogger).Log("insecure_skip_verify", conf.clientConfig.Client.TLSConfig.InsecureSkipVerify)
 
-	plugin, err := newPlugin(conf, logger)
+	m := util.NewMetrics(prometheus.DefaultRegisterer)
+	plugin, err := newPlugin(conf, logger, m)
 	if err != nil {
 		level.Error(logger).Log("newPlugin", err)
 		return output.FLB_ERROR

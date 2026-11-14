@@ -16,20 +16,18 @@ package storage
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
-	"io/ioutil"
+	"log"
 	"net/http"
-	"net/url"
-	"reflect"
-	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"cloud.google.com/go/internal/trace"
-	"google.golang.org/api/googleapi"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 )
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
@@ -41,6 +39,7 @@ var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 // Each field is read-only.
 type ReaderObjectAttrs struct {
 	// Size is the length of the object's content.
+	// Size may be out of date for unfinalized objects.
 	Size int64
 
 	// StartOffset is the byte offset within the object
@@ -70,6 +69,19 @@ type ReaderObjectAttrs struct {
 	// meaningful in the context of a particular generation of a
 	// particular object.
 	Metageneration int64
+
+	// CRC32C is the CRC32 checksum of the entire object's content using the
+	// Castagnoli93 polynomial, if available.
+	CRC32C uint32
+
+	// Decompressed is true if the object is stored as a gzip file and was
+	// decompressed when read.
+	// Objects are automatically decompressed if the object's metadata property
+	// "Content-Encoding" is set to "gzip" or satisfies decompressive
+	// transcoding as per https://cloud.google.com/storage/docs/transcoding.
+	//
+	// To prevent decompression on reads, use [ObjectHandle.ReadCompressed].
+	Decompressed bool
 }
 
 // NewReader creates a new Reader to read the contents of the
@@ -77,8 +89,14 @@ type ReaderObjectAttrs struct {
 // ErrObjectNotExist will be returned if the object is not found.
 //
 // The caller must call Close on the returned Reader when done reading.
-func (o *ObjectHandle) NewReader(ctx context.Context) (*Reader, error) {
-	return o.NewRangeReader(ctx, 0, -1)
+//
+// By default, reads are made using the Cloud Storage XML API. We recommend
+// using the JSON API instead, which can be done by setting [WithJSONReads]
+// when calling [NewClient]. This ensures consistency with other client
+// operations, which all use JSON. JSON will become the default in a future
+// release.
+func (o *ObjectHandle) NewReader(ctx context.Context, opts ...ReaderOption) (*Reader, error) {
+	return o.NewRangeReader(ctx, 0, -1, opts...)
 }
 
 // NewRangeReader reads part of an object, reading at most length bytes
@@ -90,10 +108,19 @@ func (o *ObjectHandle) NewReader(ctx context.Context) (*Reader, error) {
 // If the object's metadata property "Content-Encoding" is set to "gzip" or satisfies
 // decompressive transcoding per https://cloud.google.com/storage/docs/transcoding
 // that file will be served back whole, regardless of the requested range as
-// Google Cloud Storage dictates.
-func (o *ObjectHandle) NewRangeReader(ctx context.Context, offset, length int64) (r *Reader, err error) {
-	ctx = trace.StartSpan(ctx, "cloud.google.com/go/storage.Object.NewRangeReader")
-	defer func() { trace.EndSpan(ctx, err) }()
+// Google Cloud Storage dictates. If decompressive transcoding occurs,
+// [Reader.Attrs.Decompressed] will be true.
+//
+// By default, reads are made using the Cloud Storage XML API. We recommend
+// using the JSON API instead, which can be done by setting [WithJSONReads]
+// when calling [NewClient]. This ensures consistency with other client
+// operations, which all use JSON. JSON will become the default in a future
+// release.
+func (o *ObjectHandle) NewRangeReader(ctx context.Context, offset, length int64, opts ...ReaderOption) (r *Reader, err error) {
+	// This span covers the life of the reader. It is closed via the context
+	// in Reader.Close.
+	ctx, _ = startSpanWithBucket(ctx, o.c, o.bucket, "Object.Reader")
+	defer func() { endSpan(ctx, err) }()
 
 	if err := o.validate(); err != nil {
 		return nil, err
@@ -106,194 +133,181 @@ func (o *ObjectHandle) NewRangeReader(ctx context.Context, offset, length int64)
 			return nil, err
 		}
 	}
-	u := &url.URL{
-		Scheme: o.c.scheme,
-		Host:   o.c.readHost,
-		Path:   fmt.Sprintf("/%s/%s", o.bucket, o.object),
+
+	storageOpts := makeStorageOpts(true, o.retry, o.userProject)
+
+	params := &newRangeReaderParams{
+		bucket:         o.bucket,
+		object:         o.object,
+		gen:            o.gen,
+		offset:         offset,
+		length:         length,
+		encryptionKey:  o.encryptionKey,
+		conds:          o.conds,
+		readCompressed: o.readCompressed,
+		handle:         &o.readHandle,
 	}
-	verb := "GET"
-	if length == 0 {
-		verb = "HEAD"
+	for _, opt := range opts {
+		opt.apply(params)
 	}
-	req, err := http.NewRequest(verb, u.String(), nil)
-	if err != nil {
+
+	r, err = o.c.tc.NewRangeReader(ctx, params, storageOpts...)
+
+	// Pass the context so that the span can be closed in Reader.Close, or close the
+	// span now if there is an error.
+	if err == nil {
+		r.ctx = ctx
+	}
+
+	return r, err
+}
+
+// ReaderOption is an option for NewReader or NewRangeReader.
+type ReaderOption interface {
+	apply(*newRangeReaderParams)
+}
+
+// MRDOption is an option for MultiRangeDownloader.
+type MRDOption interface {
+	apply(*newMultiRangeDownloaderParams)
+}
+
+type minConnections int
+
+func (c minConnections) apply(params *newMultiRangeDownloaderParams) {
+	params.minConnections = int(c)
+}
+
+// WithMinConnections returns an MRDOption which sets minimum connections
+// on the MRD to c. The call to NewMultiRangeDownloader will create one connection
+// and return with an MRD. The remaining connections will be created in the background
+// to avoid open latency.
+func WithMinConnections(c int) MRDOption {
+	return minConnections(c)
+}
+
+type maxConnections int
+
+func (c maxConnections) apply(params *newMultiRangeDownloaderParams) {
+	params.maxConnections = int(c)
+}
+
+// WithMaxConnections returns an MRDOption which sets maximum connections
+// on the MRD to c. The number of connections will not exceed this number.
+// The connections will range between minimum connections and maximum connections
+// based on the load.
+func WithMaxConnections(c int) MRDOption {
+	return maxConnections(c)
+}
+
+type targetPendingRanges int
+
+func (c targetPendingRanges) apply(params *newMultiRangeDownloaderParams) {
+	params.targetPendingRanges = int(c)
+}
+
+// WithTargetPendingRanges returns an MRDOption which sets target pending
+// ranges on the MRD to c. If number of connections in the MRD is less than
+// maximum connections, MRD will trigger creation of a new connection when
+// pending ranges on all existing streams exceed c.
+//
+// Note: A new connection can be triggered by either the pending byte threshold
+// (WithTargetPendingBytes) or the pending range threshold (WithTargetPendingRanges).
+func WithTargetPendingRanges(c int) MRDOption {
+	return targetPendingRanges(c)
+}
+
+type targetPendingBytes int
+
+func (c targetPendingBytes) apply(params *newMultiRangeDownloaderParams) {
+	params.targetPendingBytes = int(c)
+}
+
+// WithTargetPendingBytes returns an MRDOption that sets target pending
+// bytes on the MRD to c. If number of connections in the MRD is less than
+// maximum connections, MRD will trigger creation of a new connection when
+// outstanding bytes on all existing streams exceed c.
+//
+// Note: A new connection can be triggered by either the pending byte threshold
+// (WithTargetPendingBytes) or the pending range threshold (WithTargetPendingRanges).
+func WithTargetPendingBytes(c int) MRDOption {
+	return targetPendingBytes(c)
+}
+
+type disableMRDReadChecksum struct{}
+
+func (c disableMRDReadChecksum) apply(params *newMultiRangeDownloaderParams) {
+	params.disableMRDReadChecksum = true
+}
+
+// WithDisableMRDReadChecksum returns an MRDOption that disables read checksum validation for the MRD range downloads.
+func WithDisableMRDReadChecksum() MRDOption {
+	return disableMRDReadChecksum{}
+}
+
+type disableReaderChecksum struct{}
+
+func (c disableReaderChecksum) apply(params *newRangeReaderParams) {
+	params.disableCRCCheck = true
+}
+
+// WithDisableReaderChecksum returns a ReaderOption that disables read checksum validation.
+func WithDisableReaderChecksum() ReaderOption {
+	return disableReaderChecksum{}
+}
+
+// NewMultiRangeDownloader creates a multi-range reader for an object.
+// Must be called on a gRPC client created using [NewGRPCClient].
+//
+// This uses the gRPC-specific bi-directional read API. The option
+// [WithGRPCBidiReads] must be selected in order to use this API.
+func (o *ObjectHandle) NewMultiRangeDownloader(ctx context.Context, opts ...MRDOption) (mrd *MultiRangeDownloader, err error) {
+	// This span covers the life of the MRD. It is closed via the context
+	// in MultiRangeDownloader.Close.
+	var spanCtx context.Context
+	spanCtx, _ = startSpanWithBucket(ctx, o.c, o.bucket, "Object.MultiRangeDownloader")
+	defer func() {
+		if err != nil {
+			endSpan(spanCtx, err)
+		}
+	}()
+
+	if err := o.validate(); err != nil {
 		return nil, err
 	}
-	req = req.WithContext(ctx)
-	if o.userProject != "" {
-		req.Header.Set("X-Goog-User-Project", o.userProject)
-	}
-	if o.readCompressed {
-		req.Header.Set("Accept-Encoding", "gzip")
-	}
-	if err := setEncryptionHeaders(req.Header, o.encryptionKey, false); err != nil {
-		return nil, err
-	}
-
-	gen := o.gen
-
-	// Define a function that initiates a Read with offset and length, assuming we
-	// have already read seen bytes.
-	reopen := func(seen int64) (*http.Response, error) {
-		start := offset + seen
-		if length < 0 && start < 0 {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d", start))
-		} else if length < 0 && start > 0 {
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", start))
-		} else if length > 0 {
-			// The end character isn't affected by how many bytes we've seen.
-			req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, offset+length-1))
-		}
-		// We wait to assign conditions here because the generation number can change in between reopen() runs.
-		req.URL.RawQuery = conditionsQuery(gen, o.conds)
-		var res *http.Response
-		err = runWithRetry(ctx, func() error {
-			res, err = o.c.hc.Do(req)
-			if err != nil {
-				return err
-			}
-			if res.StatusCode == http.StatusNotFound {
-				res.Body.Close()
-				return ErrObjectNotExist
-			}
-			if res.StatusCode < 200 || res.StatusCode > 299 {
-				body, _ := ioutil.ReadAll(res.Body)
-				res.Body.Close()
-				return &googleapi.Error{
-					Code:   res.StatusCode,
-					Header: res.Header,
-					Body:   string(body),
-				}
-			}
-
-			partialContentNotSatisfied :=
-				!decompressiveTranscoding(res) &&
-					start > 0 && length != 0 &&
-					res.StatusCode != http.StatusPartialContent
-
-			if partialContentNotSatisfied {
-				res.Body.Close()
-				return errors.New("storage: partial request not satisfied")
-			}
-
-			// With "Content-Encoding": "gzip" aka decompressive transcoding, GCS serves
-			// back the whole file regardless of the range count passed in as per:
-			//      https://cloud.google.com/storage/docs/transcoding#range,
-			// thus we have to manually move the body forward by seen bytes.
-			if decompressiveTranscoding(res) && seen > 0 {
-				_, _ = io.CopyN(ioutil.Discard, res.Body, seen)
-			}
-
-			// If a generation hasn't been specified, and this is the first response we get, let's record the
-			// generation. In future requests we'll use this generation as a precondition to avoid data races.
-			if gen < 0 && res.Header.Get("X-Goog-Generation") != "" {
-				gen64, err := strconv.ParseInt(res.Header.Get("X-Goog-Generation"), 10, 64)
-				if err != nil {
-					return err
-				}
-				gen = gen64
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		return res, nil
-	}
-
-	res, err := reopen(0)
-	if err != nil {
-		return nil, err
-	}
-	var (
-		size        int64 // total size of object, even if a range was requested.
-		checkCRC    bool
-		crc         uint32
-		startOffset int64 // non-zero if range request.
-	)
-	if res.StatusCode == http.StatusPartialContent {
-		cr := strings.TrimSpace(res.Header.Get("Content-Range"))
-		if !strings.HasPrefix(cr, "bytes ") || !strings.Contains(cr, "/") {
-			return nil, fmt.Errorf("storage: invalid Content-Range %q", cr)
-		}
-		size, err = strconv.ParseInt(cr[strings.LastIndex(cr, "/")+1:], 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("storage: invalid Content-Range %q", cr)
-		}
-
-		dashIndex := strings.Index(cr, "-")
-		if dashIndex >= 0 {
-			startOffset, err = strconv.ParseInt(cr[len("bytes="):dashIndex], 10, 64)
-			if err != nil {
-				return nil, fmt.Errorf("storage: invalid Content-Range %q: %v", cr, err)
-			}
-		}
-	} else {
-		size = res.ContentLength
-		// Check the CRC iff all of the following hold:
-		// - We asked for content (length != 0).
-		// - We got all the content (status != PartialContent).
-		// - The server sent a CRC header.
-		// - The Go http stack did not uncompress the file.
-		// - We were not served compressed data that was uncompressed on download.
-		// The problem with the last two cases is that the CRC will not match -- GCS
-		// computes it on the compressed contents, but we compute it on the
-		// uncompressed contents.
-		if length != 0 && !res.Uncompressed && !uncompressedByServer(res) {
-			crc, checkCRC = parseCRC32c(res)
-		}
-	}
-
-	remain := res.ContentLength
-	body := res.Body
-	if length == 0 {
-		remain = 0
-		body.Close()
-		body = emptyBody
-	}
-	var metaGen int64
-	if res.Header.Get("X-Goog-Metageneration") != "" {
-		metaGen, err = strconv.ParseInt(res.Header.Get("X-Goog-Metageneration"), 10, 64)
-		if err != nil {
+	if o.conds != nil {
+		if err := o.conds.validate("NewMultiRangeDownloader"); err != nil {
 			return nil, err
 		}
 	}
 
-	var lm time.Time
-	if res.Header.Get("Last-Modified") != "" {
-		lm, err = http.ParseTime(res.Header.Get("Last-Modified"))
-		if err != nil {
-			return nil, err
-		}
-	}
+	storageOpts := makeStorageOpts(true, o.retry, o.userProject)
 
-	attrs := ReaderObjectAttrs{
-		Size:            size,
-		ContentType:     res.Header.Get("Content-Type"),
-		ContentEncoding: res.Header.Get("Content-Encoding"),
-		CacheControl:    res.Header.Get("Cache-Control"),
-		LastModified:    lm,
-		StartOffset:     startOffset,
-		Generation:      gen,
-		Metageneration:  metaGen,
+	params := &newMultiRangeDownloaderParams{
+		bucket:        o.bucket,
+		conds:         o.conds,
+		encryptionKey: o.encryptionKey,
+		gen:           o.gen,
+		object:        o.object,
+		handle:        &o.readHandle,
 	}
-	return &Reader{
-		Attrs:    attrs,
-		body:     body,
-		size:     size,
-		remain:   remain,
-		wantCRC:  crc,
-		checkCRC: checkCRC,
-		reopen:   reopen,
-	}, nil
+	// Process configured options
+	for _, opt := range opts {
+		opt.apply(params)
+	}
+	if params.minConnections > 1 || params.maxConnections > 1 {
+		spanCtx = addFeatureAttributes(spanCtx, featureMultistreamInMRD)
+	}
+	// This call will return the *MultiRangeDownloader with the .impl field set.
+	return o.c.tc.NewMultiRangeDownloader(spanCtx, params, storageOpts...)
 }
 
 // decompressiveTranscoding returns true if the request was served decompressed
 // and different than its original storage form. This happens when the "Content-Encoding"
 // header is "gzip".
 // See:
-//  * https://cloud.google.com/storage/docs/transcoding#transcoding_and_gzip
-//  * https://github.com/googleapis/google-cloud-go/issues/1800
+//   - https://cloud.google.com/storage/docs/transcoding#transcoding_and_gzip
+//   - https://github.com/googleapis/google-cloud-go/issues/1800
 func decompressiveTranscoding(res *http.Response) bool {
 	// Decompressive Transcoding.
 	return res.Header.Get("Content-Encoding") == "gzip" ||
@@ -307,20 +321,46 @@ func uncompressedByServer(res *http.Response) bool {
 		res.Header.Get("Content-Encoding") != "gzip"
 }
 
+// parseCRC32c parses the crc32c hash from the X-Goog-Hash header.
+// It can parse headers in the form [crc32c=xxx md5=xxx] (XML responses) or the
+// form [crc32c=xxx,md5=xxx] (JSON responses). The md5 hash is ignored.
 func parseCRC32c(res *http.Response) (uint32, bool) {
 	const prefix = "crc32c="
 	for _, spec := range res.Header["X-Goog-Hash"] {
-		if strings.HasPrefix(spec, prefix) {
-			c, err := decodeUint32(spec[len(prefix):])
-			if err == nil {
-				return c, true
+		values := strings.Split(spec, ",")
+
+		for _, v := range values {
+			if strings.HasPrefix(v, prefix) {
+				c, err := decodeUint32(v[len(prefix):])
+				if err == nil {
+					return c, true
+				}
 			}
 		}
+
 	}
 	return 0, false
 }
 
-var emptyBody = ioutil.NopCloser(strings.NewReader(""))
+// setConditionsHeaders sets precondition request headers for downloads
+// using the XML API. It assumes that the conditions have been validated.
+func setConditionsHeaders(headers http.Header, conds *Conditions) error {
+	if conds == nil {
+		return nil
+	}
+	if conds.MetagenerationMatch != 0 {
+		headers.Set("x-goog-if-metageneration-match", fmt.Sprint(conds.MetagenerationMatch))
+	}
+	switch {
+	case conds.GenerationMatch != 0:
+		headers.Set("x-goog-if-generation-match", fmt.Sprint(conds.GenerationMatch))
+	case conds.DoesNotExist:
+		headers.Set("x-goog-if-generation-match", "0")
+	}
+	return nil
+}
+
+var emptyBody = io.NopCloser(strings.NewReader(""))
 
 // Reader reads a Cloud Storage object.
 // It implements io.Reader.
@@ -329,72 +369,94 @@ var emptyBody = ioutil.NopCloser(strings.NewReader(""))
 // the stored CRC, returning an error from Read if there is a mismatch. This integrity check
 // is skipped if transcoding occurs. See https://cloud.google.com/storage/docs/transcoding.
 type Reader struct {
-	Attrs              ReaderObjectAttrs
-	body               io.ReadCloser
-	seen, remain, size int64
-	checkCRC           bool   // should we check the CRC?
-	wantCRC            uint32 // the CRC32c value the server sent in the header
-	gotCRC             uint32 // running crc
-	reopen             func(seen int64) (*http.Response, error)
+	// remain must be the first field in the struct to guarantee 64-bit
+	// alignment on 32-bit architectures for atomic operations.
+	remain    int64
+	bytesRead int64 // Cumulative bytes read for response size metric.
+
+	Attrs          ReaderObjectAttrs
+	objectMetadata *map[string]string
+
+	seen, size int64
+	checkCRC   bool // Did we check the CRC? This is now only used by tests.
+
+	reader      io.ReadCloser
+	ctx         context.Context
+	mu          sync.Mutex
+	err         error // Persistent error encountered during Read or WriteTo.
+	handle      *ReadHandle
+	unfinalized bool
+
+	bucket string
+	object string
+
+	metricsState *metricsState
 }
 
 // Close closes the Reader. It must be called when done reading.
 func (r *Reader) Close() error {
-	return r.body.Close()
+	if !r.unfinalized && !r.Attrs.Decompressed {
+		if rem := atomic.LoadInt64(&r.remain); rem < 0 {
+			log.Printf("storage: received %d more bytes than requested from GCS for bucket %q, object %q", -rem, r.bucket, r.object)
+		}
+	}
+	err := r.reader.Close()
+	r.mu.Lock()
+	if r.err != nil {
+		err = r.err
+	}
+	r.mu.Unlock()
+
+	if r.metricsState != nil {
+		if r.metricsState.metrics != nil {
+			if total := atomic.SwapInt64(&r.bytesRead, 0); total > 0 {
+				r.metricsState.metrics.responseBodySize.Record(r.ctx, total, metric.WithAttributes(attribute.String("rpc.system.name", r.metricsState.getSystemName()), attribute.String("rpc.method", "ReadObject"), attribute.String("server.address", stripPort(r.metricsState.getTarget()))))
+			}
+		}
+		if r.metricsState.record != nil {
+			r.metricsState.record(err)
+		}
+	}
+	endSpan(r.ctx, err)
+	return err
 }
 
 func (r *Reader) Read(p []byte) (int, error) {
-	n, err := r.readWithRetry(p)
-	if r.remain != -1 {
-		r.remain -= int64(n)
-	}
-	if r.checkCRC {
-		r.gotCRC = crc32.Update(r.gotCRC, crc32cTable, p[:n])
-		// Check CRC here. It would be natural to check it in Close, but
-		// everybody defers Close on the assumption that it doesn't return
-		// anything worth looking at.
-		if err == io.EOF {
-			if r.gotCRC != r.wantCRC {
-				return n, fmt.Errorf("storage: bad CRC on read: got %d, want %d",
-					r.gotCRC, r.wantCRC)
-			}
-		}
-	}
+	n, err := r.reader.Read(p)
+	r.recordRead(int64(n), err)
 	return n, err
 }
 
-func (r *Reader) readWithRetry(p []byte) (int, error) {
-	n := 0
-	for len(p[n:]) > 0 {
-		m, err := r.body.Read(p[n:])
-		n += m
-		r.seen += int64(m)
-		if !shouldRetryRead(err) {
-			return n, err
-		}
-		// Read failed, but we will try again. Send a ranged read request that takes
-		// into account the number of bytes we've already seen.
-		res, err := r.reopen(r.seen)
-		if err != nil {
-			// reopen already retries
-			return n, err
-		}
-		r.body.Close()
-		r.body = res.Body
-	}
-	return n, nil
+// WriteTo writes all the data from the Reader to w. Fulfills the io.WriterTo interface.
+// This is called implicitly when calling io.Copy on a Reader.
+func (r *Reader) WriteTo(w io.Writer) (int64, error) {
+	// This implicitly calls r.reader.WriteTo for gRPC only. JSON and XML don't have an
+	// implementation of WriteTo.
+	n, err := io.Copy(w, r.reader)
+	r.recordRead(n, err)
+	return n, err
 }
 
-func shouldRetryRead(err error) bool {
-	if err == nil {
-		return false
+// recordRead updates remaining byte counts and metrics after a read operation,
+// and saves any persistent error encountered during Read or WriteTo.
+func (r *Reader) recordRead(n int64, err error) {
+	if !r.unfinalized && !r.Attrs.Decompressed {
+		atomic.AddInt64(&r.remain, -n)
 	}
-	return strings.HasSuffix(err.Error(), "INTERNAL_ERROR") && strings.Contains(reflect.TypeOf(err).String(), "http2")
+	if n > 0 {
+		atomic.AddInt64(&r.bytesRead, n)
+	}
+	if err != nil && err != io.EOF {
+		r.mu.Lock()
+		r.err = err
+		r.mu.Unlock()
+	}
 }
 
 // Size returns the size of the object in bytes.
 // The returned value is always the same and is not affected by
 // calls to Read or Close.
+// Size may be out of date for a Reader to an unfinalized object.
 //
 // Deprecated: use Reader.Attrs.Size.
 func (r *Reader) Size() int64 {
@@ -402,8 +464,16 @@ func (r *Reader) Size() int64 {
 }
 
 // Remain returns the number of bytes left to read, or -1 if unknown.
+// Unfinalized objects will return -1.
 func (r *Reader) Remain() int64 {
-	return r.remain
+	if r.unfinalized || r.Attrs.Decompressed {
+		return -1
+	}
+	rem := atomic.LoadInt64(&r.remain)
+	if rem < 0 {
+		return 0
+	}
+	return rem
 }
 
 // ContentType returns the content type of the object.
@@ -432,4 +502,114 @@ func (r *Reader) CacheControl() string {
 // Deprecated: use Reader.Attrs.LastModified.
 func (r *Reader) LastModified() (time.Time, error) {
 	return r.Attrs.LastModified, nil
+}
+
+// Metadata returns user-provided metadata, in key/value pairs.
+//
+// It can be nil if no metadata is present, or if the client uses the JSON
+// API for downloads. Only the XML and gRPC APIs support getting
+// custom metadata via the Reader; for JSON make a separate call to
+// ObjectHandle.Attrs.
+func (r *Reader) Metadata() map[string]string {
+	if r.objectMetadata != nil {
+		return *r.objectMetadata
+	}
+	return nil
+}
+
+// ReadHandle returns the read handle associated with an object.
+// ReadHandle will be periodically refreshed.
+//
+// ReadHandle requires the gRPC-specific bi-directional read API.
+func (r *Reader) ReadHandle() ReadHandle {
+	if r.handle == nil {
+		r.handle = &ReadHandle{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return (*r.handle)
+}
+
+// MultiRangeDownloader reads a Cloud Storage object.
+//
+// Typically, a MultiRangeDownloader opens a stream to which we can add
+// different ranges to read from the object.
+type MultiRangeDownloader struct {
+	// Attrs is populated when NewMultiRangeDownloader returns.
+	Attrs ReaderObjectAttrs
+	impl  internalMultiRangeDownloader
+}
+
+// Add adds a new range to MultiRangeDownloader.
+//
+// The offset for the first byte to return in the read, relative to the start
+// of the object.
+//
+// A negative offset value will be interpreted as the number of bytes from the
+// end of the object to be returned. Requesting a negative offset with magnitude
+// larger than the size of the object will return the entire object.
+//
+// An offset larger than the size of the object returns an OutOfRange error via
+// the callback and enters a permanent error state. All subsequent calls to Close
+// will return this same error.
+//
+// A limit of zero indicates that there is no limit, and a negative limit will
+// cause an error.
+//
+// This will initiate the read range but is non-blocking; call callback to
+// process the result. Add is thread-safe and can be called simultaneously
+// from different goroutines.
+//
+// Callback will be called with the offset, length of data read, and error
+// of the read. Note that the length of the data read may be less than the
+// requested length if the end of the object is reached.
+func (mrd *MultiRangeDownloader) Add(output io.Writer, offset, length int64, callback func(int64, int64, error)) {
+	mrd.impl.add(output, offset, length, callback)
+}
+
+// Close the MultiRangeDownloader. It must be called when done reading.
+// Adding new ranges after this has been called will cause an error.
+//
+// This will immediately close the streams and can result in a
+// "stream closed early" error if a response for a range is still not processed.
+// Call [MultiRangeDownloader.Wait] to avoid this error.
+//
+// If the downloader is in a permanent error state, this will return an error.
+//
+// This must not be called from the callback sent into Add command otherwise
+// it could lead to a deadlock.
+func (mrd *MultiRangeDownloader) Close() error {
+	err := mrd.impl.close(nil)
+	if state := metricsStateFromContext(mrd.impl.getSpanCtx()); state != nil {
+		if state.metrics != nil {
+			if total := mrd.impl.getBytesRead(); total > 0 {
+				state.metrics.responseBodySize.Record(mrd.impl.getSpanCtx(), total, metric.WithAttributes(attribute.String("rpc.system.name", state.getSystemName()), attribute.String("rpc.method", "ReadObject"), attribute.String("server.address", stripPort(state.getTarget()))))
+			}
+		}
+		if state.record != nil {
+			state.record(err)
+		}
+	}
+	endSpan(mrd.impl.getSpanCtx(), err)
+	return err
+}
+
+// Wait for all the responses to process on the stream.
+// Adding new ranges after this has been called will cause an error.
+// Wait will wait for all callbacks to finish.
+func (mrd *MultiRangeDownloader) Wait() {
+	mrd.impl.wait()
+}
+
+// GetHandle returns the read handle. This can be used to further speed up the
+// follow up read if the same object is read through a different stream.
+func (mrd *MultiRangeDownloader) GetHandle() []byte {
+	return mrd.impl.getHandle() // TODO: Consider plumbing context from caller
+}
+
+// Error returns an error if the MultiRangeDownloader is in a permanent failure
+// state. It returns a nil error if the MultiRangeDownloader is open and can be
+// used.
+func (mrd *MultiRangeDownloader) Error() error {
+	return mrd.impl.getPermanentError()
 }

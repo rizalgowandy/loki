@@ -1,7 +1,8 @@
 package distributor
 
 import (
-	"net/http"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -9,23 +10,26 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/assert"
-	"github.com/weaveworks/common/httpgrpc"
+	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql"
-	"github.com/grafana/loki/pkg/validation"
+	"github.com/grafana/loki/pkg/push"
+
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/validation"
 )
 
 var (
-	testStreamLabels = "FIXME"
-	testTime         = time.Now()
+	testStreamLabels       = labels.FromStrings("my", "label")
+	testStreamLabelsString = testStreamLabels.String()
+	testTime               = time.Now()
 )
 
 type fakeLimits struct {
 	limits *validation.Limits
 }
 
-func (f fakeLimits) TenantLimits(userID string) *validation.Limits {
+func (f fakeLimits) TenantLimits(_ string) *validation.Limits {
 	return f.limits
 }
 
@@ -41,6 +45,7 @@ func TestValidator_ValidateEntry(t *testing.T) {
 		overrides validation.TenantLimits
 		entry     logproto.Entry
 		expected  error
+		reason    string
 	}{
 		{
 			"test valid",
@@ -48,6 +53,7 @@ func TestValidator_ValidateEntry(t *testing.T) {
 			nil,
 			logproto.Entry{Timestamp: testTime, Line: "test"},
 			nil,
+			"",
 		},
 		{
 			"test too old",
@@ -59,14 +65,20 @@ func TestValidator_ValidateEntry(t *testing.T) {
 				},
 			},
 			logproto.Entry{Timestamp: testTime.Add(-time.Hour * 5), Line: "test"},
-			httpgrpc.Errorf(http.StatusBadRequest, validation.GreaterThanMaxSampleAgeErrorMsg, testStreamLabels, testTime.Add(-time.Hour*5)),
+			fmt.Errorf(validation.GreaterThanMaxSampleAgeErrorMsg,
+				testStreamLabelsString,
+				testTime.Add(-time.Hour*5).Format(timeFormat),
+				testTime.Add(-1*time.Hour).Format(timeFormat), // same as RejectOldSamplesMaxAge
+			),
+			validation.GreaterThanMaxSampleAge,
 		},
 		{
 			"test too new",
 			"test",
 			nil,
 			logproto.Entry{Timestamp: testTime.Add(time.Hour * 5), Line: "test"},
-			httpgrpc.Errorf(http.StatusBadRequest, validation.TooFarInFutureErrorMsg, testStreamLabels, testTime.Add(time.Hour*5)),
+			fmt.Errorf(validation.TooFarInFutureErrorMsg, testStreamLabelsString, testTime.Add(time.Hour*5).Format(timeFormat)),
+			validation.TooFarInFuture,
 		},
 		{
 			"line too long",
@@ -77,7 +89,46 @@ func TestValidator_ValidateEntry(t *testing.T) {
 				},
 			},
 			logproto.Entry{Timestamp: testTime, Line: "12345678901"},
-			httpgrpc.Errorf(http.StatusBadRequest, validation.LineTooLongErrorMsg, 10, testStreamLabels, 11),
+			fmt.Errorf(validation.LineTooLongErrorMsg, 10, testStreamLabelsString, 11),
+			validation.LineTooLong,
+		},
+		{
+			"disallowed structured metadata",
+			"test",
+			fakeLimits{
+				&validation.Limits{
+					AllowStructuredMetadata: false,
+				},
+			},
+			logproto.Entry{Timestamp: testTime, Line: "12345678901", StructuredMetadata: push.LabelsAdapter{{Name: "foo", Value: "bar"}}},
+			fmt.Errorf(validation.DisallowedStructuredMetadataErrorMsg, testStreamLabelsString),
+			validation.DisallowedStructuredMetadata,
+		},
+		{
+			"structured metadata too big",
+			"test",
+			fakeLimits{
+				&validation.Limits{
+					AllowStructuredMetadata:   true,
+					MaxStructuredMetadataSize: 4,
+				},
+			},
+			logproto.Entry{Timestamp: testTime, Line: "12345678901", StructuredMetadata: push.LabelsAdapter{{Name: "foo", Value: "bar"}}},
+			fmt.Errorf(validation.StructuredMetadataTooLargeErrorMsg, testStreamLabelsString, 6, 4),
+			validation.StructuredMetadataTooLarge,
+		},
+		{
+			"structured metadata too many",
+			"test",
+			fakeLimits{
+				&validation.Limits{
+					AllowStructuredMetadata:           true,
+					MaxStructuredMetadataEntriesCount: 1,
+				},
+			},
+			logproto.Entry{Timestamp: testTime, Line: "12345678901", StructuredMetadata: push.LabelsAdapter{{Name: "foo", Value: "bar"}, {Name: "too", Value: "many"}}},
+			fmt.Errorf(validation.StructuredMetadataTooManyErrorMsg, testStreamLabelsString, 2, 1),
+			validation.StructuredMetadataTooMany,
 		},
 	}
 	for _, tt := range tests {
@@ -86,22 +137,23 @@ func TestValidator_ValidateEntry(t *testing.T) {
 			flagext.DefaultValues(l)
 			o, err := validation.NewOverrides(*l, tt.overrides)
 			assert.NoError(t, err)
-			v, err := NewValidator(o)
+			v, err := NewValidator(o, nil)
 			assert.NoError(t, err)
-
-			err = v.ValidateEntry(v.getValidationContextFor(tt.userID), testStreamLabels, tt.entry)
-			assert.Equal(t, tt.expected, err)
+			reason, err := v.ValidateEntry(v.getValidationContextForTime(testTime, tt.userID), testStreamLabels, tt.entry, 0, 0)
+			require.Equal(t, tt.expected, err)
+			require.Equal(t, tt.reason, reason)
 		})
 	}
 }
 
 func TestValidator_ValidateLabels(t *testing.T) {
 	tests := []struct {
-		name      string
-		userID    string
-		overrides validation.TenantLimits
-		labels    string
-		expected  error
+		name           string
+		userID         string
+		overrides      validation.TenantLimits
+		labels         string
+		expected       error
+		expectedReason string
 	}{
 		{
 			"test valid",
@@ -109,13 +161,15 @@ func TestValidator_ValidateLabels(t *testing.T) {
 			nil,
 			"{foo=\"bar\"}",
 			nil,
+			"",
 		},
 		{
 			"empty",
 			"test",
 			nil,
 			"{}",
-			httpgrpc.Errorf(http.StatusBadRequest, validation.MissingLabelsErrorMsg),
+			fmt.Errorf(validation.MissingLabelsErrorMsg),
+			validation.MissingLabels,
 		},
 		{
 			"test too many labels",
@@ -124,7 +178,8 @@ func TestValidator_ValidateLabels(t *testing.T) {
 				&validation.Limits{MaxLabelNamesPerSeries: 2},
 			},
 			"{foo=\"bar\",food=\"bars\",fed=\"bears\"}",
-			httpgrpc.Errorf(http.StatusBadRequest, validation.MaxLabelNamesPerSeriesErrorMsg, "{foo=\"bar\",food=\"bars\",fed=\"bears\"}", 3, 2),
+			fmt.Errorf(validation.MaxLabelNamesPerSeriesErrorMsg, "{foo=\"bar\",food=\"bars\",fed=\"bears\"}", 3, 2),
+			validation.MaxLabelNamesPerSeries,
 		},
 		{
 			"label name too long",
@@ -136,7 +191,8 @@ func TestValidator_ValidateLabels(t *testing.T) {
 				},
 			},
 			"{fooooo=\"bar\"}",
-			httpgrpc.Errorf(http.StatusBadRequest, validation.LabelNameTooLongErrorMsg, "{fooooo=\"bar\"}", "fooooo"),
+			fmt.Errorf(validation.LabelNameTooLongErrorMsg, "{fooooo=\"bar\"}", "fooooo"),
+			validation.LabelNameTooLong,
 		},
 		{
 			"label value too long",
@@ -149,7 +205,8 @@ func TestValidator_ValidateLabels(t *testing.T) {
 				},
 			},
 			"{foo=\"barrrrrr\"}",
-			httpgrpc.Errorf(http.StatusBadRequest, validation.LabelValueTooLongErrorMsg, "{foo=\"barrrrrr\"}", "barrrrrr"),
+			fmt.Errorf(validation.LabelValueTooLongErrorMsg, "{foo=\"barrrrrr\"}", "barrrrrr"),
+			validation.LabelValueTooLong,
 		},
 		{
 			"duplicate label",
@@ -162,7 +219,8 @@ func TestValidator_ValidateLabels(t *testing.T) {
 				},
 			},
 			"{foo=\"bar\", foo=\"barf\"}",
-			httpgrpc.Errorf(http.StatusBadRequest, validation.DuplicateLabelNamesErrorMsg, "{foo=\"bar\", foo=\"barf\"}", "foo"),
+			fmt.Errorf(validation.DuplicateLabelNamesErrorMsg, "{foo=\"bar\", foo=\"barf\"}", "foo"),
+			validation.DuplicateLabelNames,
 		},
 		{
 			"label value contains %",
@@ -175,10 +233,8 @@ func TestValidator_ValidateLabels(t *testing.T) {
 				},
 			},
 			"{foo=\"bar\", foo=\"barf%s\"}",
-			httpgrpc.ErrorFromHTTPResponse(&httpgrpc.HTTPResponse{
-				Code: int32(http.StatusBadRequest),
-				Body: []byte("stream '{foo=\"bar\", foo=\"barf%s\"}' has label value too long: 'barf%s'"), // Intentionally construct the string to make sure %s isn't substituted as (MISSING)
-			}),
+			errors.New("stream '{foo=\"bar\", foo=\"barf%s\"}' has label value too long: 'barf%s'"), // Intentionally construct the string to make sure %s isn't substituted as (MISSING)
+			validation.LabelValueTooLong,
 		},
 	}
 	for _, tt := range tests {
@@ -187,17 +243,172 @@ func TestValidator_ValidateLabels(t *testing.T) {
 			flagext.DefaultValues(l)
 			o, err := validation.NewOverrides(*l, tt.overrides)
 			assert.NoError(t, err)
-			v, err := NewValidator(o)
+			v, err := NewValidator(o, nil)
 			assert.NoError(t, err)
 
-			err = v.ValidateLabels(v.getValidationContextFor(tt.userID), mustParseLabels(tt.labels), logproto.Stream{Labels: tt.labels})
-			assert.Equal(t, tt.expected, err)
+			reason, err := v.ValidateLabels(v.getValidationContextForTime(testTime, tt.userID), mustParseLabels(tt.labels), *logproto.FromStream(logproto.Stream{Labels: tt.labels}))
+			require.Equal(t, tt.expected, err)
+			require.Equal(t, tt.expectedReason, reason)
 		})
 	}
 }
 
+func TestShouldBlockIngestion(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		policy    string
+		time      time.Time
+		overrides validation.TenantLimits
+
+		expectBlock      bool
+		expectStatusCode int
+		expectReason     string
+	}{
+		{
+			name: "no block configured",
+			time: testTime,
+			overrides: fakeLimits{
+				&validation.Limits{},
+			},
+		},
+		{
+			name:   "all configured tenant blocked priority",
+			time:   testTime,
+			policy: "policy1",
+			overrides: fakeLimits{
+				&validation.Limits{
+					BlockIngestionUntil: flagext.Time(testTime.Add(time.Hour)),
+					BlockIngestionPolicyUntil: map[string]flagext.Time{
+						validation.GlobalPolicy: flagext.Time(testTime.Add(-2 * time.Hour)),
+						"policy1":               flagext.Time(testTime.Add(-time.Hour)),
+					},
+					BlockIngestionStatusCode: 1234,
+				},
+			},
+			expectBlock:      true,
+			expectStatusCode: 1234,
+			expectReason:     validation.BlockedIngestion,
+		},
+		{
+			name:   "named policy priority",
+			time:   testTime,
+			policy: "policy1",
+			overrides: fakeLimits{
+				&validation.Limits{
+					BlockIngestionUntil: flagext.Time(testTime.Add(-2 * time.Hour)), // Not active anymore
+					BlockIngestionPolicyUntil: map[string]flagext.Time{
+						validation.GlobalPolicy: flagext.Time(testTime.Add(-time.Hour)),
+						"policy1":               flagext.Time(testTime.Add(time.Hour)),
+					},
+					BlockIngestionStatusCode: 1234,
+				},
+			},
+			expectBlock:      true,
+			expectStatusCode: 1234,
+			expectReason:     validation.BlockedIngestionPolicy,
+		},
+		{
+			name:   "global policy ignored",
+			time:   testTime,
+			policy: "policy1",
+			overrides: fakeLimits{
+				&validation.Limits{
+					BlockIngestionUntil: flagext.Time(testTime.Add(-time.Hour)), // Not active anymore
+					BlockIngestionPolicyUntil: map[string]flagext.Time{
+						validation.GlobalPolicy: flagext.Time(testTime.Add(time.Hour)), // Won't apply since we have a named policy
+					},
+					BlockIngestionStatusCode: 1234,
+				},
+			},
+			expectBlock: false,
+		},
+		{
+			name:   "global policy matched",
+			time:   testTime,
+			policy: "", // matches global policy
+			overrides: fakeLimits{
+				&validation.Limits{
+					BlockIngestionPolicyUntil: map[string]flagext.Time{
+						validation.GlobalPolicy: flagext.Time(testTime.Add(time.Hour)),
+					},
+					BlockIngestionStatusCode: 1234,
+				},
+			},
+			expectBlock:      true,
+			expectStatusCode: 1234,
+			expectReason:     validation.BlockedIngestionPolicy,
+		},
+		{
+			name:   "unknown policy not blocked by global policy",
+			time:   testTime,
+			policy: "notExists",
+			overrides: fakeLimits{
+				&validation.Limits{
+					BlockIngestionPolicyUntil: map[string]flagext.Time{
+						validation.GlobalPolicy: flagext.Time(testTime.Add(time.Hour)),
+						"policy1":               flagext.Time(testTime.Add(2 * time.Hour)),
+					},
+					BlockIngestionStatusCode: 1234,
+				},
+			},
+			expectBlock: false,
+		},
+		{
+			name:   "named policy overrides global policy",
+			time:   testTime,
+			policy: "policy1",
+			overrides: fakeLimits{
+				&validation.Limits{
+					BlockIngestionPolicyUntil: map[string]flagext.Time{
+						validation.GlobalPolicy: flagext.Time(testTime.Add(time.Hour)),
+						"policy1":               flagext.Time(testTime.Add(-time.Hour)), // Not blocked overriding block from global quota
+					},
+					BlockIngestionStatusCode: 1234,
+				},
+			},
+			expectBlock: false,
+		},
+		{
+			name:   "no matching policy",
+			time:   testTime,
+			policy: "notExists",
+			overrides: fakeLimits{
+				&validation.Limits{
+					BlockIngestionPolicyUntil: map[string]flagext.Time{
+						"policy1": flagext.Time(testTime.Add(2 * time.Hour)),
+					},
+					BlockIngestionStatusCode: 1234,
+				},
+			},
+			expectBlock: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := &validation.Limits{}
+			flagext.DefaultValues(l)
+
+			o, err := validation.NewOverrides(*l, tc.overrides)
+			assert.NoError(t, err)
+			v, err := NewValidator(o, nil)
+			assert.NoError(t, err)
+
+			block, statusCode, reason, err := v.ShouldBlockIngestion(v.getValidationContextForTime(testTime, "fake"), testTime, tc.policy)
+			assert.Equal(t, tc.expectBlock, block)
+			if tc.expectBlock {
+				assert.Equal(t, tc.expectStatusCode, statusCode)
+				assert.Equal(t, tc.expectReason, reason)
+				assert.Error(t, err)
+				t.Logf("block: %v, statusCode: %d, reason: %s, err: %v", block, statusCode, reason, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+
+}
+
 func mustParseLabels(s string) labels.Labels {
-	ls, err := logql.ParseLabels(s)
+	ls, err := syntax.ParseLabels(s)
 	if err != nil {
 		panic(err)
 	}

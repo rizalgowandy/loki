@@ -6,19 +6,18 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/frontend/v2/frontendv2pb"
-	"github.com/cortexproject/cortex/pkg/scheduler/schedulerpb"
-	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/backoff"
+	"github.com/grafana/dskit/httpgrpc"
+	"github.com/grafana/dskit/middleware"
 	"github.com/grafana/dskit/ring"
 	"github.com/grafana/dskit/services"
 	"github.com/pkg/errors"
-	"github.com/weaveworks/common/httpgrpc"
 	"google.golang.org/grpc"
 
-	lokiutil "github.com/grafana/loki/pkg/util"
+	"github.com/grafana/loki/v3/pkg/scheduler/schedulerpb"
+	"github.com/grafana/loki/v3/pkg/util"
 )
 
 type frontendSchedulerWorkers struct {
@@ -50,7 +49,7 @@ func newFrontendSchedulerWorkers(cfg Config, frontendAddress string, ring ring.R
 	switch {
 	case ring != nil:
 		// Use the scheduler ring and RingWatcher to find schedulers.
-		w, err := lokiutil.NewRingWatcher(log.With(logger, "component", "frontend-scheduler-worker"), ring, cfg.DNSLookupPeriod, f)
+		w, err := util.NewRingWatcher(log.With(logger, "component", "frontend-scheduler-worker"), ring, cfg.DNSLookupPeriod, f)
 		if err != nil {
 			return nil, err
 		}
@@ -68,8 +67,14 @@ func newFrontendSchedulerWorkers(cfg Config, frontendAddress string, ring ring.R
 	return f, nil
 }
 
-func (f *frontendSchedulerWorkers) starting(ctx context.Context) error {
-	return services.StartAndAwaitRunning(ctx, f.watcher)
+func (f *frontendSchedulerWorkers) starting(_ context.Context) error {
+	// Instead of re-using `ctx` from the frontendSchedulerWorkers service,
+	// `watcher` needs to use their own service context, because we want to
+	// control the stopping process in the `stopping` function of the
+	// frontendSchedulerWorkers. If we would use the same context, the child
+	// service would be stopped automatically as soon as the context of the
+	// parent service is cancelled.
+	return services.StartAndAwaitRunning(context.Background(), f.watcher)
 }
 
 func (f *frontendSchedulerWorkers) stopping(_ error) error {
@@ -90,12 +95,13 @@ func (f *frontendSchedulerWorkers) AddressAdded(address string) {
 	f.mu.Lock()
 	ws := f.workers
 	w := f.workers[address]
-	f.mu.Unlock()
 
 	// Already stopped or we already have worker for this address.
 	if ws == nil || w != nil {
+		f.mu.Unlock()
 		return
 	}
+	f.mu.Unlock()
 
 	level.Info(f.logger).Log("msg", "adding connection to scheduler", "addr", address)
 	conn, err := f.connectToScheduler(context.Background(), address)
@@ -111,10 +117,16 @@ func (f *frontendSchedulerWorkers) AddressAdded(address string) {
 	defer f.mu.Unlock()
 
 	// Can be nil if stopping has been called already.
-	if f.workers != nil {
-		f.workers[address] = w
-		w.start()
+	if f.workers == nil {
+		return
 	}
+	// We have to recheck for presence in case we got called again while we were
+	// connecting and that one finished first.
+	if f.workers[address] != nil {
+		return
+	}
+	f.workers[address] = w
+	w.start()
 }
 
 func (f *frontendSchedulerWorkers) AddressRemoved(address string) {
@@ -141,11 +153,12 @@ func (f *frontendSchedulerWorkers) getWorkersCount() int {
 
 func (f *frontendSchedulerWorkers) connectToScheduler(ctx context.Context, address string) (*grpc.ClientConn, error) {
 	// Because we only use single long-running method, it doesn't make sense to inject user ID, send over tracing or add metrics.
-	opts, err := f.cfg.GRPCClientConfig.DialOption(nil, nil)
+	opts, err := f.cfg.GRPCClientConfig.DialOption(nil, nil, middleware.NoOpInvalidClusterValidationReporter)
 	if err != nil {
 		return nil, err
 	}
 
+	// nolint:staticcheck // grpc.DialContext() has been deprecated; we'll address it before upgrading to gRPC 2.
 	conn, err := grpc.DialContext(ctx, address, opts...)
 	if err != nil {
 		return nil, err
@@ -184,7 +197,8 @@ func newFrontendSchedulerWorker(conn *grpc.ClientConn, schedulerAddr string, fro
 		schedulerAddr: schedulerAddr,
 		frontendAddr:  frontendAddr,
 		requestCh:     requestCh,
-		cancelCh:      make(chan uint64),
+		// Allow to enqueue enough cancellation requests. ~ 8MB memory size.
+		cancelCh: make(chan uint64, 1000000),
 	}
 	w.ctx, w.cancel = context.WithCancel(context.Background())
 
@@ -269,15 +283,25 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 			return nil
 
 		case req := <-w.requestCh:
-			err := loop.Send(&schedulerpb.FrontendToScheduler{
-				Type:            schedulerpb.ENQUEUE,
-				QueryID:         req.queryID,
-				UserID:          req.userID,
-				HttpRequest:     req.request,
+			msg := &schedulerpb.FrontendToScheduler{
+				Type:      schedulerpb.ENQUEUE,
+				QueryID:   req.queryID,
+				UserID:    req.tenantID,
+				QueuePath: req.actor,
+				Request: &schedulerpb.FrontendToScheduler_HttpRequest{
+					HttpRequest: req.request,
+				},
 				FrontendAddress: w.frontendAddr,
 				StatsEnabled:    req.statsEnabled,
-			})
+			}
 
+			if req.queryRequest != nil {
+				msg.Request = &schedulerpb.FrontendToScheduler_QueryRequest{
+					QueryRequest: req.queryRequest,
+				}
+			}
+
+			err := loop.Send(msg)
 			if err != nil {
 				req.enqueue <- enqueueResult{status: failed}
 				return err
@@ -301,21 +325,13 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 
 			case schedulerpb.ERROR:
 				req.enqueue <- enqueueResult{status: waitForResponse}
-				req.response <- &frontendv2pb.QueryResultRequest{
-					HttpResponse: &httpgrpc.HTTPResponse{
-						Code: http.StatusInternalServerError,
-						Body: []byte(err.Error()),
-					},
-				}
-
+				req.response <- ResponseTuple{nil, httpgrpc.Errorf(http.StatusInternalServerError, "%s", resp.Error)}
 			case schedulerpb.TOO_MANY_REQUESTS_PER_TENANT:
 				req.enqueue <- enqueueResult{status: waitForResponse}
-				req.response <- &frontendv2pb.QueryResultRequest{
-					HttpResponse: &httpgrpc.HTTPResponse{
-						Code: http.StatusTooManyRequests,
-						Body: []byte("too many outstanding requests"),
-					},
-				}
+				req.response <- ResponseTuple{nil, httpgrpc.Errorf(http.StatusTooManyRequests, "too many outstanding requests")}
+			default:
+				level.Error(w.log).Log("msg", "unknown response status from the scheduler", "status", resp.Status, "queryID", req.queryID)
+				req.enqueue <- enqueueResult{status: failed}
 			}
 
 		case reqID := <-w.cancelCh:
@@ -323,7 +339,6 @@ func (w *frontendSchedulerWorker) schedulerLoop(loop schedulerpb.SchedulerForFro
 				Type:    schedulerpb.CANCEL,
 				QueryID: reqID,
 			})
-
 			if err != nil {
 				return err
 			}

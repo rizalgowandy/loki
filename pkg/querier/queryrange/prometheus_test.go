@@ -5,26 +5,60 @@ import (
 	"io"
 	"testing"
 
-	"github.com/cortexproject/cortex/pkg/cortexpb"
-	"github.com/cortexproject/cortex/pkg/querier/queryrange"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/loghttp"
+	"github.com/grafana/loki/v3/pkg/loghttp"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/querier/queryrange/queryrangebase"
 )
 
 var emptyStats = `"stats": {
+	"index": {
+		"bloomFilterTime": 0,
+		"chunkRefsLookupTime": 0,
+		"postFilterChunks": 0,
+		"totalChunks": 0,
+		"totalStreams": 0,
+		"shardsDuration": 0,
+		"usedBloomFilters": false
+	},
 	"ingester" : {
 		"store": {
 			"chunksDownloadTime": 0,
+			"congestionControlLatency": 0,
 			"totalChunksRef": 0,
 			"totalChunksDownloaded": 0,
+			"chunkRefsFetchTime": 0,
+			"queryReferencedStructuredMetadata": false,
+			"pipelineWrapperFilteredLines": 0,
+			"chunkFetchFailures": 0,
 			"chunk" :{
 				"compressedBytes": 0,
 				"decompressedBytes": 0,
 				"decompressedLines": 0,
+				"decompressedStructuredMetadataBytes": 0,
 				"headChunkBytes": 0,
 				"headChunkLines": 0,
+				"headChunkStructuredMetadataBytes": 0,
+                "postFilterLines": 0,
 				"totalDuplicates": 0
+			},
+			"dataobj": {
+				"pageBatches": 0,
+				"pagesDownloaded": 0,
+				"pagesDownloadedBytes": 0,
+				"pagesScanned": 0,
+				"postFilterRows": 0,
+				"postPredicateRows": 0,
+				"postPredicateDecompressedBytes": 0,
+				"postPredicateStructuredMetadataBytes": 0,
+				"prePredicateDecompressedRows": 0,
+				"prePredicateDecompressedBytes": 0,
+				"prePredicateDecompressedStructuredMetadataBytes": 0,
+				"sectionsResolutionMaxTime": 0,
+				"totalPageDownloadTime": 0,
+				"totalRowsAvailable": 0,
+				"wireBytesTransferred": 0
 			}
 		},
 		"totalBatches": 0,
@@ -33,26 +67,143 @@ var emptyStats = `"stats": {
 		"totalReached": 0
 	},
 	"querier": {
+		"querierExecTime": 0,
 		"store": {
 			"chunksDownloadTime": 0,
+			"congestionControlLatency": 0,
 			"totalChunksRef": 0,
 			"totalChunksDownloaded": 0,
+			"chunkRefsFetchTime": 0,
+			"queryReferencedStructuredMetadata": false,
+			"pipelineWrapperFilteredLines": 0,
+			"chunkFetchFailures": 0,
 			"chunk" :{
 				"compressedBytes": 0,
 				"decompressedBytes": 0,
 				"decompressedLines": 0,
+				"decompressedStructuredMetadataBytes": 0,
 				"headChunkBytes": 0,
 				"headChunkLines": 0,
+				"headChunkStructuredMetadataBytes": 0,
+                "postFilterLines": 0,
 				"totalDuplicates": 0
+			},
+			"dataobj": {
+				"pageBatches": 0,
+				"pagesDownloaded": 0,
+				"pagesDownloadedBytes": 0,
+				"pagesScanned": 0,
+				"postFilterRows": 0,
+				"postPredicateRows": 0,
+				"postPredicateDecompressedBytes": 0,
+				"postPredicateStructuredMetadataBytes": 0,
+				"prePredicateDecompressedRows": 0,
+				"prePredicateDecompressedBytes": 0,
+				"prePredicateDecompressedStructuredMetadataBytes": 0,
+				"sectionsResolutionMaxTime": 0,
+				"totalPageDownloadTime": 0,
+				"totalRowsAvailable": 0,
+				"wireBytesTransferred": 0
 			}
+		}
+	},
+	"cache": {
+		"chunk": {
+			"entriesFound": 0,
+			"entriesRequested": 0,
+			"entriesStored": 0,
+			"bytesReceived": 0,
+			"bytesSent": 0,
+			"requests": 0,
+			"downloadTime": 0,
+			"queryLengthServed": 0
+		},
+		"index": {
+			"entriesFound": 0,
+			"entriesRequested": 0,
+			"entriesStored": 0,
+			"bytesReceived": 0,
+			"bytesSent": 0,
+			"requests": 0,
+			"downloadTime": 0,
+			"queryLengthServed": 0
+		},
+		"statsResult": {
+			"entriesFound": 0,
+			"entriesRequested": 0,
+			"entriesStored": 0,
+			"bytesReceived": 0,
+			"bytesSent": 0,
+			"requests": 0,
+			"downloadTime": 0,
+			"queryLengthServed": 0
+		},
+		"seriesResult": {
+			"entriesFound": 0,
+			"entriesRequested": 0,
+			"entriesStored": 0,
+			"bytesReceived": 0,
+			"bytesSent": 0,
+			"requests": 0,
+			"downloadTime": 0,
+			"queryLengthServed": 0
+		},
+		"labelResult": {
+			"entriesFound": 0,
+			"entriesRequested": 0,
+			"entriesStored": 0,
+			"bytesReceived": 0,
+			"bytesSent": 0,
+			"requests": 0,
+			"downloadTime": 0,
+			"queryLengthServed": 0
+		},
+		"volumeResult": {
+			"entriesFound": 0,
+			"entriesRequested": 0,
+			"entriesStored": 0,
+			"bytesReceived": 0,
+			"bytesSent": 0,
+			"requests": 0,
+			"downloadTime": 0,
+			"queryLengthServed": 0
+		},
+		"instantMetricResult": {
+			"entriesFound": 0,
+			"entriesRequested": 0,
+			"entriesStored": 0,
+			"bytesReceived": 0,
+			"bytesSent": 0,
+			"requests": 0,
+			"downloadTime": 0,
+			"queryLengthServed": 0
+		},
+		"result": {
+			"entriesFound": 0,
+			"entriesRequested": 0,
+			"entriesStored": 0,
+			"bytesReceived": 0,
+			"bytesSent": 0,
+			"requests": 0,
+			"downloadTime": 0,
+			"queryLengthServed": 0
 		}
 	},
 	"summary": {
 		"bytesProcessedPerSecond": 0,
 		"execTime": 0,
 		"linesProcessedPerSecond": 0,
+		"queueTime": 0,
+		"splits": 0,
+		"shards": 0,
+		"streamFirstQueries": 0,
+		"subqueries": 0,
+		"timestampFirstQueries": 0,
 		"totalBytesProcessed":0,
-		"totalLinesProcessed":0
+		"totalEntriesReturned":0,
+		"totalLinesProcessed":0,
+		"totalStructuredMetadataBytesProcessed": 0,
+        "totalPostFilterLines": 0
 	}
 }`
 
@@ -65,25 +216,26 @@ func Test_encodePromResponse(t *testing.T) {
 		{
 			"matrix",
 			&LokiPromResponse{
-				Response: &queryrange.PrometheusResponse{
-					Status: string(queryrange.StatusSuccess),
-					Data: queryrange.PrometheusData{
+				Response: &queryrangebase.PrometheusResponse{
+					Status:   queryrangebase.StatusSuccess,
+					Warnings: []string{"this is a warning"},
+					Data: queryrangebase.PrometheusData{
 						ResultType: loghttp.ResultTypeMatrix,
-						Result: []queryrange.SampleStream{
+						Result: []queryrangebase.SampleStream{
 							{
-								Labels: []cortexpb.LabelAdapter{
+								Labels: []logproto.LabelAdapter{
 									{Name: "foo", Value: "bar"},
 								},
-								Samples: []cortexpb.Sample{
+								Samples: []logproto.LegacySample{
 									{Value: 1, TimestampMs: 1000},
 									{Value: 1, TimestampMs: 2000},
 								},
 							},
 							{
-								Labels: []cortexpb.LabelAdapter{
+								Labels: []logproto.LabelAdapter{
 									{Name: "foo", Value: "buzz"},
 								},
-								Samples: []cortexpb.Sample{
+								Samples: []logproto.LegacySample{
 									{Value: 4, TimestampMs: 1000},
 									{Value: 5, TimestampMs: 2000},
 								},
@@ -94,6 +246,7 @@ func Test_encodePromResponse(t *testing.T) {
 			},
 			`{
 				"status": "success",
+				"warnings": ["this is a warning"],
 				"data": {
 					"resultType": "matrix",
 					"result": [
@@ -113,24 +266,25 @@ func Test_encodePromResponse(t *testing.T) {
 		{
 			"vector",
 			&LokiPromResponse{
-				Response: &queryrange.PrometheusResponse{
-					Status: string(queryrange.StatusSuccess),
-					Data: queryrange.PrometheusData{
+				Response: &queryrangebase.PrometheusResponse{
+					Status:   queryrangebase.StatusSuccess,
+					Warnings: []string{"this is a warning"},
+					Data: queryrangebase.PrometheusData{
 						ResultType: loghttp.ResultTypeVector,
-						Result: []queryrange.SampleStream{
+						Result: []queryrangebase.SampleStream{
 							{
-								Labels: []cortexpb.LabelAdapter{
+								Labels: []logproto.LabelAdapter{
 									{Name: "foo", Value: "bar"},
 								},
-								Samples: []cortexpb.Sample{
+								Samples: []logproto.LegacySample{
 									{Value: 1, TimestampMs: 1000},
 								},
 							},
 							{
-								Labels: []cortexpb.LabelAdapter{
+								Labels: []logproto.LabelAdapter{
 									{Name: "foo", Value: "buzz"},
 								},
-								Samples: []cortexpb.Sample{
+								Samples: []logproto.LegacySample{
 									{Value: 4, TimestampMs: 1000},
 								},
 							},
@@ -140,6 +294,7 @@ func Test_encodePromResponse(t *testing.T) {
 			},
 			`{
 				"status": "success",
+				"warnings": ["this is a warning"],
 				"data": {
 					"resultType": "vector",
 					"result": [
@@ -157,7 +312,6 @@ func Test_encodePromResponse(t *testing.T) {
 			}`,
 		},
 	} {
-		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
 			r, err := tt.resp.encode(context.Background())
 			require.NoError(t, err)

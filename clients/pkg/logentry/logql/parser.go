@@ -1,13 +1,14 @@
 package logql
 
 import (
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"text/scanner"
 
 	"github.com/prometheus/prometheus/model/labels"
+
+	logqlerr "github.com/grafana/loki/v3/pkg/logql/errors"
 )
 
 func init() {
@@ -44,7 +45,7 @@ func ParseMatchers(input string) ([]*labels.Matcher, error) {
 	}
 	matcherExpr, ok := expr.(*matchersExpr)
 	if !ok {
-		return nil, errors.New("only label matchers is supported")
+		return nil, logqlerr.ErrParseMatchers
 	}
 	return matcherExpr.matchers, nil
 }

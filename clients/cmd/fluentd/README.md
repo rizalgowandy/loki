@@ -2,18 +2,25 @@
 
 [Fluentd](https://fluentd.org/) is a data collector for unified logging layer, it can be configured with the Loki output plugin, provided in this folder, to ship logs to Loki.
 
-See [docs/client/fluentd/README.md](../../docs/sources/clients/fluentd/_index.md) for detailed information.
+See the [Fluentd documentation](../../../docs/sources/send-data/fluentd/_index.md) for detailed information.
+
+## Client certificates (mTLS)
+
+For mutual TLS in front of Loki, configure `cert`, `key`, and optionally `ca_cert`. A PEM `cert` file may include the leaf plus intermediate chain; **sending the full chain requires Ruby 3.0+**. See [Client certificate verification](../../../docs/sources/send-data/fluentd/_index.md#client-certificate-verification) in the Loki docs.
 
 ## Development
 
-After checking out the repo, run `bin/setup` to install dependencies. Then, run `bundle exec rake spec` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.
+After checking out the repo, run `bin/setup` to install dependencies. Then, run `bin/test` to run the tests. You can also run `bin/console` for an interactive prompt that will allow you to experiment.
 
-To install this gem onto your local machine, run `bundle exec rake install`. To release a new version, update the version number in `fluent-plugin-grafana-loki.gemspec`, and then run `bundle exec rake release`, which will create a git tag for the version, push git commits and tags, and push the `.gem` file to [rubygems.org](https://rubygems.org).
+To install this gem onto your local machine, run `ruby -S bundle exec rake install`. To release a new version, update the version number in `fluent-plugin-grafana-loki.gemspec`, and then run `ruby -S bundle exec rake release`, which will create a git tag for the version, push git commits and tags, and push the `.gem` file to [rubygems.org](https://rubygems.org).
 
-To create the gem: `gem build fluent-plugin-grafana-loki.gemspec`
+To create the gem: `ruby -S gem build fluent-plugin-grafana-loki.gemspec`
 
 Useful additions:
-  `gem install rubocop`
+
+```bash
+ruby -S gem install rubocop
+```
 
 ## Testing
 
@@ -78,6 +85,15 @@ The expected output is:
   }
 ]
 ```
+
+## Build and publish gem
+
+To build and publish a gem to
+[rubygems](https://rubygems.org/gems/fluent-plugin-grafana-loki) you first need
+to update the version in the `fluent-plugin-grafana-loki.gemspec` file.
+Then update the `VERSION` variable in the `Makefile` to match the new version number.
+Create a PR with the changes against the `main` branch und run `make
+fluentd-plugin-push` from the root of the project once the PR has been merged.
 
 ## Copyright
 

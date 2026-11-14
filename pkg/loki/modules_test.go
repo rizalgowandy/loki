@@ -1,15 +1,32 @@
 package loki
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/grafana/loki/pkg/storage/chunk"
+	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/services"
+	"github.com/prometheus/common/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/grafana/loki/v3/pkg/compactor"
+	"github.com/grafana/loki/v3/pkg/indexgateway"
+	loglinestore "github.com/grafana/loki/v3/pkg/logline/store"
+	"github.com/grafana/loki/v3/pkg/storage"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/local"
+	"github.com/grafana/loki/v3/pkg/storage/config"
+	bloomshipperconfig "github.com/grafana/loki/v3/pkg/storage/stores/shipper/bloomshipper/config"
+	"github.com/grafana/loki/v3/pkg/storage/stores/shipper/indexshipper"
+	"github.com/grafana/loki/v3/pkg/storage/types"
 )
 
 func Test_calculateMaxLookBack(t *testing.T) {
 	type args struct {
-		pc                chunk.PeriodConfig
+		pc                config.PeriodConfig
 		maxLookBackConfig time.Duration
 		minDuration       time.Duration
 	}
@@ -22,7 +39,7 @@ func Test_calculateMaxLookBack(t *testing.T) {
 		{
 			name: "default",
 			args: args{
-				pc: chunk.PeriodConfig{
+				pc: config.PeriodConfig{
 					ObjectType: "filesystem",
 				},
 				maxLookBackConfig: 0,
@@ -34,7 +51,7 @@ func Test_calculateMaxLookBack(t *testing.T) {
 		{
 			name: "infinite",
 			args: args{
-				pc: chunk.PeriodConfig{
+				pc: config.PeriodConfig{
 					ObjectType: "filesystem",
 				},
 				maxLookBackConfig: -1,
@@ -46,7 +63,7 @@ func Test_calculateMaxLookBack(t *testing.T) {
 		{
 			name: "invalid store type",
 			args: args{
-				pc: chunk.PeriodConfig{
+				pc: config.PeriodConfig{
 					ObjectType: "gcs",
 				},
 				maxLookBackConfig: -1,
@@ -58,7 +75,7 @@ func Test_calculateMaxLookBack(t *testing.T) {
 		{
 			name: "less than minDuration",
 			args: args{
-				pc: chunk.PeriodConfig{
+				pc: config.PeriodConfig{
 					ObjectType: "filesystem",
 				},
 				maxLookBackConfig: 1 * time.Hour,
@@ -78,6 +95,330 @@ func Test_calculateMaxLookBack(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("calculateMaxLookBack() got = %v, want %v", got, tt.want)
 			}
+		})
+	}
+}
+
+func prepareGlobalMetricsRegistry(t *testing.T) {
+	oldReg, oldGat := prometheus.DefaultRegisterer, prometheus.DefaultGatherer
+
+	reg := prometheus.NewRegistry()
+	prometheus.DefaultRegisterer, prometheus.DefaultGatherer = reg, reg
+
+	t.Cleanup(func() {
+		prometheus.DefaultRegisterer, prometheus.DefaultGatherer = oldReg, oldGat
+	})
+}
+
+func TestMultiKVSetup(t *testing.T) {
+	dir := t.TempDir()
+
+	for target, checkFn := range map[string]func(t *testing.T, c Config){
+		All: func(t *testing.T, c Config) {
+			require.NotNil(t, c.CompactorConfig.CompactorRing.KVStore.Multi.ConfigProvider)
+			require.NotNil(t, c.Distributor.DistributorRing.KVStore.Multi.ConfigProvider)
+			require.NotNil(t, c.IndexGateway.Ring.KVStore.Multi.ConfigProvider)
+			require.NotNil(t, c.Ingester.LifecyclerConfig.RingConfig.KVStore.Multi.ConfigProvider)
+			require.NotNil(t, c.QueryScheduler.SchedulerRing.KVStore.Multi.ConfigProvider)
+			require.NotNil(t, c.Ruler.Ring.KVStore.Multi.ConfigProvider)
+		},
+
+		Compactor: func(t *testing.T, c Config) {
+			require.NotNil(t, c.CompactorConfig.CompactorRing.KVStore.Multi.ConfigProvider)
+		},
+
+		Distributor: func(t *testing.T, c Config) {
+			require.NotNil(t, c.Ingester.LifecyclerConfig.RingConfig.KVStore.Multi.ConfigProvider)
+		},
+
+		IndexGateway: func(t *testing.T, c Config) {
+			require.NotNil(t, c.IndexGateway.Ring.KVStore.Multi.ConfigProvider)
+		},
+
+		Ingester: func(t *testing.T, c Config) {
+			require.NotNil(t, c.Ingester.LifecyclerConfig.RingConfig.KVStore.Multi.ConfigProvider)
+		},
+
+		QueryScheduler: func(t *testing.T, c Config) {
+			require.NotNil(t, c.QueryScheduler.SchedulerRing.KVStore.Multi.ConfigProvider)
+		},
+
+		Ruler: func(t *testing.T, c Config) {
+			require.NotNil(t, c.Ruler.Ring.KVStore.Multi.ConfigProvider)
+		},
+	} {
+		t.Run(target, func(test *testing.T) {
+			prepareGlobalMetricsRegistry(test)
+
+			cfg := minimalWorkingConfig(test, dir, target)
+			cfg.RuntimeConfig.LoadPath = []string{filepath.Join(dir, "config.yaml")}
+			c, err := New(cfg)
+			require.NoError(test, err)
+
+			_, err = c.ModuleManager.InitModuleServices(cfg.Target...)
+			require.NoError(test, err)
+			defer c.Server.Stop()
+
+			checkFn(test, c.Cfg)
+		})
+	}
+}
+
+func TestIndexGatewayClientConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Run("IndexGateway client is enabled when running querier target", func(t *testing.T) {
+		cfg := minimalWorkingConfig(t, dir, Querier)
+		c, err := New(cfg)
+		require.NoError(t, err)
+
+		services, err := c.ModuleManager.InitModuleServices(Querier)
+		defer func() {
+			for _, service := range services {
+				service.StopAsync()
+			}
+		}()
+
+		require.NoError(t, err)
+		assert.False(t, c.Cfg.StorageConfig.TSDBShipperConfig.IndexGatewayClientConfig.Disabled)
+	})
+}
+
+const localhost = "localhost"
+
+// TestIndexGatewayInterceptorsOrderedBeforeServer is a regression test for a
+// bug where initServer was called before initIndexGatewayInterceptors, resulting
+// in the interceptors not being effective.
+func TestIndexGatewayInterceptorsOrderedBeforeServer(t *testing.T) {
+	dir := t.TempDir()
+	cfg := minimalWorkingConfig(t, dir, IndexGateway)
+	c, err := New(cfg)
+	require.NoError(t, err)
+
+	require.Contains(t, c.ModuleManager.DependenciesForModule(Server), IndexGatewayInterceptors,
+		"Server must list IndexGatewayInterceptors as a dependency when target=index-gateway")
+}
+
+func minimalWorkingConfig(t *testing.T, dir, target string, cfgTransformers ...func(*Config)) Config {
+	prepareGlobalMetricsRegistry(t)
+
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+
+	// Set to 0 to find any free port.
+	cfg.Server.HTTPListenPort = 0
+	cfg.Server.GRPCListenPort = 0
+	cfg.Target = []string{target}
+
+	// This would be overwritten by the default values setting.
+	cfg.StorageConfig = storage.Config{
+		FSConfig: local.FSConfig{Directory: dir},
+		BloomShipperConfig: bloomshipperconfig.Config{
+			WorkingDirectory:    []string{filepath.Join(dir, "blooms")},
+			DownloadParallelism: 1,
+		},
+		TSDBShipperConfig: indexshipper.Config{
+			ActiveIndexDirectory: filepath.Join(dir, "index"),
+			CacheLocation:        filepath.Join(dir, "cache"),
+			Mode:                 indexshipper.ModeWriteOnly,
+			ResyncInterval:       24 * time.Hour,
+			IndexReaderMode:      indexshipper.DefaultIndexReaderMode,
+		},
+	}
+
+	// Disable some caches otherwise we'll get errors if we don't configure them
+	cfg.QueryRange.CacheLabelResults = false
+	cfg.QueryRange.CacheSeriesResults = false
+	cfg.QueryRange.CacheIndexStatsResults = false
+	cfg.QueryRange.CacheVolumeResults = false
+
+	cfg.SchemaConfig = config.SchemaConfig{
+		Configs: []config.PeriodConfig{
+			{
+				IndexType:  types.IndexTypeTSDB,
+				ObjectType: types.StorageTypeFileSystem,
+				IndexTables: config.IndexPeriodicTableConfig{
+					PeriodicTableConfig: config.PeriodicTableConfig{
+						Period: time.Hour * 24,
+					}},
+				Schema: "v11",
+				From: config.DayTime{
+					Time: model.Now(),
+				},
+			},
+		},
+	}
+
+	cfg.Common.InstanceAddr = localhost
+	cfg.MemberlistKV.AdvertiseAddr = localhost
+	cfg.Ingester.LifecyclerConfig.Addr = localhost
+	cfg.Distributor.DistributorRing.InstanceAddr = localhost
+	cfg.IndexGateway.Mode = indexgateway.SimpleMode
+	cfg.IndexGateway.Ring.InstanceAddr = localhost
+	cfg.CompactorConfig.CompactorRing.InstanceAddr = localhost
+	cfg.CompactorConfig.WorkingDirectory = filepath.Join(dir, "compactor")
+
+	cfg.Ruler.Ring.InstanceAddr = localhost
+	// "local" matches the ruler's local rule-store backend (pkg/ruler/rulestore/local.Name)
+	cfg.Ruler.StoreConfig.Type = "local"
+	cfg.Ruler.StoreConfig.Local.Directory = dir
+
+	cfg.Common.CompactorAddress = "http://localhost:0"
+	cfg.Common.PathPrefix = dir
+
+	for _, transformer := range cfgTransformers {
+		if transformer != nil {
+			transformer(&cfg)
+		}
+	}
+
+	return cfg
+}
+
+func TestInitPatternIngesterTee(t *testing.T) {
+	tests := []struct {
+		name           string
+		patternEnabled bool
+		kafkaIngestion bool
+	}{
+		{name: "disabled", patternEnabled: false},
+		{name: "disabled when the pattern ingester consumes from Kafka", patternEnabled: true, kafkaIngestion: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			loki := &Loki{}
+			loki.Cfg.Pattern.Enabled = tc.patternEnabled
+			loki.Cfg.Pattern.KafkaIngestion.Enabled = tc.kafkaIngestion
+
+			svc, err := loki.initPatternIngesterTee()
+			require.NoError(t, err)
+			require.Nil(t, svc)
+			require.Nil(t, loki.Tee)
+		})
+	}
+}
+
+// Puts both servers and an ingester in the service map, then checks only the
+// ingester comes back - if the servers wait on each other, neither shuts down.
+func TestServerServicesToWaitFor(t *testing.T) {
+	ingester := services.NewIdleService(nil, nil)
+	l := &Loki{serviceMap: map[string]services.Service{
+		Server:         services.NewIdleService(nil, nil),
+		InternalServer: services.NewIdleService(nil, nil),
+		Ingester:       ingester,
+	}}
+
+	require.Equal(t, []services.Service{ingester}, l.serverServicesToWaitFor())
+}
+
+func TestLoglineStoreConfigBorrowsIngesterWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		queryIngestersWithin time.Duration
+		want                 time.Duration
+	}{
+		{name: "querier value", queryIngestersWithin: 3 * time.Hour, want: 3 * time.Hour},
+		{name: "unset falls back to default", queryIngestersWithin: 0, want: loglinestore.DefaultQueryIngestersWithin},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l := &Loki{}
+			l.Cfg.Logline.Store.MinDate = "2026-01-01"
+			l.Cfg.Querier.QueryIngestersWithin = tc.queryIngestersWithin
+
+			cfg := l.loglineStoreConfig()
+			require.Equal(t, tc.want, cfg.QueryIngestersWithin)
+			require.Equal(t, "2026-01-01", cfg.MinDate)
+			// The shared section stays untouched.
+			require.Zero(t, l.Cfg.Logline.Store.QueryIngestersWithin)
+		})
+	}
+}
+
+func TestCompactorAddress(t *testing.T) {
+	const (
+		ownGRPCAddress = "10.0.0.1:9095"
+		mainGRPC       = "loki-main:9095"
+		compactorHTTP  = "http://compactor:3100"
+	)
+
+	for _, tc := range []struct {
+		name        string
+		target      []string
+		mode        string
+		grpcAddress string
+		httpAddress string
+		want        string
+		wantGRPC    bool
+		wantErr     bool
+	}{
+		{
+			name:     "all targets with the compactor disabled uses the own address",
+			target:   []string{All},
+			mode:     compactor.HorizontalScalingModeDisabled,
+			want:     ownGRPCAddress,
+			wantGRPC: true,
+		},
+		{
+			name:        "all targets with the main compactor uses the own address",
+			target:      []string{All},
+			mode:        compactor.HorizontalScalingModeMain,
+			grpcAddress: mainGRPC,
+			want:        ownGRPCAddress,
+			wantGRPC:    true,
+		},
+		{
+			name:        "all targets with a worker compactor uses the configured address",
+			target:      []string{All},
+			mode:        compactor.HorizontalScalingModeWorker,
+			grpcAddress: mainGRPC,
+			want:        mainGRPC,
+			wantGRPC:    true,
+		},
+		{
+			name:    "all targets with a worker compactor requires a configured address",
+			target:  []string{All},
+			mode:    compactor.HorizontalScalingModeWorker,
+			wantErr: true,
+		},
+		{
+			name:        "querier prefers the configured gRPC address",
+			target:      []string{Querier},
+			mode:        compactor.HorizontalScalingModeDisabled,
+			grpcAddress: mainGRPC,
+			httpAddress: compactorHTTP,
+			want:        mainGRPC,
+			wantGRPC:    true,
+		},
+		{
+			name:        "querier falls back to the configured HTTP address",
+			target:      []string{Querier},
+			mode:        compactor.HorizontalScalingModeDisabled,
+			httpAddress: compactorHTTP,
+			want:        compactorHTTP,
+		},
+		{
+			name:    "querier requires a configured address",
+			target:  []string{Querier},
+			mode:    compactor.HorizontalScalingModeDisabled,
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var loki Loki
+			loki.Cfg.Target = tc.target
+			loki.Cfg.Server.GRPCListenAddress = "10.0.0.1"
+			loki.Cfg.Server.GRPCListenPort = 9095
+			loki.Cfg.CompactorConfig.HorizontalScalingMode = tc.mode
+			loki.Cfg.Common.CompactorGRPCAddress = tc.grpcAddress
+			loki.Cfg.Common.CompactorAddress = tc.httpAddress
+
+			got, isGRPC, err := loki.compactorAddress()
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+			require.Equal(t, tc.wantGRPC, isGRPC)
 		})
 	}
 }

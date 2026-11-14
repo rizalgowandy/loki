@@ -2,15 +2,24 @@ package log
 
 import (
 	"bytes"
+	"encoding/base64"
 	"fmt"
-	"regexp"
+	"net/url"
+	"strconv"
 	"strings"
 	"text/template"
 	"text/template/parse"
+	"time"
 
 	"github.com/Masterminds/sprig/v3"
+	"github.com/grafana/regexp"
 
-	"github.com/grafana/loki/pkg/logqlmodel"
+	logqlerr "github.com/grafana/loki/v3/pkg/logql/errors"
+)
+
+const (
+	functionLineName      = "__line__"
+	functionTimestampName = "__timestamp__"
 )
 
 var (
@@ -29,18 +38,45 @@ var (
 		"TrimPrefix": strings.TrimPrefix,
 		"TrimSuffix": strings.TrimSuffix,
 		"TrimSpace":  strings.TrimSpace,
-		"regexReplaceAll": func(regex string, s string, repl string) string {
-			r := regexp.MustCompile(regex)
-			return r.ReplaceAllString(s, repl)
+		"regexReplaceAll": func(regex string, s string, repl string) (string, error) {
+			r, err := regexp.Compile(regex)
+			if err != nil {
+				return "", err
+			}
+			return r.ReplaceAllString(s, repl), nil
 		},
-		"regexReplaceAllLiteral": func(regex string, s string, repl string) string {
-			r := regexp.MustCompile(regex)
-			return r.ReplaceAllLiteralString(s, repl)
+		"regexReplaceAllLiteral": func(regex string, s string, repl string) (string, error) {
+			r, err := regexp.Compile(regex)
+			if err != nil {
+				return "", err
+			}
+			return r.ReplaceAllLiteralString(s, repl), nil
 		},
+		"count": func(regexsubstr string, s string) (int, error) {
+			r, err := regexp.Compile(regexsubstr)
+			if err != nil {
+				return 0, err
+			}
+			matches := r.FindAllStringIndex(s, -1)
+			return len(matches), nil
+		},
+		"urldecode":        url.QueryUnescape,
+		"urlencode":        url.QueryEscape,
+		"bytes":            convertBytes,
+		"duration":         convertDuration,
+		"duration_seconds": convertDuration,
+		"unixEpochMillis":  unixEpochMillis,
+		"unixEpochNanos":   unixEpochNanos,
+		"toDateInZone":     toDateInZone,
+		"unixToTime":       unixToTime,
+		"alignLeft":        alignLeft,
+		"alignRight":       alignRight,
+		"b64dec":           base64Decode,
 	}
 
 	// sprig template functions
 	templateFunctions = []string{
+		"b64enc",
 		"lower",
 		"upper",
 		"title",
@@ -80,8 +116,82 @@ var (
 		"toDate",
 		"now",
 		"unixEpoch",
+		"default",
 	}
 )
+
+func AddLineAndTimestampFunctions(currLine func() string, currTimestamp func() int64) map[string]interface{} {
+	functions := make(map[string]interface{}, len(functionMap)+2)
+	for k, v := range functionMap {
+		functions[k] = v
+	}
+	functions[functionLineName] = func() string {
+		return currLine()
+	}
+	functions[functionTimestampName] = func() time.Time {
+		return time.Unix(0, currTimestamp())
+	}
+	return functions
+}
+
+// toEpoch converts a string with Unix time to an time Value
+func unixToTime(epoch string) (time.Time, error) {
+	var ct time.Time
+	l := len(epoch)
+	i, err := strconv.ParseInt(epoch, 10, 64)
+	if err != nil {
+		return ct, fmt.Errorf("unable to parse time '%v': %w", epoch, err)
+	}
+	switch l {
+	case 5:
+		// days 19373
+		return time.Unix(i*86400, 0), nil
+	case 10:
+		// seconds 1673798889
+		return time.Unix(i, 0), nil
+	case 13:
+		// milliseconds 1673798889902
+		return time.Unix(0, i*1000*1000), nil
+	case 16:
+		// microseconds 1673798889902000
+		return time.Unix(0, i*1000), nil
+	case 19:
+		// nanoseconds 1673798889902000000
+		return time.Unix(0, i), nil
+	default:
+		return ct, fmt.Errorf("unable to parse time '%v': %w", epoch, err)
+	}
+}
+
+func unixEpochMillis(date time.Time) string {
+	return strconv.FormatInt(date.UnixMilli(), 10)
+}
+
+func unixEpochNanos(date time.Time) string {
+	return strconv.FormatInt(date.UnixNano(), 10)
+}
+
+func toDateInZone(fmt, zone, str string) time.Time {
+	loc, err := time.LoadLocation(zone)
+	if err != nil {
+		loc, _ = time.LoadLocation("UTC")
+	}
+	t, _ := time.ParseInLocation(fmt, str, loc)
+	return t
+}
+
+func base64Decode(v string) string {
+	if remainder := len(v) % 4; remainder != 0 && remainder != 1 {
+		v += strings.Repeat("=", 4-remainder)
+	}
+
+	data, err := base64.StdEncoding.DecodeString(v)
+	if err != nil {
+		return err.Error()
+	}
+
+	return string(data)
+}
 
 func init() {
 	sprigFuncMap := sprig.GenericFuncMap()
@@ -95,31 +205,90 @@ func init() {
 type LineFormatter struct {
 	*template.Template
 	buf *bytes.Buffer
+
+	currentLine []byte
+	currentTs   int64
+	simpleKey   string
+
+	// mayReadLine is true when the template text names __line__, the only way a template reads
+	// the line. It checks the text, so it is also true for a name inside a string.
+	mayReadLine bool
 }
 
 // NewFormatter creates a new log line formatter from a given text template.
 func NewFormatter(tmpl string) (*LineFormatter, error) {
-	t, err := template.New("line").Option("missingkey=zero").Funcs(functionMap).Parse(tmpl)
+	lf := &LineFormatter{
+		buf:         bytes.NewBuffer(make([]byte, 4096)),
+		mayReadLine: strings.Contains(tmpl, functionLineName),
+	}
+
+	functions := AddLineAndTimestampFunctions(func() string {
+		return unsafeGetString(lf.currentLine)
+	}, func() int64 {
+		return lf.currentTs
+	})
+
+	t, err := template.New("line").Option("missingkey=zero").Funcs(functions).Parse(tmpl)
 	if err != nil {
 		return nil, fmt.Errorf("invalid line template: %w", err)
 	}
-	return &LineFormatter{
-		Template: t,
-		buf:      bytes.NewBuffer(make([]byte, 4096)),
-	}, nil
+	lf.Template = t
+
+	// determine if the template is a simple key substitution, e.g. line_format `{{.message}}`
+	// if it is, save the key name and we can use it later to directly copy the string
+	// bytes of the value to avoid copying and allocating a new string.
+	if len(t.Root.Nodes) == 1 && t.Root.Nodes[0].Type() == parse.NodeAction {
+		actionNode := t.Root.Nodes[0].(*parse.ActionNode)
+		if len(actionNode.Pipe.Cmds) == 1 && len(actionNode.Pipe.Cmds[0].Args) == 1 {
+			if fieldNode, ok := actionNode.Pipe.Cmds[0].Args[0].(*parse.FieldNode); ok && len(fieldNode.Ident) == 1 {
+				lf.simpleKey = fieldNode.Ident[0]
+			}
+		}
+	}
+
+	return lf, nil
 }
 
-func (lf *LineFormatter) Process(line []byte, lbs *LabelsBuilder) ([]byte, bool) {
-	lf.buf.Reset()
+func (lf *LineFormatter) Process(ts int64, line []byte, lbs *LabelsBuilder) ([]byte, bool) {
+	if lf.simpleKey != "" {
+		if val, ok := lbs.Get(lf.simpleKey); ok {
+			return unsafeGetBytes(val), true
+		}
+		return []byte{}, true
+	}
 
-	if err := lf.Template.Execute(lf.buf, lbs.Labels().Map()); err != nil {
-		lbs.SetErr(errTemplateFormat)
+	lf.buf.Reset()
+	lf.currentLine = line
+	lf.currentTs = ts
+
+	// map now is taking from a pool
+	m, ret := lbs.Map()
+	defer func() {
+		if ret { // if we return the base map from the labels builder we should not put it back in the pool
+			smp.Put(m)
+		}
+	}()
+	if err := lf.Execute(lf.buf, m); err != nil {
+		lbs.SetErr(errTemplateFormat, err)
 		return line, true
 	}
-	// todo(cyriltovena): we might want to reuse the input line or a bytes buffer.
-	res := make([]byte, len(lf.buf.Bytes()))
-	copy(res, lf.buf.Bytes())
-	return res, true
+	return lf.buf.Bytes(), true
+}
+
+// Hints implements Stage.
+func (lf *LineFormatter) Hints() StageHints {
+	return StageHints{
+		// It sets __error__ when the template fails, which changes the output labels.
+		CanModifyLabels: true,
+		// It replaces the line with the formatted template.
+		CanModifyLine: true,
+		// It reads the line only through __line__.
+		ReadsLine: lf.mayReadLine,
+		// RequiredLabelNames lists only the labels that a template reads as .name. Other forms,
+		// such as {{ index . "k" }} or {{ range . }}, read labels that it does not list. The
+		// stage does not check the forms, so this is always true.
+		ReadsArbitraryLabels: true,
+	}
 }
 
 func (lf *LineFormatter) RequiredLabelNames() []string {
@@ -142,6 +311,11 @@ func listNodeFields(nodes []parse.Node) []string {
 			res = append(res, listNodeFieldsFromBranch(node)...)
 		case parse.NodeField:
 			res = append(res, node.(*parse.FieldNode).Ident...)
+		case parse.NodeVariable:
+			// $ is the root of the template data, so $.foo reads the label foo like .foo does.
+			if v := node.(*parse.VariableNode); len(v.Ident) > 1 && v.Ident[0] == "$" {
+				res = append(res, v.Ident[1:]...)
+			}
 		}
 	}
 	return res
@@ -214,6 +388,12 @@ type labelFormatter struct {
 type LabelsFormatter struct {
 	formats []labelFormatter
 	buf     *bytes.Buffer
+
+	currentLine []byte
+	currentTs   int64
+
+	// mayReadLine is true when the text of a template names __line__, even inside a string.
+	mayReadLine bool
 }
 
 // NewLabelsFormatter creates a new formatter that can format multiple labels at once.
@@ -225,21 +405,30 @@ func NewLabelsFormatter(fmts []LabelFmt) (*LabelsFormatter, error) {
 	}
 	formats := make([]labelFormatter, 0, len(fmts))
 
+	lf := &LabelsFormatter{
+		buf: bytes.NewBuffer(make([]byte, 1024)),
+	}
+
+	functions := AddLineAndTimestampFunctions(func() string {
+		return unsafeGetString(lf.currentLine)
+	}, func() int64 {
+		return lf.currentTs
+	})
+
 	for _, fm := range fmts {
 		toAdd := labelFormatter{LabelFmt: fm}
 		if !fm.Rename {
-			t, err := template.New("label").Option("missingkey=zero").Funcs(functionMap).Parse(fm.Value)
+			t, err := template.New("label").Option("missingkey=zero").Funcs(functions).Parse(fm.Value)
 			if err != nil {
 				return nil, fmt.Errorf("invalid template for label '%s': %s", fm.Name, err)
 			}
 			toAdd.tmpl = t
+			lf.mayReadLine = lf.mayReadLine || strings.Contains(fm.Value, functionLineName)
 		}
 		formats = append(formats, toAdd)
 	}
-	return &LabelsFormatter{
-		formats: formats,
-		buf:     bytes.NewBuffer(make([]byte, 1024)),
-	}, nil
+	lf.formats = formats
+	return lf, nil
 }
 
 func validate(fmts []LabelFmt) error {
@@ -247,7 +436,7 @@ func validate(fmts []LabelFmt) error {
 	// To avoid confusion we allow to have a label name only once per stage.
 	uniqueLabelName := map[string]struct{}{}
 	for _, f := range fmts {
-		if f.Name == logqlmodel.ErrorLabel {
+		if f.Name == logqlerr.ErrorLabel {
 			return fmt.Errorf("%s cannot be formatted", f.Name)
 		}
 		if _, ok := uniqueLabelName[f.Name]; ok {
@@ -258,28 +447,47 @@ func validate(fmts []LabelFmt) error {
 	return nil
 }
 
-func (lf *LabelsFormatter) Process(l []byte, lbs *LabelsBuilder) ([]byte, bool) {
-	var data interface{}
+func (lf *LabelsFormatter) Process(ts int64, l []byte, lbs *LabelsBuilder) ([]byte, bool) {
+	lf.currentLine = l
+	lf.currentTs = ts
+
+	m := smp.Get()
+	defer smp.Put(m)
 	for _, f := range lf.formats {
 		if f.Rename {
-			v, ok := lbs.Get(f.Value)
+			v, _, ok := lbs.GetWithCategory(f.Value)
 			if ok {
-				lbs.Set(f.Name, v)
+				lbs.Set(ParsedLabel, f.Name, v)
 				lbs.Del(f.Value)
 			}
 			continue
 		}
 		lf.buf.Reset()
-		if data == nil {
-			data = lbs.Labels().Map()
+		if len(m) == 0 {
+			lbs.IntoMap(m)
 		}
-		if err := f.tmpl.Execute(lf.buf, data); err != nil {
-			lbs.SetErr(errTemplateFormat)
+		if err := f.tmpl.Execute(lf.buf, m); err != nil {
+			lbs.SetErr(errTemplateFormat, err)
 			continue
 		}
-		lbs.Set(f.Name, lf.buf.String())
+		lbs.Set(ParsedLabel, f.Name, lf.buf.String())
 	}
 	return l, true
+}
+
+// Hints implements Stage.
+func (lf *LabelsFormatter) Hints() StageHints {
+	return StageHints{
+		// It renames or sets labels.
+		CanModifyLabels: true,
+		CanModifyLine:   false,
+		// It reads the line only through __line__.
+		ReadsLine: lf.mayReadLine,
+		// RequiredLabelNames lists only the labels that a template reads as .name. Other forms,
+		// such as {{ index . "k" }} or {{ range . }}, read labels that it does not list. The
+		// stage does not check the forms, so this is always true, even for a rename.
+		ReadsArbitraryLabels: true,
+	}
 }
 
 func (lf *LabelsFormatter) RequiredLabelNames() []string {
@@ -305,6 +513,61 @@ func trunc(c int, s string) string {
 	}
 	return s
 }
+
+func alignLeft(count int, src string) string {
+	runes := []rune(src)
+	l := len(runes)
+	if count < 0 || count == l {
+		return src
+	}
+	pad := count - l
+	if pad > 0 {
+		return src + strings.Repeat(" ", pad)
+	}
+	return string(runes[:count])
+}
+
+func alignRight(count int, src string) string {
+	runes := []rune(src)
+	l := len(runes)
+	if count < 0 || count == l {
+		return src
+	}
+	pad := count - l
+	if pad > 0 {
+		return strings.Repeat(" ", pad) + src
+	}
+	return string(runes[l-count:])
+}
+
+type Decolorizer struct{}
+
+// RegExp to select ANSI characters courtesy of https://github.com/acarl005/stripansi
+const ansiPattern = "[\u001B\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[a-zA-Z\\d]*)*)?\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PRZcf-ntqry=><~]))"
+
+var ansiRegex = regexp.MustCompile(ansiPattern)
+
+func NewDecolorizer() (*Decolorizer, error) {
+	return &Decolorizer{}, nil
+}
+
+func (Decolorizer) Process(_ int64, line []byte, _ *LabelsBuilder) ([]byte, bool) {
+	return ansiRegex.ReplaceAll(line, []byte{}), true
+}
+
+// Hints implements Stage.
+func (Decolorizer) Hints() StageHints {
+	return StageHints{
+		// It never touches labels.
+		CanModifyLabels: false,
+		// It strips ANSI colors from the line.
+		CanModifyLine:        true,
+		ReadsLine:            true,
+		ReadsArbitraryLabels: false,
+	}
+}
+
+func (Decolorizer) RequiredLabelNames() []string { return []string{} }
 
 // substring creates a substring of the given string.
 //

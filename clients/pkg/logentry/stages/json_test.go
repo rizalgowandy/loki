@@ -5,11 +5,12 @@ import (
 	"testing"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v4"
+
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var testJSONYamlSingleStageWithoutSource = `
@@ -77,15 +78,11 @@ func TestPipeline_JSON(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
 
 			pl, err := NewPipeline(util_log.Logger, loadConfig(testData.config), nil, prometheus.DefaultRegisterer)
-			if err != nil {
-				t.Fatal(err)
-			}
+			assert.NoError(t, err, "Expected pipeline creation to not result in error")
 			out := processEntries(pl, newEntry(nil, nil, testData.entry, time.Now()))[0]
 			assert.Equal(t, testData.expectedExtract, out.Extracted)
 		})
@@ -102,27 +99,20 @@ func TestYamlMapStructure(t *testing.T) {
 	t.Parallel()
 
 	// testing that we can use yaml data into mapstructure.
-	var mapstruct map[interface{}]interface{}
-	if err := yaml.Unmarshal([]byte(cfg), &mapstruct); err != nil {
-		t.Fatalf("error while un-marshalling config: %s", err)
-	}
-	p, ok := mapstruct["json"].(map[interface{}]interface{})
-	if !ok {
-		t.Fatalf("could not read parser %+v", mapstruct["json"])
-	}
+	var mapstruct map[string]interface{}
+	err := yaml.Unmarshal([]byte(cfg), &mapstruct)
+	assert.NoError(t, err, "error while un-marshalling config: %s", err)
+	p, ok := mapstruct["json"].(map[string]interface{})
+	assert.True(t, ok, "could not read parser %+v", mapstruct["json"])
 	got, err := parseJSONConfig(p)
-	if err != nil {
-		t.Fatalf("could not create parser from yaml: %s", err)
-	}
+	assert.NoError(t, err, "could not create parser from yaml: %s", err)
 	want := &JSONConfig{
 		Expressions: map[string]string{
 			"key1": "expression1",
 			"key2": "expression2.expression2",
 		},
 	}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("want: %+v got: %+v", want, got)
-	}
+	assert.True(t, reflect.DeepEqual(got, want), "want: %+v got: %+v", want, got)
 }
 
 func TestJSONConfig_validate(t *testing.T) {
@@ -187,20 +177,15 @@ func TestJSONConfig_validate(t *testing.T) {
 		},
 	}
 	for tName, tt := range tests {
-		tt := tt
 		t.Run(tName, func(t *testing.T) {
 			c, err := parseJSONConfig(tt.config)
-			if err != nil {
-				t.Fatalf("failed to create config: %s", err)
-			}
+			assert.NoError(t, err, "failed to create config: %s", err)
 			got, err := validateJSONConfig(c)
-			if (err != nil) != (tt.err != nil) {
-				t.Errorf("JSONConfig.validate() expected error = %v, actual error = %v", tt.err, err)
-				return
+			if tt.err != nil {
+				assert.NotNil(t, err, "JSONConfig.validate() expected error = %v, but got nil", tt.err)
 			}
-			if (err != nil) && (err.Error() != tt.err.Error()) {
-				t.Errorf("JSONConfig.validate() expected error = %v, actual error = %v", tt.err, err)
-				return
+			if err != nil {
+				assert.Equal(t, tt.err.Error(), err.Error(), "JSONConfig.validate() expected error = %v, actual error = %v", tt.err, err)
 			}
 			assert.Equal(t, tt.wantExprCount, len(got))
 		})
@@ -351,16 +336,33 @@ func TestJSONParser_Parse(t *testing.T) {
 		},
 	}
 	for tName, tt := range tests {
-		tt := tt
 		t.Run(tName, func(t *testing.T) {
 			t.Parallel()
 			p, err := New(util_log.Logger, nil, StageTypeJSON, tt.config, nil)
-			if err != nil {
-				t.Fatalf("failed to create json parser: %s", err)
-			}
+			assert.NoError(t, err, "failed to create json parser: %s", err)
 			out := processEntries(p, newEntry(tt.extracted, nil, tt.entry, time.Now()))[0]
 
 			assert.Equal(t, tt.expectedExtract, out.Extracted)
 		})
 	}
+}
+
+func TestValidateJSONDrop(t *testing.T) {
+	labels := map[string]string{"foo": "bar"}
+	matchConfig := JSONConfig{
+		DropMalformed: true,
+		Expressions:   map[string]string{"page": "page"},
+	}
+	s, err := newJSONStage(matchConfig)
+	assert.NoError(t, err, "withMatcher() error = %v", err)
+	assert.NotNil(t, s, "newJSONStage failed to create the pipeline stage and was nil")
+	out := processEntries(s, newEntry(map[string]interface{}{
+		"test_label": "unimportant value",
+	}, toLabelSet(labels), `{"page": 1, "fruits": ["apple", "peach"]}`, time.Now()))
+	assert.Equal(t, 1, len(out), "stage should have kept one valid json line but got %v", out)
+
+	out = processEntries(s, newEntry(map[string]interface{}{
+		"test_label": "unimportant value",
+	}, toLabelSet(labels), `{"page": 1, fruits": ["apple", "peach"]}`, time.Now()))
+	assert.Equal(t, 0, len(out), "stage should have kept zero valid json line but got %v", out)
 }

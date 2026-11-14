@@ -6,9 +6,9 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/docker/docker/daemon/logger"
-	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/go-plugins-helpers/sdk"
+	"github.com/moby/moby/v2/daemon/logger"
+	"github.com/moby/moby/v2/pkg/ioutils"
 )
 
 type StartLoggingRequest struct {
@@ -56,7 +56,7 @@ func handlers(h *sdk.Handler, d *driver) {
 		respond(nil, w)
 	})
 
-	h.HandleFunc("/LogDriver.Capabilities", func(w http.ResponseWriter, r *http.Request) {
+	h.HandleFunc("/LogDriver.Capabilities", func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(&CapabilitiesResponse{
 			Cap: logger.Capability{ReadLogs: true},
 		})

@@ -12,9 +12,11 @@ import (
 	consul "github.com/hashicorp/consul/api"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/grafana/dskit/closer"
 	"github.com/grafana/dskit/kv/codec"
 )
+
+// The max wait time allowed for mockKV operations, in order to have faster tests.
+const maxWaitTime = 100 * time.Millisecond
 
 type mockKV struct {
 	mtx     sync.Mutex
@@ -48,7 +50,7 @@ func NewInMemoryClientWithConfig(codec codec.Codec, cfg Config, logger log.Logge
 	// Create a closer function used to close the main loop and wait until it's done.
 	// We need to wait until done, otherwise the goroutine leak finder used in tests
 	// may still report it as leaked.
-	closer := closer.Func(func() error {
+	closer := closerFunc(func() error {
 		close(m.close)
 		m.closeWG.Wait()
 		return nil
@@ -67,6 +69,12 @@ func NewInMemoryClientWithConfig(codec codec.Codec, cfg Config, logger log.Logge
 	}, closer
 }
 
+type closerFunc func() error
+
+func (c closerFunc) Close() error {
+	return c()
+}
+
 func copyKVPair(in *consul.KVPair) *consul.KVPair {
 	out := *in
 	out.Value = make([]byte, len(in.Value))
@@ -82,7 +90,7 @@ func (m *mockKV) loop() {
 		select {
 		case <-m.close:
 			return
-		case <-time.After(time.Second):
+		case <-time.After(maxWaitTime):
 			m.mtx.Lock()
 			m.cond.Broadcast()
 			m.mtx.Unlock()
@@ -90,7 +98,7 @@ func (m *mockKV) loop() {
 	}
 }
 
-func (m *mockKV) Put(p *consul.KVPair, q *consul.WriteOptions) (*consul.WriteMeta, error) {
+func (m *mockKV) Put(p *consul.KVPair, _ *consul.WriteOptions) (*consul.WriteMeta, error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 
@@ -114,7 +122,7 @@ func (m *mockKV) Put(p *consul.KVPair, q *consul.WriteOptions) (*consul.WriteMet
 	return nil, nil
 }
 
-func (m *mockKV) CAS(p *consul.KVPair, q *consul.WriteOptions) (bool, *consul.WriteMeta, error) {
+func (m *mockKV) CAS(p *consul.KVPair, _ *consul.WriteOptions) (bool, *consul.WriteMeta, error) {
 	level.Debug(m.logger).Log("msg", "CAS", "key", p.Key, "modify_index", p.ModifyIndex, "value", fmt.Sprintf("%.40q", p.Value))
 
 	m.mtx.Lock()
@@ -221,7 +229,7 @@ func (m *mockKV) List(prefix string, q *consul.QueryOptions) (consul.KVPairs, *c
 	return result, &consul.QueryMeta{LastIndex: m.current}, nil
 }
 
-func (m *mockKV) Delete(key string, q *consul.WriteOptions) (*consul.WriteMeta, error) {
+func (m *mockKV) Delete(key string, _ *consul.WriteOptions) (*consul.WriteMeta, error) {
 	m.mtx.Lock()
 	defer m.mtx.Unlock()
 	delete(m.kvps, key)
@@ -253,7 +261,6 @@ func (m *mockKV) ResetIndexForKey(key string) {
 // mockedMaxWaitTime returns the minimum duration between the input duration
 // and the max wait time allowed in this mock, in order to have faster tests.
 func mockedMaxWaitTime(queryWaitTime time.Duration) time.Duration {
-	const maxWaitTime = time.Second
 	if queryWaitTime > maxWaitTime {
 		return maxWaitTime
 	}

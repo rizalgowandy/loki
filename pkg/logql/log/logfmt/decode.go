@@ -8,6 +8,15 @@ import (
 	"unicode/utf8"
 )
 
+// special marks the bytes that the key and unquoted value loops must check.
+// The loops skip all other bytes.
+var special = func() (t [256]bool) {
+	for c := range t {
+		t[c] = c <= ' ' || c == '=' || c == '"' || c >= utf8.RuneSelf
+	}
+	return t
+}()
+
 // A Decoder reads and decodes logfmt records from an input stream.
 type Decoder struct {
 	pos   int
@@ -32,6 +41,10 @@ func (dec *Decoder) Reset(line []byte) {
 	dec.err = nil
 }
 
+func (dec *Decoder) EOL() bool {
+	return dec.pos >= len(dec.line)
+}
+
 // ScanKeyval advances the Decoder to the next key/value pair of the current
 // record, which can then be retrieved with the Key and Value methods. It
 // returns false when decoding stops, either by reaching the end of the
@@ -40,6 +53,7 @@ func (dec *Decoder) ScanKeyval() bool {
 	dec.key, dec.value = nil, nil
 
 	line := dec.line
+
 	// garbage
 	for p, c := range line[dec.pos:] {
 		if c > ' ' {
@@ -55,6 +69,9 @@ key:
 
 	start, multibyte := dec.pos, false
 	for p, c := range line[dec.pos:] {
+		if !special[c] {
+			continue
+		}
 		switch {
 		case c == '=':
 			dec.pos += p
@@ -62,18 +79,18 @@ key:
 				dec.key = line[start:dec.pos]
 				if multibyte && bytes.ContainsRune(dec.key, utf8.RuneError) {
 					dec.syntaxError(invalidKeyError)
-					return false
+					goto skip_value
 				}
 			}
 			if dec.key == nil {
 				dec.unexpectedByte(c)
-				return false
+				goto skip_value
 			}
 			goto equal
 		case c == '"':
 			dec.pos += p
 			dec.unexpectedByte(c)
-			return false
+			goto skip_value
 		case c <= ' ':
 			dec.pos += p
 			if dec.pos > start {
@@ -113,11 +130,14 @@ equal:
 	// value
 	start = dec.pos
 	for p, c := range line[dec.pos:] {
+		if !special[c] {
+			continue
+		}
 		switch {
 		case c == '=' || c == '"':
 			dec.pos += p
 			dec.unexpectedByte(c)
-			return false
+			goto skip_value
 		case c <= ' ':
 			dec.pos += p
 			if dec.pos > start {
@@ -132,11 +152,34 @@ equal:
 	}
 	return true
 
+skip_value:
+	for p, c := range line[dec.pos:] {
+		if c <= ' ' {
+			dec.pos += p
+			return false
+		}
+	}
+
+	dec.pos = len(line)
+	return false
+
 qvalue:
 	const (
 		untermQuote  = "unterminated quoted value"
 		invalidQuote = "invalid quoted value"
 	)
+
+	// Most quoted values hold no escape. For those, bytes.IndexByte finds the closing quote
+	// faster than the loop below.
+	rest := line[dec.pos+1:]
+	if end := bytes.IndexByte(rest, '"'); end >= 0 && bytes.IndexByte(rest[:end], '\\') < 0 {
+		// Add 1 for the opening quote and 1 to move past the closing quote.
+		dec.pos += end + 2
+		if end > 0 {
+			dec.value = rest[:end]
+		}
+		return true
+	}
 
 	hasEsc, esc := false, false
 	start = dec.pos

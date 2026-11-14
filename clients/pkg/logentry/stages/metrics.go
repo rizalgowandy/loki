@@ -3,7 +3,6 @@ package stages
 import (
 	"fmt"
 	"math"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -15,7 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 
-	"github.com/grafana/loki/clients/pkg/logentry/metric"
+	"github.com/grafana/loki/v3/clients/pkg/logentry/metric"
 )
 
 const (
@@ -128,11 +127,11 @@ func newMetricStage(logger log.Logger, config interface{}, registry prometheus.R
 			metrics[name] = collector
 		}
 	}
-	return toStage(&metricStage{
+	return &metricStage{
 		logger:  logger,
 		cfg:     *cfgs,
 		metrics: metrics,
-	}), nil
+	}, nil
 }
 
 // metricStage creates and updates prometheus metrics based on extracted pipeline data
@@ -142,18 +141,31 @@ type metricStage struct {
 	metrics map[string]prometheus.Collector
 }
 
+func (m *metricStage) Run(in chan Entry) chan Entry {
+	out := make(chan Entry)
+	go func() {
+		defer close(out)
+
+		for e := range in {
+			m.Process(e.Labels, e.Extracted, &e.Timestamp, &e.Line)
+			out <- e
+		}
+	}()
+	return out
+}
+
 // Process implements Stage
-func (m *metricStage) Process(labels model.LabelSet, extracted map[string]interface{}, t *time.Time, entry *string) {
+func (m *metricStage) Process(labels model.LabelSet, extracted map[string]interface{}, _ *time.Time, entry *string) {
 	for name, collector := range m.metrics {
 		// There is a special case for counters where we count even if there is no match in the extracted map.
 		if c, ok := collector.(*metric.Counters); ok {
 			if c != nil && c.Cfg.MatchAll != nil && *c.Cfg.MatchAll {
 				if c.Cfg.CountBytes != nil && *c.Cfg.CountBytes {
 					if entry != nil {
-						m.recordCounter(name, c, labels, len(*entry))
+						m.recordCounter(c, labels, len(*entry))
 					}
 				} else {
-					m.recordCounter(name, c, labels, nil)
+					m.recordCounter(c, labels, nil)
 				}
 				continue
 			}
@@ -161,11 +173,11 @@ func (m *metricStage) Process(labels model.LabelSet, extracted map[string]interf
 		if v, ok := extracted[*m.cfg[name].Source]; ok {
 			switch vec := collector.(type) {
 			case *metric.Counters:
-				m.recordCounter(name, vec, labels, v)
+				m.recordCounter(vec, labels, v)
 			case *metric.Gauges:
-				m.recordGauge(name, vec, labels, v)
+				m.recordGauge(vec, labels, v)
 			case *metric.Histograms:
-				m.recordHistogram(name, vec, labels, v)
+				m.recordHistogram(vec, labels, v)
 			}
 		} else {
 			level.Debug(m.logger).Log("msg", "source does not exist", "err", fmt.Sprintf("source: %s, does not exist", *m.cfg[name].Source))
@@ -178,17 +190,27 @@ func (m *metricStage) Name() string {
 	return StageTypeMetric
 }
 
+// Cleanup implements Stage.
+func (m *metricStage) Cleanup() {
+	for _, collector := range m.metrics {
+		switch vec := collector.(type) {
+		case *metric.Counters:
+			vec.DeleteAll()
+		case *metric.Gauges:
+			vec.DeleteAll()
+		case *metric.Histograms:
+			vec.DeleteAll()
+		}
+	}
+}
+
 // recordCounter will update a counter metric
-func (m *metricStage) recordCounter(name string, counter *metric.Counters, labels model.LabelSet, v interface{}) {
+// nolint:goconst
+func (m *metricStage) recordCounter(counter *metric.Counters, labels model.LabelSet, v interface{}) {
 	// If value matching is defined, make sure value matches.
 	if counter.Cfg.Value != nil {
 		stringVal, err := getString(v)
 		if err != nil {
-			if Debug {
-				level.Debug(m.logger).Log("msg", "failed to convert extracted value to string, "+
-					"can't perform value comparison", "metric", name, "err",
-					fmt.Sprintf("can't convert %v to string", reflect.TypeOf(v)))
-			}
 			return
 		}
 		if *counter.Cfg.Value != stringVal {
@@ -202,9 +224,6 @@ func (m *metricStage) recordCounter(name string, counter *metric.Counters, label
 	case metric.CounterAdd:
 		f, err := getFloat(v)
 		if err != nil {
-			if Debug {
-				level.Debug(m.logger).Log("msg", "failed to convert extracted value to positive float", "metric", name, "err", err)
-			}
 			return
 		}
 		counter.With(labels).Add(f)
@@ -212,16 +231,11 @@ func (m *metricStage) recordCounter(name string, counter *metric.Counters, label
 }
 
 // recordGauge will update a gauge metric
-func (m *metricStage) recordGauge(name string, gauge *metric.Gauges, labels model.LabelSet, v interface{}) {
+func (m *metricStage) recordGauge(gauge *metric.Gauges, labels model.LabelSet, v interface{}) {
 	// If value matching is defined, make sure value matches.
 	if gauge.Cfg.Value != nil {
 		stringVal, err := getString(v)
 		if err != nil {
-			if Debug {
-				level.Debug(m.logger).Log("msg", "failed to convert extracted value to string, "+
-					"can't perform value comparison", "metric", name, "err",
-					fmt.Sprintf("can't convert %v to string", reflect.TypeOf(v)))
-			}
 			return
 		}
 		if *gauge.Cfg.Value != stringVal {
@@ -233,9 +247,6 @@ func (m *metricStage) recordGauge(name string, gauge *metric.Gauges, labels mode
 	case metric.GaugeSet:
 		f, err := getFloat(v)
 		if err != nil {
-			if Debug {
-				level.Debug(m.logger).Log("msg", "failed to convert extracted value to positive float", "metric", name, "err", err)
-			}
 			return
 		}
 		gauge.With(labels).Set(f)
@@ -246,18 +257,12 @@ func (m *metricStage) recordGauge(name string, gauge *metric.Gauges, labels mode
 	case metric.GaugeAdd:
 		f, err := getFloat(v)
 		if err != nil {
-			if Debug {
-				level.Debug(m.logger).Log("msg", "failed to convert extracted value to positive float", "metric", name, "err", err)
-			}
 			return
 		}
 		gauge.With(labels).Add(f)
 	case metric.GaugeSub:
 		f, err := getFloat(v)
 		if err != nil {
-			if Debug {
-				level.Debug(m.logger).Log("msg", "failed to convert extracted value to positive float", "metric", name, "err", err)
-			}
 			return
 		}
 		gauge.With(labels).Sub(f)
@@ -265,16 +270,11 @@ func (m *metricStage) recordGauge(name string, gauge *metric.Gauges, labels mode
 }
 
 // recordHistogram will update a Histogram metric
-func (m *metricStage) recordHistogram(name string, histogram *metric.Histograms, labels model.LabelSet, v interface{}) {
+func (m *metricStage) recordHistogram(histogram *metric.Histograms, labels model.LabelSet, v interface{}) {
 	// If value matching is defined, make sure value matches.
 	if histogram.Cfg.Value != nil {
 		stringVal, err := getString(v)
 		if err != nil {
-			if Debug {
-				level.Debug(m.logger).Log("msg", "failed to convert extracted value to string, "+
-					"can't perform value comparison", "metric", name, "err",
-					fmt.Sprintf("can't convert %v to string", reflect.TypeOf(v)))
-			}
 			return
 		}
 		if *histogram.Cfg.Value != stringVal {
@@ -283,9 +283,6 @@ func (m *metricStage) recordHistogram(name string, histogram *metric.Histograms,
 	}
 	f, err := getFloat(v)
 	if err != nil {
-		if Debug {
-			level.Debug(m.logger).Log("msg", "failed to convert extracted value to float", "metric", name, "err", err)
-		}
 		return
 	}
 	histogram.With(labels).Observe(f)
@@ -311,7 +308,7 @@ func getFloat(unk interface{}) (float64, error) {
 	case uint:
 		return float64(i), nil
 	case string:
-		return strconv.ParseFloat(i, 64)
+		return getFloatFromString(i)
 	case bool:
 		if i {
 			return float64(1), nil
@@ -320,4 +317,23 @@ func getFloat(unk interface{}) (float64, error) {
 	default:
 		return math.NaN(), fmt.Errorf("can't convert %v to float64", unk)
 	}
+}
+
+// getFloatFromString converts string into float64
+// Two types of string formats are supported:
+//   - strings that represent floating point numbers, e.g., "0.804"
+//   - duration format strings, e.g., "0.5ms", "10h".
+//     Valid time units are "ns", "us", "ms", "s", "m", "h".
+//     Values in this format are converted as a floating point number of seconds.
+//     E.g., "0.5ms" is converted to 0.0005
+func getFloatFromString(str string) (float64, error) {
+	dur, err := strconv.ParseFloat(str, 64)
+	if err != nil {
+		dur, err := time.ParseDuration(str)
+		if err != nil {
+			return 0, err
+		}
+		return dur.Seconds(), nil
+	}
+	return dur, nil
 }

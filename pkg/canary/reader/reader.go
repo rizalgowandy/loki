@@ -2,10 +2,10 @@ package reader
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -21,11 +21,13 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/config"
 
-	"github.com/grafana/loki/pkg/loghttp"
-	"github.com/grafana/loki/pkg/logqlmodel"
-	"github.com/grafana/loki/pkg/util/build"
-	"github.com/grafana/loki/pkg/util/unmarshal"
+	"github.com/grafana/loki/v3/pkg/loghttp"
+	logqlmodel "github.com/grafana/loki/v3/pkg/logql/model"
+	"github.com/grafana/loki/v3/pkg/util/build"
+	"github.com/grafana/loki/v3/pkg/util/httpreq"
+	"github.com/grafana/loki/v3/pkg/util/unmarshal"
 )
 
 var (
@@ -39,56 +41,144 @@ var (
 		Name:      "ws_pings_total",
 		Help:      "counts every time the websocket receives a ping message",
 	})
+	otlpValidationErrors = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "loki_canary",
+		Name:      "otlp_validation_errors_total",
+		Help:      "counts returned log entries with missing or mismatched OTLP canary attributes, including repeated observations",
+	})
 	userAgent = fmt.Sprintf("loki-canary/%s", build.Version)
 )
 
 type LokiReader interface {
 	Query(start time.Time, end time.Time) ([]time.Time, error)
-	QueryCountOverTime(queryRange string) (float64, error)
+	QueryCountOverTime(queryRange string, now time.Time, cache bool) (float64, error)
 }
 
 type Reader struct {
-	header       http.Header
-	tls          bool
-	addr         string
-	user         string
-	pass         string
-	tenantID     string
-	queryTimeout time.Duration
-	sName        string
-	sValue       string
-	lName        string
-	lVal         string
-	backoff      *backoff.Backoff
-	nextQuery    time.Time
-	backoffMtx   sync.RWMutex
-	interval     time.Duration
-	conn         *websocket.Conn
-	w            io.Writer
-	recv         chan time.Time
-	quit         chan struct{}
-	shuttingDown bool
-	done         chan struct{}
+	header          http.Header
+	useTLS          bool
+	clientTLSConfig *tls.Config
+	caFile          string
+	addr            string
+	pathPrefix      string
+	user            string
+	pass            string
+	bearerToken     config.SecretReader
+	tenantID        string
+	httpClient      *http.Client
+	queryTimeout    time.Duration
+	backoff         *backoff.Backoff
+	nextQuery       time.Time
+	backoffMtx      sync.RWMutex
+	interval        time.Duration
+	connMtx         sync.Mutex // guards conn, which Stop closes to unblock a pending read in run
+	conn            *websocket.Conn
+	w               io.Writer
+	recv            chan time.Time
+	quit            chan struct{}
+	done            chan struct{}
+	queryAppend     string
+	labelSelector   string
+	validateOTLP    bool
+}
+
+func buildLabelSelector(labels, sName, sValue, lName, lVal string) (string, error) {
+	if labels != "" {
+		var lbls []string
+		for _, label := range strings.Split(labels, ",") {
+			labelParts := strings.SplitN(label, "=", 2)
+			if len(labelParts) != 2 {
+				return "", fmt.Errorf("invalid label format: %s, expected key=value", label)
+			}
+			lbls = append(lbls, fmt.Sprintf("%s=\"%s\"", labelParts[0], labelParts[1]))
+		}
+		return fmt.Sprintf("{%s}", strings.Join(lbls, ",")), nil
+	}
+	return fmt.Sprintf("{%s=\"%s\",%s=\"%s\"}", sName, sValue, lName, lVal), nil
+}
+
+func (r *Reader) buildMetricQuery(queryRange string) string {
+	queryAppend := r.queryAppend
+	if r.validateOTLP {
+		// The per-record attribute must not create a series for each timestamp.
+		queryAppend = strings.TrimSpace(queryAppend + " | drop canary_timestamp")
+	}
+	if queryAppend != "" {
+		return fmt.Sprintf("count_over_time(%s %s[%s])", r.labelSelector, queryAppend, queryRange)
+	}
+	return fmt.Sprintf("count_over_time(%s[%s])", r.labelSelector, queryRange)
 }
 
 func NewReader(writer io.Writer,
 	receivedChan chan time.Time,
-	tls bool,
+	useTLS bool,
+	tlsConfig *tls.Config,
+	caFile, certFile, keyFile string,
 	address string,
+	pathPrefix string,
 	user string,
 	pass string,
+	bearerTokenFile string,
 	tenantID string,
 	queryTimeout time.Duration,
 	labelName string,
 	labelVal string,
 	streamName string,
 	streamValue string,
-	interval time.Duration) *Reader {
+	interval time.Duration,
+	queryAppend string,
+	labels string,
+	validateOTLP bool,
+) (*Reader, error) {
+	if user != "" && bearerTokenFile != "" {
+		return nil, fmt.Errorf("at most one of basic authentication and bearer token authentication may be configured")
+	}
+
 	h := http.Header{}
+	if validateOTLP {
+		// Keep structured metadata separate from stream labels for validation
+		// on both the websocket and historical query responses.
+		h.Set(httpreq.LokiEncodingFlagsHeader, string(httpreq.FlagCategorizeLabels))
+	}
+
+	// http.DefaultClient will be used in the case that the connection to Loki is http or TLS without client certs.
+	httpClient := http.DefaultClient
+	if tlsConfig != nil && (certFile != "" || keyFile != "" || caFile != "") {
+		// For the mTLS case, use a http.Client configured with the client side certificates.
+		tlsSettings := config.TLSRoundTripperSettings{
+			CA:   config.NewFileSecret(caFile),
+			Cert: config.NewFileSecret(certFile),
+			Key:  config.NewFileSecret(keyFile),
+		}
+		rt, err := config.NewTLSRoundTripper(tlsConfig, tlsSettings, func(tls *tls.Config) (http.RoundTripper, error) {
+			return &http.Transport{TLSClientConfig: tls}, nil
+		})
+		if err != nil {
+			return nil, errors.Wrapf(err, "Failed to create HTTPS transport with mTLS config")
+		}
+		httpClient = &http.Client{Transport: rt}
+	} else if tlsConfig != nil {
+		// non-mutual TLS
+		httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig}}
+	}
+
+	var bearerToken config.SecretReader
+	if bearerTokenFile != "" {
+		bearerToken = config.NewFileSecret(bearerTokenFile)
+		transport := httpClient.Transport
+		if transport == nil {
+			transport = http.DefaultTransport
+		}
+		httpClient = &http.Client{
+			Transport: config.NewAuthorizationCredentialsRoundTripper("Bearer", bearerToken, transport),
+		}
+	}
+
 	if user != "" {
-		h = http.Header{"Authorization": {"Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))}}
-	} else if tenantID != "" {
-		h = http.Header{"X-Scope-OrgID": {tenantID}}
+		h.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+pass)))
+	}
+	if tenantID != "" {
+		h.Set("X-Scope-OrgID", tenantID)
 	}
 
 	next := time.Now()
@@ -99,53 +189,99 @@ func NewReader(writer io.Writer,
 	}
 	bkoff := backoff.New(context.Background(), bkcfg)
 
+	labelSel, err := buildLabelSelector(labels, streamName, streamValue, labelName, labelVal)
+	if err != nil {
+		return nil, err
+	}
+
+	prefix, err := url.JoinPath(pathPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("invalid path prefix %q: %w", pathPrefix, err)
+	}
+
 	rd := Reader{
-		header:       h,
-		tls:          tls,
-		addr:         address,
-		user:         user,
-		pass:         pass,
-		tenantID:     tenantID,
-		queryTimeout: queryTimeout,
-		sName:        streamName,
-		sValue:       streamValue,
-		lName:        labelName,
-		lVal:         labelVal,
-		nextQuery:    next,
-		backoff:      bkoff,
-		interval:     interval,
-		w:            writer,
-		recv:         receivedChan,
-		quit:         make(chan struct{}),
-		done:         make(chan struct{}),
-		shuttingDown: false,
+		header:          h,
+		useTLS:          useTLS,
+		clientTLSConfig: tlsConfig,
+		caFile:          caFile,
+		addr:            address,
+		pathPrefix:      prefix,
+		user:            user,
+		pass:            pass,
+		bearerToken:     bearerToken,
+		tenantID:        tenantID,
+		queryTimeout:    queryTimeout,
+		httpClient:      httpClient,
+		nextQuery:       next,
+		backoff:         bkoff,
+		interval:        interval,
+		w:               writer,
+		recv:            receivedChan,
+		quit:            make(chan struct{}),
+		done:            make(chan struct{}),
+		queryAppend:     queryAppend,
+		labelSelector:   labelSel,
+		validateOTLP:    validateOTLP,
 	}
 
 	go rd.run()
 
-	go func() {
-		<-rd.quit
-		if rd.conn != nil {
-			fmt.Fprintf(rd.w, "shutting down reader\n")
-			rd.shuttingDown = true
-			_ = rd.conn.Close()
-		}
-	}()
-
-	return &rd
+	return &rd, nil
 }
 
 func (r *Reader) Stop() {
 	if r.quit != nil {
 		close(r.quit)
+		// Closing the connection unblocks a pending read in run, which then
+		// observes the closed quit channel and exits.
+		r.connMtx.Lock()
+		if r.conn != nil {
+			fmt.Fprintf(r.w, "shutting down reader\n")
+			_ = r.conn.Close()
+		}
+		r.connMtx.Unlock()
 		<-r.done
 		r.quit = nil
 	}
 }
 
+// shuttingDown reports whether Stop has been called.
+func (r *Reader) shuttingDown() bool {
+	select {
+	case <-r.quit:
+		return true
+	default:
+		return false
+	}
+}
+
+// wait blocks for d or until Stop is called, whichever happens first.
+func (r *Reader) wait(d time.Duration) {
+	select {
+	case <-time.After(d):
+	case <-r.quit:
+	}
+}
+
+// currentConn returns the current websocket connection.
+func (r *Reader) currentConn() *websocket.Conn {
+	r.connMtx.Lock()
+	defer r.connMtx.Unlock()
+	return r.conn
+}
+
+// swapConn replaces the websocket connection and returns the previous one.
+func (r *Reader) swapConn(c *websocket.Conn) *websocket.Conn {
+	r.connMtx.Lock()
+	defer r.connMtx.Unlock()
+	old := r.conn
+	r.conn = c
+	return old
+}
+
 // QueryCountOverTime will ask Loki for a count of logs over the provided range e.g. 5m
 // QueryCountOverTime blocks if a previous query has failed until the appropriate backoff time has been reached.
-func (r *Reader) QueryCountOverTime(queryRange string) (float64, error) {
+func (r *Reader) QueryCountOverTime(queryRange string, now time.Time, cache bool) (float64, error) {
 	r.backoffMtx.RLock()
 	next := r.nextQuery
 	r.backoffMtx.RUnlock()
@@ -158,18 +294,25 @@ func (r *Reader) QueryCountOverTime(queryRange string) (float64, error) {
 	}
 
 	scheme := "http"
-	if r.tls {
+	if r.useTLS {
 		scheme = "https"
 	}
+
+	queryPath, err := url.JoinPath(r.pathPrefix, "/loki/api/v1/query")
+	if err != nil {
+		return 0, err
+	}
+
 	u := url.URL{
 		Scheme: scheme,
 		Host:   r.addr,
-		Path:   "/loki/api/v1/query",
-		RawQuery: "query=" + url.QueryEscape(fmt.Sprintf("count_over_time({%v=\"%v\",%v=\"%v\"}[%s])", r.sName, r.sValue, r.lName, r.lVal, queryRange)) +
-			fmt.Sprintf("&time=%d", time.Now().UnixNano()) +
+		Path:   queryPath,
+		RawQuery: "query=" + url.QueryEscape(r.buildMetricQuery(queryRange)) +
+			fmt.Sprintf("&time=%d", now.UnixNano()) +
 			"&limit=1000",
 	}
-	fmt.Fprintf(r.w, "Querying loki for metric count with query: %v\n", u.String())
+
+	fmt.Fprintf(r.w, "Querying loki for metric count with query: %v, cache: %v\n", u.String(), cache)
 
 	ctx, cancel := context.WithTimeout(context.Background(), r.queryTimeout)
 	defer cancel()
@@ -181,14 +324,18 @@ func (r *Reader) QueryCountOverTime(queryRange string) (float64, error) {
 
 	if r.user != "" {
 		req.SetBasicAuth(r.user, r.pass)
-	} else if r.tenantID != "" {
+	}
+	if r.tenantID != "" {
 		req.Header.Set("X-Scope-OrgID", r.tenantID)
 	}
 	req.Header.Set("User-Agent", userAgent)
+	if !cache {
+		req.Header.Set("Cache-Control", "no-cache")
+	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := r.httpClient.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, errors.Wrap(err, "query request failed")
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -200,7 +347,7 @@ func (r *Reader) QueryCountOverTime(queryRange string) (float64, error) {
 		r.backoffMtx.Lock()
 		r.nextQuery = nextBackoff(r.w, resp.StatusCode, r.backoff)
 		r.backoffMtx.Unlock()
-		buf, _ := ioutil.ReadAll(resp.Body)
+		buf, _ := io.ReadAll(resp.Body)
 		return 0, fmt.Errorf("error response from server: %s (%v)", string(buf), err)
 	}
 	// No Errors, reset backoff
@@ -248,15 +395,21 @@ func (r *Reader) Query(start time.Time, end time.Time) ([]time.Time, error) {
 	}
 
 	scheme := "http"
-	if r.tls {
+	if r.useTLS {
 		scheme = "https"
 	}
+
+	queryRangePath, err := url.JoinPath(r.pathPrefix, "/loki/api/v1/query_range")
+	if err != nil {
+		return nil, err
+	}
+
 	u := url.URL{
 		Scheme: scheme,
 		Host:   r.addr,
-		Path:   "/loki/api/v1/query_range",
+		Path:   queryRangePath,
 		RawQuery: fmt.Sprintf("start=%d&end=%d", start.UnixNano(), end.UnixNano()) +
-			"&query=" + url.QueryEscape(fmt.Sprintf("{%v=\"%v\",%v=\"%v\"}", r.sName, r.sValue, r.lName, r.lVal)) +
+			"&query=" + url.QueryEscape(fmt.Sprintf("%s %v", r.labelSelector, r.queryAppend)) +
 			"&limit=1000",
 	}
 	fmt.Fprintf(r.w, "Querying loki for logs with query: %v\n", u.String())
@@ -269,16 +422,12 @@ func (r *Reader) Query(start time.Time, end time.Time) ([]time.Time, error) {
 		return nil, err
 	}
 
-	if r.user != "" {
-		req.SetBasicAuth(r.user, r.pass)
-	} else if r.tenantID != "" {
-		req.Header.Set("X-Scope-OrgID", r.tenantID)
-	}
+	req.Header = r.header.Clone()
 	req.Header.Set("User-Agent", userAgent)
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := r.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "query_range request failed")
 	}
 	defer func() {
 		if err := resp.Body.Close(); err != nil {
@@ -290,7 +439,7 @@ func (r *Reader) Query(start time.Time, end time.Time) ([]time.Time, error) {
 		r.backoffMtx.Lock()
 		r.nextQuery = nextBackoff(r.w, resp.StatusCode, r.backoff)
 		r.backoffMtx.Unlock()
-		buf, _ := ioutil.ReadAll(resp.Body)
+		buf, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("error response from server: %s (%v)", string(buf), err)
 	}
 	// No Errors, reset backoff
@@ -310,9 +459,9 @@ func (r *Reader) Query(start time.Time, end time.Time) ([]time.Time, error) {
 	case logqlmodel.ValueTypeStreams:
 		for _, stream := range value.(loghttp.Streams) {
 			for _, entry := range stream.Entries {
-				ts, err := parseResponse(&entry)
+				ts, err := r.parseResponse(&entry)
 				if err != nil {
-					fmt.Fprint(r.w, err)
+					fmt.Fprintln(r.w, err)
 					continue
 				}
 				tss = append(tss, *ts)
@@ -325,7 +474,7 @@ func (r *Reader) Query(start time.Time, end time.Time) ([]time.Time, error) {
 	return tss, nil
 }
 
-// run uses the established websocket connection to tail logs from Loki and
+// run uses the established websocket connection to tail logs from Loki
 func (r *Reader) run() {
 	r.closeAndReconnect()
 
@@ -333,23 +482,36 @@ func (r *Reader) run() {
 	lastMessageTs := time.Now()
 
 	for {
-		if r.shuttingDown {
-			if r.conn != nil {
-				_ = r.conn.Close()
-				r.conn = nil
+		if r.shuttingDown() {
+			if conn := r.swapConn(nil); conn != nil {
+				_ = conn.Close()
 			}
 			close(r.done)
 			return
 		}
 
+		conn := r.currentConn()
 		// Set a read timeout of 10x the interval we expect to see messages
 		// Ignore the error as it will get caught when we call ReadJSON
 		timeoutInterval := 10 * r.interval
-		_ = r.conn.SetReadDeadline(time.Now().Add(timeoutInterval))
+		_ = conn.SetReadDeadline(time.Now().Add(timeoutInterval))
 		// I assume this is a blocking call that either reads from the websocket connection
 		// or times out based on the above SetReadDeadline call.
-		err := unmarshal.ReadTailResponseJSON(tailResponse, r.conn)
+		err := unmarshal.ReadTailResponseJSON(tailResponse, conn)
 		if err != nil {
+			if r.shuttingDown() {
+				// Stop closed the connection, exit on the next iteration.
+				continue
+			}
+
+			var e *websocket.CloseError
+			if errors.As(err, &e) && e.Text == "reached tail max duration limit" {
+				fmt.Fprintf(r.w, "tail max duration limit exceeded, will retry immediately: %s\n", err)
+
+				r.closeAndReconnect()
+				continue
+			}
+
 			reason := "error reading websocket"
 			if e, ok := err.(net.Error); ok && e.Timeout() {
 				reason = fmt.Sprintf("timeout tailing new logs (timeout period: %.2fs)", timeoutInterval.Seconds())
@@ -359,7 +521,7 @@ func (r *Reader) run() {
 
 			// Even though we sleep between connection retries, we found it's possible to DOS Loki if the connection
 			// succeeds but some other error is returned, so also sleep here before retrying.
-			<-time.After(10 * time.Second)
+			r.wait(10 * time.Second)
 			r.closeAndReconnect()
 			continue
 		}
@@ -369,9 +531,9 @@ func (r *Reader) run() {
 		}
 		for _, stream := range tailResponse.Streams {
 			for _, entry := range stream.Entries {
-				ts, err := parseResponse(&entry)
+				ts, err := r.parseResponse(&entry)
 				if err != nil {
-					fmt.Fprint(r.w, err)
+					fmt.Fprintln(r.w, err)
 					continue
 				}
 				r.recv <- *ts
@@ -382,7 +544,7 @@ func (r *Reader) run() {
 		if time.Since(lastMessageTs).Milliseconds() > 10*r.interval.Milliseconds() {
 			fmt.Fprintf(r.w, "Have not received a canary message from loki on the websocket in %vms, "+
 				"sleeping 10s and reconnecting\n", 10*r.interval.Milliseconds())
-			<-time.After(10 * time.Second)
+			r.wait(10 * time.Second)
 			r.closeAndReconnect()
 			continue
 		}
@@ -393,34 +555,48 @@ func (r *Reader) run() {
 // with the stream and label selectors which can be used check if all logs generated by the
 // canary have been received by Loki.
 func (r *Reader) closeAndReconnect() {
-	if r.shuttingDown {
+	if r.shuttingDown() {
 		return
 	}
-	if r.conn != nil {
-		_ = r.conn.Close()
-		r.conn = nil
+	if conn := r.swapConn(nil); conn != nil {
+		_ = conn.Close()
 		// By incrementing reconnects here we should only count a failure followed by a successful reconnect.
 		// Initial connections and reconnections from failed tries will not be counted.
 		reconnects.Inc()
 	}
-	for r.conn == nil {
+	for !r.shuttingDown() {
 		scheme := "ws"
-		if r.tls {
+		if r.useTLS {
 			scheme = "wss"
 		}
+
+		tailPath, err := url.JoinPath(r.pathPrefix, "/loki/api/v1/tail")
+		if err != nil {
+			fmt.Fprintf(r.w, "failed to build tail URL: %v\n", err)
+			return
+		}
+
 		u := url.URL{
 			Scheme:   scheme,
 			Host:     r.addr,
-			Path:     "/loki/api/v1/tail",
-			RawQuery: "query=" + url.QueryEscape(fmt.Sprintf("{%v=\"%v\",%v=\"%v\"}", r.sName, r.sValue, r.lName, r.lVal)),
+			Path:     tailPath,
+			RawQuery: "query=" + url.QueryEscape(fmt.Sprintf("%s %v", r.labelSelector, r.queryAppend)),
 		}
 
-		fmt.Fprintf(r.w, "Connecting to loki at %v, querying for label '%v' with value '%v'\n", u.String(), r.lName, r.lVal)
+		fmt.Fprintf(r.w, "Connecting to loki at %v, using selector %s\n", u.String(), r.labelSelector)
 
-		c, _, err := websocket.DefaultDialer.Dial(u.String(), r.header)
+		header, err := r.webSocketHeader(context.Background())
+		if err != nil {
+			fmt.Fprintf(r.w, "failed to load authorization credentials for %s: %s\n", u.String(), err)
+			r.wait(10 * time.Second)
+			continue
+		}
+
+		dialer := r.webSocketDialer()
+		c, _, err := dialer.Dial(u.String(), header)
 		if err != nil {
 			fmt.Fprintf(r.w, "failed to connect to %s with err %s\n", u.String(), err)
-			<-time.After(10 * time.Second)
+			r.wait(10 * time.Second)
 			continue
 		}
 		// Use a custom ping handler so we can increment a metric, this is copied from the default ping handler
@@ -429,23 +605,57 @@ func (r *Reader) closeAndReconnect() {
 			err := c.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(time.Second))
 			if err == websocket.ErrCloseSent {
 				return nil
-			} else if e, ok := err.(net.Error); ok && e.Temporary() {
+			} else if _, ok := err.(net.Error); ok {
 				return nil
 			}
 			return err
 		})
-		r.conn = c
+		r.swapConn(c)
+		return
 	}
 }
 
-func parseResponse(entry *loghttp.Entry) (*time.Time, error) {
+func (r *Reader) webSocketHeader(ctx context.Context) (http.Header, error) {
+	header := r.header.Clone()
+	if r.bearerToken == nil {
+		return header, nil
+	}
+
+	token, err := r.bearerToken.Fetch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	header.Set("Authorization", "Bearer "+token)
+
+	return header, nil
+}
+
+// webSocketDialer creates a dialer for the web socket connection to Loki
+// websocket.DefaultDialer will be returned in the case that the connection to Loki is http or TLS without client certs.
+// For the mTLS case, return a websocket.Dialer configured to use client side certificates.
+func (r *Reader) webSocketDialer() *websocket.Dialer {
+	return &websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		TLSClientConfig:  r.clientTLSConfig,
+		HandshakeTimeout: 45 * time.Second,
+	}
+}
+
+func (r *Reader) parseResponse(entry *loghttp.Entry) (*time.Time, error) {
 	sp := strings.Split(entry.Line, " ")
 	if len(sp) != 2 {
-		return nil, errors.Errorf("received invalid entry: %s\n", entry.Line)
+		return nil, errors.Errorf("received invalid entry: %s", entry.Line)
 	}
 	ts, err := strconv.ParseInt(sp[0], 10, 64)
 	if err != nil {
-		return nil, errors.Errorf("failed to parse timestamp: %s\n", sp[0])
+		return nil, errors.Errorf("failed to parse timestamp: %s", sp[0])
+	}
+	if r.validateOTLP {
+		want := strconv.FormatInt(ts, 10)
+		if got := entry.StructuredMetadata.Get("canary_timestamp"); got != want {
+			otlpValidationErrors.Inc()
+			return nil, fmt.Errorf("otlp attribute validation failed for entry %s: canary_timestamp=%q, expected %q", sp[0], got, want)
+		}
 	}
 	t := time.Unix(0, ts)
 	return &t, nil

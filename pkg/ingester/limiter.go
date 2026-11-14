@@ -6,28 +6,47 @@ import (
 	"sync"
 	"time"
 
+	"github.com/grafana/dskit/ring"
 	"golang.org/x/time/rate"
 
-	"github.com/grafana/loki/pkg/validation"
+	"github.com/grafana/loki/v3/pkg/compactor/retention"
+	"github.com/grafana/loki/v3/pkg/distributor/shardstreams"
+	"github.com/grafana/loki/v3/pkg/validation"
 )
 
 const (
-	errMaxStreamsPerUserLimitExceeded = "tenant '%v' per-user streams limit exceeded, streams: %d exceeds calculated limit: %d (local limit: %d, global limit: %d, global/ingesters: %d)"
+	errMaxStreamsPerUserLimitExceeded = "tenant '%v' per-user streams limit exceeded, streams: %d exceeds calculated limit: %d (local limit: %d, global limit: %d, local share: %d)"
 )
 
 // RingCount is the interface exposed by a ring implementation which allows
 // to count members
 type RingCount interface {
 	HealthyInstancesCount() int
+	HealthyInstancesInZoneCount() int
+	ZonesCount() int
+}
+
+type Limits interface {
+	UseOwnedStreamCount(userID string) bool
+	DelegateStreamLimits(userID string) bool
+	MaxLocalStreamsPerUser(userID string) int
+	MaxGlobalStreamsPerUser(userID string) int
+	PerStreamRateLimit(userID string) validation.RateLimit
+	ShardStreams(userID string) shardstreams.Config
+	IngestionPartitionsTenantShardSize(userID string) int
+	PolicyChunkIdlePeriod(userID, policy string) (time.Duration, bool)
+
+	validation.IngestionPolicyOverrideLimits
+	retention.Limits
 }
 
 // Limiter implements primitives to get the maximum number of streams
 // an ingester can handle for a specific tenant
 type Limiter struct {
-	limits            *validation.Overrides
-	ring              RingCount
-	replicationFactor int
+	limits            Limits
+	ringStrategy      limiterRingStrategy
 	metrics           *ingesterMetrics
+	rateLimitStrategy RateLimiterStrategy
 
 	mtx      sync.RWMutex
 	disabled bool
@@ -38,6 +57,7 @@ func (l *Limiter) DisableForWALReplay() {
 	defer l.mtx.Unlock()
 	l.disabled = true
 	l.metrics.limiterEnabled.Set(0)
+	l.rateLimitStrategy.SetDisabled(true)
 }
 
 func (l *Limiter) Enable() {
@@ -45,81 +65,75 @@ func (l *Limiter) Enable() {
 	defer l.mtx.Unlock()
 	l.disabled = false
 	l.metrics.limiterEnabled.Set(1)
+	l.rateLimitStrategy.SetDisabled(false)
+}
+
+type limiterRingStrategy interface {
+	convertGlobalToLocalLimit(int, string) int
 }
 
 // NewLimiter makes a new limiter
-func NewLimiter(limits *validation.Overrides, metrics *ingesterMetrics, ring RingCount, replicationFactor int) *Limiter {
+func NewLimiter(limits Limits, metrics *ingesterMetrics, ingesterRingLimiterStrategy limiterRingStrategy, rateLimitStrategy RateLimiterStrategy) *Limiter {
 	return &Limiter{
 		limits:            limits,
-		ring:              ring,
-		replicationFactor: replicationFactor,
+		ringStrategy:      ingesterRingLimiterStrategy,
 		metrics:           metrics,
+		rateLimitStrategy: rateLimitStrategy,
 	}
 }
 
-func (l *Limiter) UnorderedWrites(userID string) bool {
-	// WAL replay should not discard previously ack'd writes,
-	// so allow out of order writes while the limiter is disabled.
-	// This allows replaying unordered WALs into ordered configurations.
-	if l.disabled {
-		return true
-	}
-	return l.limits.UnorderedWrites(userID)
-}
-
-// AssertMaxStreamsPerUser ensures limit has not been reached compared to the current
-// number of streams in input and returns an error if so.
-func (l *Limiter) AssertMaxStreamsPerUser(userID string, streams int) error {
-	// Until the limiter actually starts, all accesses are successful.
-	// This is used to disable limits while recovering from the WAL.
-	l.mtx.RLock()
-	defer l.mtx.RUnlock()
-	if l.disabled {
-		return nil
-	}
-
+func (l *Limiter) GetStreamCountLimit(tenantID string, policy string) (calculatedLimit, localLimit, globalLimit, adjustedGlobalLimit int) {
 	// Start by setting the local limit either from override or default
-	localLimit := l.limits.MaxLocalStreamsPerUser(userID)
+	localLimit = l.limits.MaxLocalStreamsPerUser(tenantID)
 
 	// We can assume that streams are evenly distributed across ingesters
 	// so we do convert the global limit into a local limit
-	globalLimit := l.limits.MaxGlobalStreamsPerUser(userID)
-	adjustedGlobalLimit := l.convertGlobalToLocalLimit(globalLimit)
+	globalLimit = l.limits.MaxGlobalStreamsPerUser(tenantID)
+
+	// Check for policy-specific overrides if policy is specified. A non-nil override (ok=true)
+	// replaces the tenant value for that policy.
+	if policy != noPolicy {
+		if policyLocalLimit, ok := l.limits.PolicyMaxLocalStreamsPerUser(tenantID, policy); ok {
+			localLimit = policyLocalLimit
+		}
+		if policyGlobalLimit, ok := l.limits.PolicyMaxGlobalStreamsPerUser(tenantID, policy); ok {
+			globalLimit = policyGlobalLimit
+		}
+	}
+
+	adjustedGlobalLimit = l.ringStrategy.convertGlobalToLocalLimit(globalLimit, tenantID)
 
 	// Set the calculated limit to the lesser of the local limit or the new calculated global limit
-	calculatedLimit := l.minNonZero(localLimit, adjustedGlobalLimit)
+	calculatedLimit = l.minNonZero(localLimit, adjustedGlobalLimit)
 
 	// If both the local and global limits are disabled, we just
 	// use the largest int value
 	if calculatedLimit == 0 {
 		calculatedLimit = math.MaxInt32
 	}
-
-	if streams < calculatedLimit {
-		return nil
-	}
-
-	return fmt.Errorf(errMaxStreamsPerUserLimitExceeded, userID, streams, calculatedLimit, localLimit, globalLimit, adjustedGlobalLimit)
+	return
 }
 
-func (l *Limiter) convertGlobalToLocalLimit(globalLimit int) int {
-	if globalLimit == 0 {
-		return 0
+// policyBucket returns the policy whose stream count and stream limit apply to a stream resolved
+// to the given policy. A policy gets its own bucket only when it overrides a stream limit;
+// otherwise its streams share the tenant's default bucket (noPolicy).
+//
+// Unlike the ingest-limits service (see pkg/limits/store.go), which only buckets on a global
+// stream limit override, overriding the local stream limit also creates a bucket here.
+func (l *Limiter) policyBucket(tenantID, policy string) string {
+	if policy != noPolicy && l.hasPolicyStreamBucket(tenantID, policy) {
+		return policy
 	}
+	return noPolicy
+}
 
-	// Given we don't need a super accurate count (ie. when the ingesters
-	// topology changes) and we prefer to always be in favor of the tenant,
-	// we can use a per-ingester limit equal to:
-	// (global limit / number of ingesters) * replication factor
-	numIngesters := l.ring.HealthyInstancesCount()
-
-	// May happen because the number of ingesters is asynchronously updated.
-	// If happens, we just temporarily ignore the global limit.
-	if numIngesters > 0 {
-		return int((float64(globalLimit) / float64(numIngesters)) * float64(l.replicationFactor))
+// hasPolicyStreamBucket reports whether the policy overrides the local or global stream limit.
+func (l *Limiter) hasPolicyStreamBucket(tenantID, policy string) bool {
+	if _, ok := l.limits.PolicyMaxLocalStreamsPerUser(tenantID, policy); ok {
+		return true
 	}
-
-	return 0
+	_, ok := l.limits.PolicyMaxGlobalStreamsPerUser(tenantID, policy)
+	return ok
 }
 
 func (l *Limiter) minNonZero(first, second int) int {
@@ -130,16 +144,191 @@ func (l *Limiter) minNonZero(first, second int) int {
 	return first
 }
 
-type RateLimiterStrategy interface {
-	RateLimit(tenant string) validation.RateLimit
+type ingesterRingLimiterStrategy struct {
+	ring              RingCount
+	replicationFactor int
 }
 
-func (l *Limiter) RateLimit(tenant string) validation.RateLimit {
+func newIngesterRingLimiterStrategy(ring RingCount, replicationFactor int) *ingesterRingLimiterStrategy {
+	return &ingesterRingLimiterStrategy{
+		ring:              ring,
+		replicationFactor: replicationFactor,
+	}
+}
+
+func (l *ingesterRingLimiterStrategy) convertGlobalToLocalLimit(globalLimit int, _ string) int {
+	if globalLimit == 0 || l.replicationFactor == 0 {
+		return 0
+	}
+
+	zonesCount := l.ring.ZonesCount()
+	if zonesCount <= 1 {
+		return l.calculateLimitForSingleZone(globalLimit)
+	}
+
+	return l.calculateLimitForMultipleZones(globalLimit, zonesCount)
+}
+
+func (l *ingesterRingLimiterStrategy) calculateLimitForSingleZone(globalLimit int) int {
+	numIngesters := l.ring.HealthyInstancesCount()
+	if numIngesters > 0 {
+		return int((float64(globalLimit) / float64(numIngesters)) * float64(l.replicationFactor))
+	}
+	return 0
+}
+
+func (l *ingesterRingLimiterStrategy) calculateLimitForMultipleZones(globalLimit, zonesCount int) int {
+	ingestersInZone := l.ring.HealthyInstancesInZoneCount()
+	if ingestersInZone > 0 {
+		return int((float64(globalLimit) * float64(l.replicationFactor)) / float64(zonesCount) / float64(ingestersInZone))
+	}
+	return 0
+}
+
+type partitionRingLimiterStrategy struct {
+	ring                  ring.PartitionRingReader
+	getPartitionShardSize func(user string) int
+}
+
+func newPartitionRingLimiterStrategy(ring ring.PartitionRingReader, getPartitionShardSize func(user string) int) *partitionRingLimiterStrategy {
+	return &partitionRingLimiterStrategy{
+		ring:                  ring,
+		getPartitionShardSize: getPartitionShardSize,
+	}
+}
+
+func (l *partitionRingLimiterStrategy) convertGlobalToLocalLimit(globalLimit int, tenantID string) int {
+	if globalLimit == 0 {
+		return 0
+	}
+
+	userShardSize := l.getPartitionShardSize(tenantID)
+
+	// ShuffleShardSize correctly handles cases when user has no shard config or more shards than number of active partitions in the ring.
+	activePartitionsForUser := l.ring.PartitionRing().ShuffleShardSize(userShardSize)
+
+	if activePartitionsForUser == 0 {
+		return 0
+	}
+	return int(float64(globalLimit) / float64(activePartitionsForUser))
+}
+
+type supplier[T any] func() T
+
+type streamCountLimiter struct {
+	tenantID                   string
+	limiter                    *Limiter
+	defaultStreamCountSupplier supplier[int]
+	// memoryPolicyStreams counts all in-memory streams per policy. Together with
+	// defaultStreamCountSupplier it is used when owned stream counting is disabled.
+	memoryPolicyStreams *policyStreamCounts
+	ownedStreamSvc      *ownedStreamService
+}
+
+var noopFixedLimitSupplier = func() int {
+	return 0
+}
+
+func newStreamCountLimiter(tenantID string, defaultStreamCountSupplier supplier[int], memoryPolicyStreams *policyStreamCounts, limiter *Limiter, service *ownedStreamService) *streamCountLimiter {
+	return &streamCountLimiter{
+		tenantID:                   tenantID,
+		limiter:                    limiter,
+		defaultStreamCountSupplier: defaultStreamCountSupplier,
+		memoryPolicyStreams:        memoryPolicyStreams,
+		ownedStreamSvc:             service,
+	}
+}
+
+func (l *streamCountLimiter) AssertNewStreamAllowed(tenantID string, policy string) error {
+	if l.limiter.limits.DelegateStreamLimits(tenantID) {
+		return nil
+	}
+	bucket := l.limiter.policyBucket(tenantID, policy)
+	streamCountSupplier, fixedLimitSupplier := l.getSuppliers(tenantID, bucket)
+	calculatedLimit, localLimit, globalLimit, adjustedGlobalLimit := l.getCurrentLimit(tenantID, bucket, fixedLimitSupplier)
+	actualStreamsCount := streamCountSupplier()
+	if actualStreamsCount < calculatedLimit {
+		return nil
+	}
+
+	return fmt.Errorf(errMaxStreamsPerUserLimitExceeded, tenantID, actualStreamsCount, calculatedLimit, localLimit, globalLimit, adjustedGlobalLimit)
+}
+
+func (l *streamCountLimiter) getCurrentLimit(tenantID, policy string, fixedLimitSupplier supplier[int]) (calculatedLimit, localLimit, globalLimit, adjustedGlobalLimit int) {
+	calculatedLimit, localLimit, globalLimit, adjustedGlobalLimit = l.limiter.GetStreamCountLimit(tenantID, policy)
+
+	// Only apply fixed limit if no policy is specified
+	// Policy limits should take precedence over fixed limits
+	if policy == noPolicy {
+		fixedLimit := fixedLimitSupplier()
+		if fixedLimit > calculatedLimit {
+			calculatedLimit = fixedLimit
+		}
+	}
+
+	return
+}
+
+// getSuppliers returns the stream count supplier for the given policy bucket (see
+// Limiter.policyBucket). The default bucket (noPolicy) excludes streams of policies that have
+// their own bucket, so they don't consume the tenant's default stream budget.
+func (l *streamCountLimiter) getSuppliers(tenant string, bucket string) (streamCountSupplier, fixedLimitSupplier supplier[int]) {
+	totalStreams, policyStreams, fixedLimitSupplier := l.defaultStreamCountSupplier, l.memoryPolicyStreams, noopFixedLimitSupplier
+	if l.limiter.limits.UseOwnedStreamCount(tenant) {
+		totalStreams, policyStreams, fixedLimitSupplier = l.ownedStreamSvc.getOwnedStreamCount, l.ownedStreamSvc.policyStreams, l.ownedStreamSvc.getFixedLimit
+	}
+
+	if bucket != noPolicy {
+		return func() int { return policyStreams.get(bucket) }, fixedLimitSupplier
+	}
+	return func() int {
+		ownBucketStreams := policyStreams.sum(func(policy string) bool {
+			return l.limiter.hasPolicyStreamBucket(tenant, policy)
+		})
+		// ownBucketStreams is a subset of totalStreams, but both are updated separately, so it
+		// can briefly exceed it while a stream is being removed.
+		return max(0, totalStreams()-ownBucketStreams)
+	}, fixedLimitSupplier
+}
+
+type RateLimiterStrategy interface {
+	RateLimit(tenant, policy string) validation.RateLimit
+	SetDisabled(bool)
+}
+
+type TenantBasedStrategy struct {
+	disabled bool
+	limits   Limits
+}
+
+func (l *TenantBasedStrategy) RateLimit(tenant, policy string) validation.RateLimit {
 	if l.disabled {
 		return validation.Unlimited
 	}
 
+	// A per-policy override replaces the tenant per-stream rate limit for streams
+	// resolved to that policy.
+	if policy != noPolicy {
+		if rl, ok := l.limits.PolicyPerStreamRateLimit(tenant, policy); ok {
+			return rl
+		}
+	}
+
 	return l.limits.PerStreamRateLimit(tenant)
+}
+
+func (l *TenantBasedStrategy) SetDisabled(disabled bool) {
+	l.disabled = disabled
+}
+
+type NoLimitsStrategy struct{}
+
+func (l *NoLimitsStrategy) RateLimit(_, _ string) validation.RateLimit {
+	return validation.Unlimited
+}
+
+func (l *NoLimitsStrategy) SetDisabled(_ bool) {
+	// no-op
 }
 
 type StreamRateLimiter struct {
@@ -147,15 +336,17 @@ type StreamRateLimiter struct {
 	recheckAt     time.Time
 	strategy      RateLimiterStrategy
 	tenant        string
+	policy        string
 	lim           *rate.Limiter
 }
 
-func NewStreamRateLimiter(strategy RateLimiterStrategy, tenant string, recheckPeriod time.Duration) *StreamRateLimiter {
-	rl := strategy.RateLimit(tenant)
+func NewStreamRateLimiter(strategy RateLimiterStrategy, tenant, policy string, recheckPeriod time.Duration) *StreamRateLimiter {
+	rl := strategy.RateLimit(tenant, policy)
 	return &StreamRateLimiter{
 		recheckPeriod: recheckPeriod,
 		strategy:      strategy,
 		tenant:        tenant,
+		policy:        policy,
 		lim:           rate.NewLimiter(rl.Limit, rl.Burst),
 	}
 }
@@ -168,7 +359,7 @@ func (l *StreamRateLimiter) AllowN(at time.Time, n int) bool {
 		oldLim := l.lim.Limit()
 		oldBurst := l.lim.Burst()
 
-		next := l.strategy.RateLimit(l.tenant)
+		next := l.strategy.RateLimit(l.tenant, l.policy)
 
 		if oldLim != next.Limit || oldBurst != next.Burst {
 			// Edge case: rate.Inf doesn't advance nicely when reconfigured.

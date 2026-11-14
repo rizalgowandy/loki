@@ -25,7 +25,7 @@ import "github.com/alicebob/miniredis/v2"
 
 Implemented commands:
 
- - Connection (complete)
+ - Connection
    - AUTH -- see RequireAuth()
    - ECHO
    - HELLO -- see RequireUserAuth()
@@ -34,25 +34,31 @@ Implemented commands:
    - SWAPDB
    - QUIT
  - Key
+   - COPY
    - DEL
+   - DUMP -- partly, only handles string keys
    - EXISTS
    - EXPIRE
    - EXPIREAT
+   - EXPIRETIME
    - KEYS
    - MOVE
    - PERSIST
    - PEXPIRE
    - PEXPIREAT
+   - PEXPIRETIME
    - PTTL
+   - RANDOMKEY -- see m.Seed(...)
    - RENAME
    - RENAMENX
-   - RANDOMKEY -- see m.Seed(...)
+   - RESTORE -- partly, only handles string keys
    - SCAN
    - TOUCH
    - TTL
    - TYPE
    - UNLINK
- - Transactions (complete)
+   - WAIT -- no-op
+ - Transactions
    - DISCARD
    - EXEC
    - MULTI
@@ -63,15 +69,20 @@ Implemented commands:
    - FLUSHALL
    - FLUSHDB
    - TIME -- returns time.Now() or value set by SetTime()
- - String keys (complete)
+   - COMMAND -- partly
+   - INFO -- partly, returns only "clients" section with one field "connected_clients"
+ - String keys
    - APPEND
    - BITCOUNT
    - BITOP
    - BITPOS
    - DECR
    - DECRBY
+   - DELEX -- partly
    - GET
    - GETBIT
+   - GETDEL
+   - GETEX
    - GETRANGE
    - GETSET
    - INCR
@@ -87,9 +98,10 @@ Implemented commands:
    - SETNX
    - SETRANGE
    - STRLEN
- - Hash keys (complete)
+ - Hash keys
    - HDEL
    - HEXISTS
+   - HEXPIRE
    - HGET
    - HGETALL
    - HINCRBY
@@ -98,18 +110,24 @@ Implemented commands:
    - HLEN
    - HMGET
    - HMSET
+   - HPERSIST
+   - HPTTL
+   - HRANDFIELD
    - HSET
+   - HSETEX
    - HSETNX
    - HSTRLEN
+   - HTTL
    - HVALS
    - HSCAN
- - List keys (complete)
+ - List keys
    - BLPOP
    - BRPOP
    - BRPOPLPUSH
    - LINDEX
    - LINSERT
    - LLEN
+   - LMPOP
    - LPOP
    - LPUSH
    - LPUSHX
@@ -121,38 +139,48 @@ Implemented commands:
    - RPOPLPUSH
    - RPUSH
    - RPUSHX
- - Pub/Sub (complete)
+   - LMOVE
+   - BLMOVE
+ - Pub/Sub
    - PSUBSCRIBE
    - PUBLISH
    - PUBSUB
    - PUNSUBSCRIBE
    - SUBSCRIBE
    - UNSUBSCRIBE
- - Set keys (complete)
+ - Set keys
    - SADD
    - SCARD
    - SDIFF
    - SDIFFSTORE
    - SINTER
    - SINTERSTORE
+   - SINTERCARD
    - SISMEMBER
    - SMEMBERS
+   - SMISMEMBER
    - SMOVE
    - SPOP -- see m.Seed(...)
    - SRANDMEMBER -- see m.Seed(...)
    - SREM
+   - SSCAN
    - SUNION
    - SUNIONSTORE
-   - SSCAN
- - Sorted Set keys (complete)
+ - Sorted Set keys
+   - BZMPOP
+   - BZPOPMAX
+   - BZPOPMIN
    - ZADD
    - ZCARD
    - ZCOUNT
    - ZINCRBY
+   - ZINTER
    - ZINTERSTORE
    - ZLEXCOUNT
+   - ZMPOP
    - ZPOPMIN
    - ZPOPMAX
+   - ZRANDMEMBER
    - ZRANGE
    - ZRANGEBYLEX
    - ZRANGEBYSCORE
@@ -166,19 +194,29 @@ Implemented commands:
    - ZREVRANGEBYSCORE
    - ZREVRANK
    - ZSCORE
+   - ZUNION
    - ZUNIONSTORE
    - ZSCAN
  - Stream keys
    - XACK
    - XADD
+   - XAUTOCLAIM
+   - XCLAIM
    - XDEL
    - XGROUP CREATE
+   - XGROUP CREATECONSUMER
+   - XGROUP DESTROY
+   - XGROUP DELCONSUMER
    - XINFO STREAM -- partly
+   - XINFO GROUPS
+   - XINFO CONSUMERS -- partly
    - XLEN
    - XRANGE
-   - XREAD -- partly
-   - XREADGROUP -- partly
+   - XREAD
+   - XREADGROUP
    - XREVRANGE
+   - XPENDING
+   - XTRIM
  - Scripting
    - EVAL
    - EVALSHA
@@ -194,12 +232,16 @@ Implemented commands:
    - GEORADIUS_RO
    - GEORADIUSBYMEMBER
    - GEORADIUSBYMEMBER_RO
- - Server
-   - COMMAND -- partly
+   - GEOSEARCH
  - Cluster
    - CLUSTER SLOTS
    - CLUSTER KEYSLOT
    - CLUSTER NODES
+   - CLUSTER SHARDS
+ - HyperLogLog
+   - PFADD
+   - PFCOUNT
+   - PFMERGE
 
 
 ## TTLs, key expiration, and time
@@ -218,6 +260,42 @@ which case time.Now() will be used.
 
 SetTime() also sets the value returned by TIME, which defaults to time.Now().
 It is not updated by FastForward, only by SetTime.
+
+`m.ClockTTL(true)` makes TTLs decrease as the clock (time.Now(), or the
+SetTime() value) advances, instead of only via FastForward. Expired keys are
+removed lazily, whenever a database is accessed via a command or a
+Miniredis-level accessor. Combined with SetTime() the expiry stays coherent
+with TIME and (P)EXPIREAT. Note that against the wall clock this makes expiry
+depend on test execution speed, which is why it's not the default.
+
+## testing/synctest
+
+miniredis works inside a `testing/synctest` bubble (Go 1.25+). Since real TCP
+connections can't be used there, connect with `m.Dial()`, which serves the
+connection on an in-memory pipe — most redis clients accept it as a custom
+dialer. `NewMiniRedis()` is the non-started constructor: with `Dial()` no
+listener is ever created. Inside a bubble `time.Now()` is the bubble's fake
+clock, so with `ClockTTL(true)` a plain `time.Sleep()` expires keys — no
+FastForward needed:
+
+``` Go
+synctest.Test(t, func(t *testing.T) {
+	m := miniredis.NewMiniRedis()
+	defer m.Close()
+	m.ClockTTL(true)
+
+	client := redis.NewClient(&redis.Options{
+		Dialer: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return m.Dial()
+		},
+	})
+
+	ctx := context.Background()
+	client.Set(ctx, "session", "v", time.Hour)
+	time.Sleep(time.Hour + time.Second) // instant, and deterministic
+	// key is expired now
+})
+```
 
 ## Randomness and Seed()
 
@@ -238,11 +316,7 @@ import (
 )
 
 func TestSomething(t *testing.T) {
-	s, err := miniredis.Run()
-	if err != nil {
-		panic(err)
-	}
-	defer s.Close()
+	s := miniredis.RunT(t)
 
 	// Optionally set some keys your code expects:
 	s.Set("foo", "bar")
@@ -278,17 +352,12 @@ Commands which will probably not be implemented:
     - ~~CLUSTER *~~
     - ~~READONLY~~
     - ~~READWRITE~~
- - HyperLogLog (all) -- unless someone needs these
-    - ~~PFADD~~
-    - ~~PFCOUNT~~
-    - ~~PFMERGE~~
  - Key
-    - ~~DUMP~~
     - ~~MIGRATE~~
     - ~~OBJECT~~
-    - ~~RESTORE~~
-    - ~~WAIT~~
  - Scripting
+    - ~~FCALL / FCALL_RO *~~
+    - ~~FUNCTION *~~
     - ~~SCRIPT DEBUG~~
     - ~~SCRIPT KILL~~
  - Server
@@ -297,7 +366,6 @@ Commands which will probably not be implemented:
     - ~~CLIENT *~~
     - ~~CONFIG *~~
     - ~~DEBUG *~~
-    - ~~INFO~~
     - ~~LASTSAVE~~
     - ~~MONITOR~~
     - ~~ROLE~~
@@ -310,7 +378,7 @@ Commands which will probably not be implemented:
 
 ## &c.
 
-Integration tests are run against Redis 6.0.10. The [./integration](./integration/) subdir
+Integration tests are run against Redis 8.4.0. The [./integration](./integration/) subdir
 compares miniredis against a real redis instance.
 
 The Redis 6 RESP3 protocol is supported. If there are problems, please open
@@ -320,5 +388,4 @@ If you want to test Redis Sentinel have a look at [minisentinel](https://github.
 
 A changelog is kept at [CHANGELOG.md](https://github.com/alicebob/miniredis/blob/master/CHANGELOG.md).
 
-[![Build Status](https://travis-ci.org/alicebob/miniredis.svg?branch=master)](https://travis-ci.org/alicebob/miniredis)
 [![Go Reference](https://pkg.go.dev/badge/github.com/alicebob/miniredis/v2.svg)](https://pkg.go.dev/github.com/alicebob/miniredis/v2)

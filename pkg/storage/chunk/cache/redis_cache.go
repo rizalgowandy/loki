@@ -2,27 +2,31 @@ package cache
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/logql/model/stats"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 // RedisCache type caches chunks in redis
 type RedisCache struct {
-	name   string
-	redis  *RedisClient
-	logger log.Logger
+	name      string
+	cacheType stats.CacheType
+	redis     *RedisClient
+	logger    log.Logger
 }
 
 // NewRedisCache creates a new RedisCache
-func NewRedisCache(name string, redisClient *RedisClient, logger log.Logger) *RedisCache {
-	util_log.WarnExperimentalUse("Redis cache")
+func NewRedisCache(name string, redisClient *RedisClient, logger log.Logger, cacheType stats.CacheType) *RedisCache {
+	util_log.WarnExperimentalUse(fmt.Sprintf("Redis cache - %s", name), logger)
 	cache := &RedisCache{
-		name:   name,
-		redis:  redisClient,
-		logger: logger,
+		name:      name,
+		redis:     redisClient,
+		logger:    logger,
+		cacheType: cacheType,
 	}
 	if err := cache.redis.Ping(context.Background()); err != nil {
 		level.Error(logger).Log("msg", "error connecting to redis", "name", name, "err", err)
@@ -31,7 +35,7 @@ func NewRedisCache(name string, redisClient *RedisClient, logger log.Logger) *Re
 }
 
 // Fetch gets keys from the cache. The keys that are found must be in the order of the keys requested.
-func (c *RedisCache) Fetch(ctx context.Context, keys []string) (found []string, bufs [][]byte, missed []string) {
+func (c *RedisCache) Fetch(ctx context.Context, keys []string) (found []string, bufs [][]byte, missed []string, err error) {
 	data, err := c.redis.MGet(ctx, keys)
 	if err != nil {
 		level.Error(c.logger).Log("msg", "failed to get from redis", "name", c.name, "err", err)
@@ -51,14 +55,19 @@ func (c *RedisCache) Fetch(ctx context.Context, keys []string) (found []string, 
 }
 
 // Store stores the key in the cache.
-func (c *RedisCache) Store(ctx context.Context, keys []string, bufs [][]byte) {
+func (c *RedisCache) Store(ctx context.Context, keys []string, bufs [][]byte) error {
 	err := c.redis.MSet(ctx, keys, bufs)
 	if err != nil {
 		level.Error(c.logger).Log("msg", "failed to put to redis", "name", c.name, "err", err)
 	}
+	return err
 }
 
 // Stop stops the redis client.
 func (c *RedisCache) Stop() {
 	_ = c.redis.Close()
+}
+
+func (c *RedisCache) GetCacheType() stats.CacheType {
+	return c.cacheType
 }

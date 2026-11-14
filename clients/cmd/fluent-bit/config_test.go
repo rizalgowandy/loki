@@ -1,7 +1,6 @@
 package main
 
 import (
-	"io/ioutil"
 	"net/url"
 	"os"
 	"reflect"
@@ -10,12 +9,12 @@ import (
 
 	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/log"
 	"github.com/prometheus/common/model"
-	"github.com/weaveworks/common/logging"
 
-	"github.com/grafana/loki/clients/pkg/promtail/client"
+	"github.com/grafana/loki/v3/clients/pkg/util"
 
-	lokiflag "github.com/grafana/loki/pkg/util/flagext"
+	lokiflag "github.com/grafana/loki/v3/pkg/util/flagext"
 )
 
 type fakeConfig map[string]string
@@ -38,7 +37,7 @@ func Test_parseConfig(t *testing.T) {
 			map[string]string{},
 			&config{
 				lineFormat: jsonFormat,
-				clientConfig: client.Config{
+				clientConfig: util.Config{
 					URL:            mustParseURL("http://localhost:3100/loki/api/v1/push"),
 					BatchSize:      defaultClientCfg.BatchSize,
 					BatchWait:      defaultClientCfg.BatchWait,
@@ -69,7 +68,7 @@ func Test_parseConfig(t *testing.T) {
 			},
 			&config{
 				lineFormat: kvPairFormat,
-				clientConfig: client.Config{
+				clientConfig: util.Config{
 					URL:            mustParseURL("http://somewhere.com:3100/loki/api/v1/push"),
 					TenantID:       "my-tenant-id",
 					BatchSize:      100,
@@ -103,7 +102,7 @@ func Test_parseConfig(t *testing.T) {
 			},
 			&config{
 				lineFormat: kvPairFormat,
-				clientConfig: client.Config{
+				clientConfig: util.Config{
 					URL:            mustParseURL("http://somewhere.com:3100/loki/api/v1/push"),
 					TenantID:       "", // empty as not set in fluent-bit plugin config map
 					BatchSize:      100,
@@ -211,8 +210,8 @@ func mustParseURL(u string) flagext.URLValue {
 	return flagext.URLValue{URL: parsed}
 }
 
-func mustParseLogLevel(l string) logging.Level {
-	level := logging.Level{}
+func mustParseLogLevel(l string) log.Level {
+	level := log.Level{}
 	err := level.Set(l)
 	if err != nil {
 		panic(err)
@@ -229,7 +228,7 @@ func mustParseDuration(u string) time.Duration {
 }
 
 func createTempLabelMap(t *testing.T) string {
-	file, err := ioutil.TempFile("", "labelmap")
+	file, err := os.CreateTemp("", "labelmap")
 	if err != nil {
 		t.Fatal(err)
 	}

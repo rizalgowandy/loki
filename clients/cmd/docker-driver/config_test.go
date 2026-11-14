@@ -2,18 +2,18 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
-	"github.com/docker/docker/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/clients/pkg/logentry/stages"
+	"github.com/grafana/loki/v3/clients/pkg/logentry/stages"
+
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var jobRename = `
@@ -67,13 +67,13 @@ var pipelineString = `
 `
 var pipeline = PipelineConfig{
 	PipelineStages: []interface{}{
-		map[interface{}]interface{}{
-			"regex": map[interface{}]interface{}{
+		map[string]interface{}{
+			"regex": map[string]interface{}{
 				"expression": "(level|lvl|severity)=(?P<level>\\w+)",
 			},
 		},
-		map[interface{}]interface{}{
-			"labels": map[interface{}]interface{}{
+		map[string]interface{}{
+			"labels": map[string]interface{}{
 				"level": nil,
 			},
 		},
@@ -81,13 +81,13 @@ var pipeline = PipelineConfig{
 }
 
 func Test_parsePipeline(t *testing.T) {
-	f, err := ioutil.TempFile("/tmp", "Test_parsePipeline")
+	f, err := os.CreateTemp("", "Test_parsePipeline")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.Remove(f.Name())
 
-	_, err = f.Write([]byte(fmt.Sprintf("pipeline_stages:\n%s", pipelineString)))
+	_, err = fmt.Fprintf(f, "pipeline_stages:\n%s", pipelineString)
 	if err != nil {
 		t.Fatal(err)
 	}

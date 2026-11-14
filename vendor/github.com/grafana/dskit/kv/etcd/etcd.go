@@ -10,8 +10,8 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
 	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/pkg/transport"
 
 	"github.com/grafana/dskit/backoff"
 	dstls "github.com/grafana/dskit/crypto/tls"
@@ -22,23 +22,33 @@ import (
 // Config for a new etcd.Client.
 type Config struct {
 	Endpoints   []string           `yaml:"endpoints"`
-	DialTimeout time.Duration      `yaml:"dial_timeout"`
-	MaxRetries  int                `yaml:"max_retries"`
-	EnableTLS   bool               `yaml:"tls_enabled"`
+	DialTimeout time.Duration      `yaml:"dial_timeout" category:"advanced"`
+	MaxRetries  int                `yaml:"max_retries" category:"advanced"`
+	EnableTLS   bool               `yaml:"tls_enabled" category:"advanced"`
 	TLS         dstls.ClientConfig `yaml:",inline"`
 
-	UserName string `yaml:"username"`
-	Password string `yaml:"password"`
+	UserName string         `yaml:"username"`
+	Password flagext.Secret `yaml:"password"`
 }
 
-// Clientv3Facade is a subset of all Etcd client operations that are required
-// to implement an Etcd version of kv.Client
+// Clientv3Facade is the Etcd v3 KV and watcher surface supported by Client.
 type Clientv3Facade interface {
-	clientv3.KV
-	clientv3.Watcher
+	// Keep the method set explicit so additions to upstream interfaces don't
+	// expand this facade and break its in-memory implementation.
+	Put(ctx context.Context, key, val string, opts ...clientv3.OpOption) (*clientv3.PutResponse, error)
+	Get(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.GetResponse, error)
+	Delete(ctx context.Context, key string, opts ...clientv3.OpOption) (*clientv3.DeleteResponse, error)
+	Compact(ctx context.Context, rev int64, opts ...clientv3.CompactOption) (*clientv3.CompactResponse, error)
+	Do(ctx context.Context, op clientv3.Op) (clientv3.OpResponse, error)
+	Txn(ctx context.Context) clientv3.Txn
+	Watch(ctx context.Context, key string, opts ...clientv3.OpOption) clientv3.WatchChan
+	RequestProgress(ctx context.Context) error
+	Close() error
 }
 
-// Client implements ring.KVClient for etcd.
+var _ Clientv3Facade = (*clientv3.Client)(nil)
+
+// Client implements kv.Client for etcd.
 type Client struct {
 	cfg    Config
 	codec  codec.Codec
@@ -58,7 +68,7 @@ func (cfg *Config) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.IntVar(&cfg.MaxRetries, prefix+"etcd.max-retries", 10, "The maximum number of retries to do for failed ops.")
 	f.BoolVar(&cfg.EnableTLS, prefix+"etcd.tls-enabled", false, "Enable TLS.")
 	f.StringVar(&cfg.UserName, prefix+"etcd.username", "", "Etcd username.")
-	f.StringVar(&cfg.Password, prefix+"etcd.password", "", "Etcd password.")
+	f.Var(&cfg.Password, prefix+"etcd.password", "Etcd password.")
 	cfg.TLS.RegisterFlagsWithPrefix(prefix+"etcd", f)
 }
 
@@ -105,7 +115,7 @@ func New(cfg Config, codec codec.Codec, logger log.Logger) (*Client, error) {
 		PermitWithoutStream:  true,
 		TLS:                  tlsConfig,
 		Username:             cfg.UserName,
-		Password:             cfg.Password,
+		Password:             cfg.Password.String(),
 	})
 	if err != nil {
 		return nil, err

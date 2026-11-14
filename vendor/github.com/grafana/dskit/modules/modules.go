@@ -18,8 +18,11 @@ type module struct {
 	// initFn for this module (can return nil)
 	initFn func() (services.Service, error)
 
-	// is this module user visible (i.e intended to be passed to `InitModuleServices`)
+	// is this module user visible
 	userVisible bool
+
+	// is the module allowed to be selected as a target
+	targetable bool
 }
 
 // Manager is a component that initialises modules of the application
@@ -32,6 +35,18 @@ type Manager struct {
 // UserInvisibleModule is an option for `RegisterModule` that marks module not visible to user. Modules are user visible by default.
 func UserInvisibleModule(m *module) {
 	m.userVisible = false
+
+	// by default invisible modules should not be targetable.
+	m.targetable = false
+}
+
+// UserInvisibleTargetableModule is an option for `RegisterModule` that marks module not visible to user, but still keeps it targetable.
+// Modules are visible and targetable by default.
+func UserInvisibleTargetableModule(m *module) {
+	m.userVisible = false
+
+	// ensure that the module is still targetable.
+	m.targetable = true
 }
 
 // NewManager creates a new Manager
@@ -49,6 +64,7 @@ func (m *Manager) RegisterModule(name string, initFn func() (services.Service, e
 	m.modules[name] = &module{
 		initFn:      initFn,
 		userVisible: true,
+		targetable:  true,
 	}
 
 	for _, o := range options {
@@ -59,11 +75,25 @@ func (m *Manager) RegisterModule(name string, initFn func() (services.Service, e
 // AddDependency adds a dependency from name(source) to dependsOn(targets)
 // An error is returned if the source module name is not found
 func (m *Manager) AddDependency(name string, dependsOn ...string) error {
-	if mod, ok := m.modules[name]; ok {
-		mod.deps = append(mod.deps, dependsOn...)
-	} else {
+	mod, ok := m.modules[name]
+	if !ok {
 		return fmt.Errorf("no such module: %s", name)
 	}
+
+	// Ensure it doesn't introduce any circular dependency.
+	for _, newDep := range dependsOn {
+		if _, ok := m.modules[newDep]; !ok {
+			return fmt.Errorf("no such module: %s", newDep)
+		}
+
+		for _, prevDep := range m.DependenciesForModule(newDep) {
+			if prevDep == name {
+				return fmt.Errorf("found a circular dependency: %s depends on %s", newDep, name)
+			}
+		}
+	}
+
+	mod.deps = append(mod.deps, dependsOn...)
 	return nil
 }
 
@@ -92,7 +122,7 @@ func (m *Manager) initModule(name string, initMap map[string]bool, servicesMap m
 	deps := m.orderedDeps(name)
 	deps = append(deps, name) // lastly, initialize the requested module
 
-	for ix, n := range deps {
+	for _, n := range deps {
 		// Skip already initialized modules
 		if initMap[n] {
 			continue
@@ -111,7 +141,7 @@ func (m *Manager) initModule(name string, initMap map[string]bool, servicesMap m
 			if s != nil {
 				// We pass servicesMap, which isn't yet complete. By the time service starts,
 				// it will be fully built, so there is no need for extra synchronization.
-				serv = newModuleServiceWrapper(servicesMap, n, m.logger, s, m.DependenciesForModule(n), m.findInverseDependencies(n, deps[ix+1:]))
+				serv = newModuleServiceWrapper(servicesMap, n, m.logger, s, m.DependenciesForModule(n), m.inverseDependenciesForModule(n))
 			}
 		}
 
@@ -147,6 +177,18 @@ func (m *Manager) IsUserVisibleModule(mod string) bool {
 
 	if ok {
 		return val.userVisible
+	}
+
+	return false
+}
+
+// IsTargetableModule check if given module is targetable or not. Returns true
+// if and only if the given module is registered and is targetable.
+func (m *Manager) IsTargetableModule(mod string) bool {
+	val, ok := m.modules[mod]
+
+	if ok {
+		return val.targetable
 	}
 
 	return false
@@ -205,12 +247,12 @@ func (m *Manager) orderedDeps(mod string) []string {
 	return result
 }
 
-// find modules in the supplied list, that depend on mod
-func (m *Manager) findInverseDependencies(mod string, mods []string) []string {
+// inverseDependenciesForModule returns the list of modules depending on the input module, sorted by name.
+func (m *Manager) inverseDependenciesForModule(mod string) []string {
 	result := []string(nil)
 
-	for _, n := range mods {
-		for _, d := range m.modules[n].deps {
+	for n := range m.modules {
+		for _, d := range m.DependenciesForModule(n) {
 			if d == mod {
 				result = append(result, n)
 				break
@@ -218,6 +260,7 @@ func (m *Manager) findInverseDependencies(mod string, mods []string) []string {
 		}
 	}
 
+	sort.Strings(result)
 	return result
 }
 

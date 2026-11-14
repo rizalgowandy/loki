@@ -4,9 +4,10 @@ import (
 	"testing"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
-	"github.com/docker/docker/daemon/logger"
+	"github.com/moby/moby/v2/daemon/logger"
 	"github.com/stretchr/testify/require"
+
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 func Test_loki_LogWhenClosed(t *testing.T) {

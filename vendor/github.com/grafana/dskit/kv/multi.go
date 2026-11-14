@@ -16,11 +16,11 @@ import (
 
 // MultiConfig is a configuration for MultiClient.
 type MultiConfig struct {
-	Primary   string `yaml:"primary"`
-	Secondary string `yaml:"secondary"`
+	Primary   string `yaml:"primary" category:"advanced"`
+	Secondary string `yaml:"secondary" category:"advanced"`
 
-	MirrorEnabled bool          `yaml:"mirror_enabled"`
-	MirrorTimeout time.Duration `yaml:"mirror_timeout"`
+	MirrorEnabled bool          `yaml:"mirror_enabled" category:"advanced"`
+	MirrorTimeout time.Duration `yaml:"mirror_timeout" category:"advanced"`
 
 	// ConfigProvider returns channel with MultiRuntimeConfig updates.
 	ConfigProvider func() <-chan MultiRuntimeConfig `yaml:"-"`
@@ -30,8 +30,8 @@ type MultiConfig struct {
 func (cfg *MultiConfig) RegisterFlagsWithPrefix(f *flag.FlagSet, prefix string) {
 	f.StringVar(&cfg.Primary, prefix+"multi.primary", "", "Primary backend storage used by multi-client.")
 	f.StringVar(&cfg.Secondary, prefix+"multi.secondary", "", "Secondary backend storage used by multi-client.")
-	f.BoolVar(&cfg.MirrorEnabled, prefix+"multi.mirror-enabled", false, "Mirror writes to secondary store.")
-	f.DurationVar(&cfg.MirrorTimeout, prefix+"multi.mirror-timeout", 2*time.Second, "Timeout for storing value to secondary store.")
+	f.BoolVar(&cfg.MirrorEnabled, prefix+"multi.mirror-enabled", false, "Mirror writes to the secondary store.")
+	f.DurationVar(&cfg.MirrorTimeout, prefix+"multi.mirror-timeout", 2*time.Second, "Timeout for storing a value to the secondary store.")
 }
 
 // MultiRuntimeConfig has values that can change in runtime (via overrides)
@@ -98,6 +98,10 @@ func NewMultiClient(cfg MultiConfig, clients []kvclient, logger log.Logger, regi
 		logger: log.With(logger, "component", "multikv"),
 	}
 
+	c.registerMetrics(registerer)
+	c.updatePrimaryStoreGauge()
+	c.updateMirrorEnabledGauge()
+
 	ctx, cancelFn := context.WithCancel(context.Background())
 	c.cancel = cancelFn
 
@@ -105,9 +109,6 @@ func NewMultiClient(cfg MultiConfig, clients []kvclient, logger log.Logger, regi
 		go c.watchConfigChannel(ctx, cfg.ConfigProvider())
 	}
 
-	c.registerMetrics(registerer)
-	c.updatePrimaryStoreGauge()
-	c.updateMirrorEnabledGauge()
 	return c
 }
 
@@ -349,7 +350,7 @@ func (m *MultiClient) writeToSecondary(ctx context.Context, primary kvclient, ke
 		}
 
 		m.mirrorWritesCounter.Inc()
-		err := kvc.client.CAS(ctx, key, func(in interface{}) (out interface{}, retry bool, err error) {
+		err := kvc.client.CAS(ctx, key, func(interface{}) (out interface{}, retry bool, err error) {
 			// try once
 			return newValue, false, nil
 		})

@@ -6,30 +6,27 @@ import (
 	"testing"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	ww "github.com/grafana/dskit/server"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
-	ww "github.com/weaveworks/common/server"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
-
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/clients/pkg/util"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 func Test_multilineStage_Process(t *testing.T) {
 	// Enable debug logging
 	cfg := &ww.Config{}
 	require.Nil(t, cfg.LogLevel.Set("debug"))
-	util_log.InitLogger(cfg)
-	Debug = true
+	util_log.InitLogger(cfg, nil, false)
 
 	mcfg := &MultilineConfig{Expression: ptrFromString("^START"), MaxWaitTime: ptrFromString("3s")}
 	err := validateMultilineConfig(mcfg)
 	require.NoError(t, err)
 
 	stage := &multilineStage{
-		cfg:    mcfg,
-		logger: util_log.Logger,
+		cfg: mcfg,
 	}
 
 	out := processEntries(stage,
@@ -52,16 +49,14 @@ func Test_multilineStage_MultiStreams(t *testing.T) {
 	// Enable debug logging
 	cfg := &ww.Config{}
 	require.Nil(t, cfg.LogLevel.Set("debug"))
-	util_log.InitLogger(cfg)
-	Debug = true
+	util_log.InitLogger(cfg, nil, false)
 
 	mcfg := &MultilineConfig{Expression: ptrFromString("^START"), MaxWaitTime: ptrFromString("3s")}
 	err := validateMultilineConfig(mcfg)
 	require.NoError(t, err)
 
 	stage := &multilineStage{
-		cfg:    mcfg,
-		logger: util_log.Logger,
+		cfg: mcfg,
 	}
 
 	out := processEntries(stage,
@@ -97,8 +92,7 @@ func Test_multilineStage_MaxWaitTime(t *testing.T) {
 	// Enable debug logging
 	cfg := &ww.Config{}
 	require.Nil(t, cfg.LogLevel.Set("debug"))
-	util_log.InitLogger(cfg)
-	Debug = true
+	util_log.InitLogger(cfg, nil, false)
 
 	maxWait := 2 * time.Second
 	mcfg := &MultilineConfig{Expression: ptrFromString("^START"), MaxWaitTime: ptrFromString(maxWait.String())}
@@ -106,8 +100,7 @@ func Test_multilineStage_MaxWaitTime(t *testing.T) {
 	require.NoError(t, err)
 
 	stage := &multilineStage{
-		cfg:    mcfg,
-		logger: util_log.Logger,
+		cfg: mcfg,
 	}
 
 	in := make(chan Entry, 2)
@@ -146,7 +139,7 @@ func Test_multilineStage_MaxWaitTime(t *testing.T) {
 func simpleEntry(line, label string) Entry {
 	return Entry{
 		Extracted: map[string]interface{}{},
-		Entry: api.Entry{
+		Entry: util.Entry{
 			Labels: model.LabelSet{"value": model.LabelValue(label)},
 			Entry: logproto.Entry{
 				Timestamp: time.Now(),

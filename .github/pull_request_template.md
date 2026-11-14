@@ -1,23 +1,25 @@
-<!--  Thanks for sending a pull request!  Before submitting:
-
-1. Read our CONTRIBUTING.md guide
-2. Name your PR as `<Feature Area>: Describe your change`.
-  a. Do not end the title with punctuation. It will be added in the changelog.
-  b. Start with an imperative verb. Example: Fix the latency between System A and System B.
-  c. Use sentence case, not title case.
-  d. Use a complete phrase or sentence. The PR title will appear in a changelog, so help other people understand what your change will be.
-3. Rebase your PR if it gets out of sync with main
-4. If changing the Helm chart, please ensure the chart version is increased per semantic versioning (https://semver.org)
--->
-
 **What this PR does / why we need it**:
 
 **Which issue(s) this PR fixes**:
+
 Fixes #<issue number>
 
 **Special notes for your reviewer**:
 
-**Checklist**
+**Checklist**:
+
+- [ ] Reviewed the [`CONTRIBUTING.md`](https://github.com/grafana/loki/blob/main/CONTRIBUTING.md) guide (**required**)
 - [ ] Documentation added
 - [ ] Tests updated
-- [ ] Add an entry in the `CHANGELOG.md` about the changes.
+- [ ] The PR title follows [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) and the description start with a capital letter
+  - User-facing change types (`feat`, `fix`, `perf`, `revert`) will be added to the changelog
+  - Hidden change types (`chore`, `docs`, `ci`, `refactor`, `test`, etc.) will not
+  - Breaking changes (`!` before the colon, or a `BREAKING CHANGE:` footer) will be added whatever the type
+- [ ] Changes that require user attention or interaction to upgrade are documented in `docs/sources/setup/upgrade/_index.md`
+- [ ] If the change is deprecating or removing a configuration option, update the `deprecated-config.yaml` and `deleted-config.yaml` files respectively in the `tools/deprecated-config-checker` directory. [Example PR](https://github.com/grafana/loki/pull/10840/commits/0d4416a4b03739583349934b96f272fb4f685d15)
+- [Backporting](https://github.com/grafana/loki/blob/main/docs/sources/community/maintaining/release/backport-commits.md). Checking these will not trigger a backport but can be used for verification that the backporting is complete
+  - [ ] Backport to `release-4.0.x`
+  - [ ] Backport to `release-3.7.x`
+  - [ ] Backport to `release-3.6.x`
+  - [ ] Backport to latest `k` release (dev)
+  - [ ] Backport to previous `k` release (prod)

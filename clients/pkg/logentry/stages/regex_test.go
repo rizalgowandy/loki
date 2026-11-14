@@ -1,19 +1,17 @@
 package stages
 
 import (
-	"bytes"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
-	"github.com/go-kit/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v4"
+
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var testRegexYamlSingleStageWithoutSource = `
@@ -31,29 +29,7 @@ pipeline_stages:
     source:     "protocol"
 `
 
-var testRegexYamlSourceWithMissingKey = `
-pipeline_stages:
-- json:
-    expressions:
-      time:
-- regex:
-    expression: "^(?P<year>\\d+)"
-    source:     "time"
-`
-
-var testRegexLogLineWithMissingKey = `
-{
-	"app":"loki",
-	"component": ["parser","type"],
-	"level": "WARN"
-}
-`
-
 var testRegexLogLine = `11.11.11.11 - frank [25/Jan/2000:14:00:01 -0500] "GET /1986.js HTTP/1.1" 200 932 "-" "Mozilla/5.0 (Windows; U; Windows NT 5.1; de; rv:1.9.1.7) Gecko/20091221 Firefox/3.5.7 GTB6"`
-
-func init() {
-	Debug = true
-}
 
 func TestPipeline_Regex(t *testing.T) {
 	t.Parallel()
@@ -101,8 +77,6 @@ func TestPipeline_Regex(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
 
@@ -117,22 +91,6 @@ func TestPipeline_Regex(t *testing.T) {
 	}
 }
 
-func TestPipelineWithMissingKey_Regex(t *testing.T) {
-	var buf bytes.Buffer
-	w := log.NewSyncWriter(&buf)
-	logger := log.NewLogfmtLogger(w)
-	pl, err := NewPipeline(logger, loadConfig(testRegexYamlSourceWithMissingKey), nil, prometheus.DefaultRegisterer)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = processEntries(pl, newEntry(nil, nil, testRegexLogLineWithMissingKey, time.Now()))[0]
-
-	expectedLog := "level=debug component=stage type=regex msg=\"failed to convert source value to string\" source=time err=\"Can't convert <nil> to string\" type=null"
-	if !(strings.Contains(buf.String(), expectedLog)) {
-		t.Errorf("\nexpected: %s\n+actual: %s", expectedLog, buf.String())
-	}
-}
-
 var regexCfg = `regex:
   expression: "regexexpression"`
 
@@ -141,11 +99,11 @@ func TestRegexMapStructure(t *testing.T) {
 	t.Parallel()
 
 	// testing that we can use yaml data into mapstructure.
-	var mapstruct map[interface{}]interface{}
+	var mapstruct map[string]interface{}
 	if err := yaml.Unmarshal([]byte(regexCfg), &mapstruct); err != nil {
 		t.Fatalf("error while un-marshalling config: %s", err)
 	}
-	p, ok := mapstruct["regex"].(map[interface{}]interface{})
+	p, ok := mapstruct["regex"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("could not read parser %+v", mapstruct["regex"])
 	}
@@ -203,7 +161,6 @@ func TestRegexConfig_validate(t *testing.T) {
 		},
 	}
 	for tName, tt := range tests {
-		tt := tt
 		t.Run(tName, func(t *testing.T) {
 			c, err := parseRegexConfig(tt.config)
 			if err != nil {
@@ -321,7 +278,6 @@ func TestRegexParser_Parse(t *testing.T) {
 		},
 	}
 	for tName, tt := range tests {
-		tt := tt
 		t.Run(tName, func(t *testing.T) {
 			t.Parallel()
 			p, err := New(util_log.Logger, nil, StageTypeRegex, tt.config, nil)
@@ -373,6 +329,7 @@ func BenchmarkRegexStage(b *testing.B) {
 			in := make(chan Entry)
 			out := stage.Run(in)
 			go func() {
+				//nolint:revive
 				for range out {
 				}
 			}()

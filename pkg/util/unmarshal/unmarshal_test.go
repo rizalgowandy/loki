@@ -2,37 +2,42 @@ package unmarshal
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/loghttp"
-	legacy_loghttp "github.com/grafana/loki/pkg/loghttp/legacy"
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/util/marshal"
+	"github.com/grafana/loki/v3/pkg/loghttp"
+	legacy_loghttp "github.com/grafana/loki/v3/pkg/loghttp/legacy"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/util/marshal"
 )
 
-// covers requests to /loki/api/v1/push
-var pushTests = []struct {
-	expected []logproto.Stream
-	actual   string
-}{
-	{
-		[]logproto.Stream{
-			{
-				Entries: []logproto.Entry{
-					{
-						Timestamp: time.Unix(0, 123456789012345),
-						Line:      "super line",
+func Test_DecodePushRequest(t *testing.T) {
+	// covers requests to /loki/api/v1/push
+	for _, tc := range []struct {
+		name        string
+		expected    []logproto.Stream
+		expectedErr string
+		actual      string
+	}{
+		{
+			name: "basic",
+			expected: []logproto.Stream{
+				{
+					Entries: []logproto.Entry{
+						{
+							Timestamp: time.Unix(0, 123456789012345),
+							Line:      "super line",
+						},
 					},
+					Labels: labels.FromStrings("test", "test").String(),
 				},
-				Labels: `{test="test"}`,
 			},
-		},
-		`{
+			actual: `{
 			"streams": [
 				{
 					"stream": {
@@ -44,18 +49,201 @@ var pushTests = []struct {
 				}
 			]
 		}`,
-	},
-}
+		},
+		{
+			name: "with structured metadata",
+			expected: []logproto.Stream{
+				{
+					Entries: []logproto.Entry{
+						{
+							Timestamp: time.Unix(0, 123456789012345),
+							Line:      "super line",
+							StructuredMetadata: []logproto.LabelAdapter{
+								{Name: "a", Value: "1"},
+								{Name: "b", Value: "2"},
+							},
+						},
+					},
+					Labels: labels.FromStrings("test", "test").String(),
+				},
+			},
+			actual: `{
+			"streams": [
+				{
+					"stream": {
+						"test": "test"
+					},
+					"values":[
+						[ "123456789012345", "super line", { "a": "1", "b": "2" } ]
+					]
+				}
+			]
+		}`,
+		},
 
-func Test_DecodePushRequest(t *testing.T) {
-	for i, pushTest := range pushTests {
-		var actual logproto.PushRequest
-		closer := ioutil.NopCloser(strings.NewReader(pushTest.actual))
+		// The following test cases are added to cover a regression. Even though the Loki HTTP API
+		// docs for the push endpoint state that the stream label values should be strings, we
+		// previously didn't enforce this requirement.
+		// With https://github.com/grafana/loki/pull/9694, we started enforcing this requirement
+		// and that broke some users. We are adding these test cases to ensure that we don't
+		// enforce this requirement in the future. Note that we may want to enforce this requirement
+		// in a future major release, in which case we should modify these test cases.
+		{
+			name: "number in stream label value",
+			expected: []logproto.Stream{
+				{
+					Entries: []logproto.Entry{
+						{
+							Timestamp: time.Unix(0, 123456789012345),
+							Line:      "super line",
+						},
+					},
+					Labels: labels.FromStrings("test", "test", "number", "123").String(),
+				},
+			},
+			actual: `{
+			"streams": [
+				{
+					"stream": {
+						"test": "test",
+						"number": 123
+					},
+					"values":[
+						[ "123456789012345", "super line" ]
+					]
+				}
+			]
+		}`,
+		},
+		{
+			name:        "string without quotes in stream label value",
+			expectedErr: "Skip: do not know how to skip: 78",
+			actual: `{
+			"streams": [
+				{
+					"stream": {
+						"test": "test",
+						"text": None
+					},
+					"values":[
+						[ "123456789012345", "super line" ]
+					]
+				}
+			]
+		}`,
+		},
+		{
+			name: "json object in stream label value",
+			expected: []logproto.Stream{
+				{
+					Entries: []logproto.Entry{
+						{
+							Timestamp: time.Unix(0, 123456789012345),
+							Line:      "super line",
+						},
+					},
+					Labels: labels.FromStrings("test", "test", "text", "{ \"a\": \"b\" }").String(),
+				},
+			},
+			actual: `{
+			"streams": [
+				{
+					"stream": {
+						"test": "test",
+						"text": { "a": "b" }
+					},
+					"values":[
+						[ "123456789012345", "super line" ]
+					]
+				}
+			]
+		}`,
+		},
+		{
+			name: "null in stream label value",
+			expected: []logproto.Stream{
+				{
+					Entries: []logproto.Entry{
+						{
+							Timestamp: time.Unix(0, 123456789012345),
+							Line:      "super line",
+						},
+					},
+					Labels: `{nothing="null", test="test"}`,
+				},
+			},
+			actual: `{
+			"streams": [
+				{
+					"stream": {
+						"test": "test",
+						"nothing": null
+					},
+					"values":[
+						[ "123456789012345", "super line" ]
+					]
+				}
+			]
+		}`,
+		},
 
-		err := DecodePushRequest(closer, &actual)
-		require.NoError(t, err)
+		{
+			name:        "null stream",
+			expectedErr: "stream must be an object",
+			actual: `{
+			"streams": [
+				{
+					"stream": null,
+					"values":[
+						[ "123456789012345", "super line" ]
+					]
+				}
+			]
+		}`,
+		},
 
-		require.Equalf(t, pushTest.expected, actual.Streams, "Push Test %d failed", i)
+		{
+			name:        "invalid top level field",
+			expected:    nil,
+			expectedErr: "found unknown field",
+			actual: `{
+				"invalid": {}
+			}`,
+		},
+
+		{
+			name:        "invalid field",
+			expected:    nil,
+			expectedErr: "reading Stream: found unknown field",
+			actual: `{
+				"streams": [
+				  {
+						"stream": {
+					    "job": "push-payload-test"
+						},
+						"values": [
+						  ["123456789012345", "super line"]
+						],
+						"invalid": []
+				  },
+				]
+			}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var actual logproto.PushRequest
+			closer := io.NopCloser(strings.NewReader(tc.actual))
+
+			err := DecodePushRequest(closer, &actual)
+			if tc.expectedErr != "" {
+				require.Error(t, err)
+				require.ErrorContains(t, err, tc.expectedErr)
+				return
+			}
+			require.NoError(t, err)
+
+			require.Equal(t, tc.expected, actual.Streams)
+		})
 	}
 }
 
@@ -96,7 +284,7 @@ type websocket struct {
 	buf []byte
 }
 
-func (ws *websocket) WriteMessage(t int, data []byte) error {
+func (ws *websocket) WriteMessage(_ int, data []byte) error {
 	ws.buf = append(ws.buf, data...)
 	return nil
 }
@@ -107,6 +295,7 @@ func (ws *websocket) ReadMessage() (int, []byte, error) {
 
 func Test_ReadTailResponse(t *testing.T) {
 	ws := &websocket{}
+	wsJSON := marshal.NewWebsocketJSONWriter(ws)
 	require.NoError(t, marshal.WriteTailResponseJSON(legacy_loghttp.TailResponse{
 		Streams: []logproto.Stream{
 			{Labels: `{app="bar"}`, Entries: []logproto.Entry{{Timestamp: time.Unix(0, 2), Line: "2"}}},
@@ -114,7 +303,7 @@ func Test_ReadTailResponse(t *testing.T) {
 		DroppedEntries: []legacy_loghttp.DroppedEntry{
 			{Timestamp: time.Unix(0, 1), Labels: `{app="foo"}`},
 		},
-	}, ws))
+	}, wsJSON, nil))
 	res := &loghttp.TailResponse{}
 	require.NoError(t, ReadTailResponseJSON(res, ws))
 

@@ -1,23 +1,23 @@
-version: '2'
-
-env:
-  GOFLAGS: -mod=vendor
+version: '3'
 
 tasks:
   default:
     deps: [test]
 
-  lint:
-    desc: Checks code style
+  generate:
+    desc: Regenerates type_specific_codegen*.go from codegen/
     cmds:
-      - gofmt -d -s *.go
-      - go vet ./...
-    silent: true
+      - go generate ./...
+
+  lint:
+    desc: Runs golangci-lint
+    cmds:
+      - golangci-lint run ./...
 
   lint-fix:
-    desc: Fixes code style
+    desc: Runs golangci-lint and applies fixes
     cmds:
-      - gofmt -w -s *.go
+      - golangci-lint run --fix ./...
 
   test:
     desc: Runs go tests
@@ -25,6 +25,6 @@ tasks:
       - go test -race  ./...
 
   test-coverage:
-    desc: Runs go tests and calucates test coverage
+    desc: Runs go tests and calculates test coverage
     cmds:
       - go test -race -coverprofile=c.out ./...

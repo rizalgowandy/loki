@@ -1,20 +1,24 @@
 package ruler
 
 import (
-	"github.com/cortexproject/cortex/pkg/ruler"
-	"github.com/cortexproject/cortex/pkg/ruler/rulestore"
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel"
 
-	"github.com/grafana/loki/pkg/logql"
+	ruler "github.com/grafana/loki/v3/pkg/ruler/base"
+	"github.com/grafana/loki/v3/pkg/ruler/rulestore"
 )
 
-func NewRuler(cfg Config, engine *logql.Engine, reg prometheus.Registerer, logger log.Logger, ruleStore rulestore.RuleStore, limits RulesLimits) (*ruler.Ruler, error) {
+var tracer = otel.Tracer("pkg/ruler")
+
+func NewRuler(cfg Config, evaluator Evaluator, reg prometheus.Registerer, logger log.Logger, ruleStore rulestore.RuleStore, limits RulesLimits, metricsNamespace string) (*ruler.Ruler, error) {
 	mgr, err := ruler.NewDefaultMultiTenantManager(
 		cfg.Config,
-		MultiTenantRuleManager(cfg, engine, limits, logger, reg),
+		MultiTenantRuleManager(cfg, evaluator, limits, logger, reg),
 		reg,
 		logger,
+		limits,
+		metricsNamespace,
 	)
 	if err != nil {
 		return nil, err
@@ -26,5 +30,6 @@ func NewRuler(cfg Config, engine *logql.Engine, reg prometheus.Registerer, logge
 		logger,
 		ruleStore,
 		limits,
+		metricsNamespace,
 	)
 }

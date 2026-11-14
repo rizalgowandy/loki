@@ -4,11 +4,12 @@ import (
 	"testing"
 	"time"
 
-	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/assert"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v4"
+
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var testLogfmtYamlSingleStageWithoutSource = `
@@ -63,8 +64,6 @@ func TestPipeline_Logfmt(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
 
@@ -86,9 +85,9 @@ func TestLogfmtYamlMapStructure(t *testing.T) {
 	t.Parallel()
 
 	// testing that we can use yaml data into mapstructure.
-	var mapstruct map[interface{}]interface{}
+	var mapstruct map[string]interface{}
 	assert.NoError(t, yaml.Unmarshal([]byte(testLogfmtCfg), &mapstruct))
-	p, ok := mapstruct["logfmt"].(map[interface{}]interface{})
+	p, ok := mapstruct["logfmt"].(map[string]interface{})
 	assert.True(t, ok)
 	got, err := parseLogfmtConfig(p)
 	assert.NoError(t, err)
@@ -152,7 +151,6 @@ func TestLogfmtConfig_validate(t *testing.T) {
 		},
 	}
 	for tName, tt := range tests {
-		tt := tt
 		t.Run(tName, func(t *testing.T) {
 			c, err := parseLogfmtConfig(tt.config)
 			assert.NoError(t, err)
@@ -280,7 +278,6 @@ func TestLogfmtParser_Parse(t *testing.T) {
 		},
 	}
 	for tName, tt := range tests {
-		tt := tt
 		t.Run(tName, func(t *testing.T) {
 			t.Parallel()
 			p, err := New(util_log.Logger, nil, StageTypeLogfmt, tt.config, nil)

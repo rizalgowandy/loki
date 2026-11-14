@@ -6,8 +6,9 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/loghttp"
+	"github.com/grafana/loki/v3/pkg/loghttp"
 )
 
 func TestRawOutput_Format(t *testing.T) {
@@ -61,14 +62,12 @@ func TestRawOutput_Format(t *testing.T) {
 	}
 
 	for testName, testData := range tests {
-		testData := testData
-
 		t.Run(testName, func(t *testing.T) {
 			t.Parallel()
 
 			writer := &bytes.Buffer{}
 			out := &RawOutput{writer, testData.options}
-			out.FormatAndPrintln(testData.timestamp, testData.lbls, testData.maxLabelsLen, testData.line)
+			require.NoError(t, out.FormatAndPrintln(testData.timestamp, testData.lbls, testData.maxLabelsLen, testData.line))
 
 			assert.Equal(t, testData.expected, writer.String())
 		})

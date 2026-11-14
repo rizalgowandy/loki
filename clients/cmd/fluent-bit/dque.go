@@ -3,19 +3,18 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/joncrlsn/dque"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
-	"github.com/grafana/loki/clients/pkg/promtail/client"
+	"github.com/grafana/loki/v3/clients/pkg/util"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 type dqueConfig struct {
@@ -26,7 +25,7 @@ type dqueConfig struct {
 }
 
 var defaultDqueConfig = dqueConfig{
-	queueDir:         "/tmp/flb-storage/loki",
+	queueDir:         filepath.Join(os.TempDir(), "flb-storage/loki"),
 	queueSegmentSize: 500,
 	queueSync:        false,
 	queueName:        "dque",
@@ -45,21 +44,21 @@ func dqueEntryBuilder() interface{} {
 type dqueClient struct {
 	logger  log.Logger
 	queue   *dque.DQue
-	loki    client.Client
+	loki    util.Client
 	once    sync.Once
 	wg      sync.WaitGroup
-	entries chan api.Entry
+	entries chan util.Entry
 }
 
 // New makes a new dque loki client
-func newDque(cfg *config, logger log.Logger) (client.Client, error) {
+func newDque(cfg *config, logger log.Logger, metrics *util.Metrics) (util.Client, error) {
 	var err error
 
 	q := &dqueClient{
 		logger: log.With(logger, "component", "queue", "name", cfg.bufferConfig.dqueConfig.queueName),
 	}
 
-	err = os.MkdirAll(cfg.bufferConfig.dqueConfig.queueDir, 0644)
+	err = os.MkdirAll(cfg.bufferConfig.dqueConfig.queueDir, 0640)
 	if err != nil {
 		return nil, fmt.Errorf("cannot create queue directory: %s", err)
 	}
@@ -73,12 +72,12 @@ func newDque(cfg *config, logger log.Logger) (client.Client, error) {
 		_ = q.queue.TurboOn()
 	}
 
-	q.loki, err = client.New(prometheus.DefaultRegisterer, cfg.clientConfig, logger)
+	q.loki, err = util.New(metrics, cfg.clientConfig, logger)
 	if err != nil {
 		return nil, err
 	}
 
-	q.entries = make(chan api.Entry)
+	q.entries = make(chan util.Entry)
 
 	q.wg.Add(2)
 	go q.enqueuer()
@@ -108,7 +107,7 @@ func (c *dqueClient) dequeuer() {
 			continue
 		}
 
-		c.loki.Chan() <- api.Entry{
+		c.loki.Chan() <- util.Entry{
 			Labels: record.Lbs,
 			Entry: logproto.Entry{
 				Timestamp: record.Ts,
@@ -129,7 +128,7 @@ func (c *dqueClient) Stop() {
 
 }
 
-func (c *dqueClient) Chan() chan<- api.Entry {
+func (c *dqueClient) Chan() chan<- util.Entry {
 	return c.entries
 }
 
@@ -150,4 +149,8 @@ func (c *dqueClient) enqueuer() {
 			level.Warn(c.logger).Log("msg", fmt.Sprintf("cannot enqueue record %s:", e.Line), "err", err)
 		}
 	}
+}
+
+func (c *dqueClient) Name() string {
+	return ""
 }

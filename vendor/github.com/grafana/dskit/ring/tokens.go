@@ -3,10 +3,11 @@ package ring
 import (
 	"encoding/json"
 	"errors"
-	"io/ioutil"
 	"os"
 	"sort"
 )
+
+type Token uint32
 
 // Tokens is a simple list of tokens.
 type Tokens []uint32
@@ -72,7 +73,7 @@ func (t Tokens) StoreToFile(tokenFilePath string) error {
 
 // LoadTokensFromFile loads tokens from given file path.
 func LoadTokensFromFile(tokenFilePath string) (Tokens, error) {
-	b, err := ioutil.ReadFile(tokenFilePath)
+	b, err := os.ReadFile(tokenFilePath)
 	if err != nil {
 		return nil, err
 	}

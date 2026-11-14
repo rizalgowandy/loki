@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/c2h5oh/datasize"
+	yaml "go.yaml.in/yaml/v4"
 )
 
 // ByteSize is a flag parsing compatibility type for constructing human friendly sizes.
@@ -35,10 +36,10 @@ func (bs ByteSize) Val() int {
 	return int(bs)
 }
 
-/// UnmarshalYAML the Unmarshaler interface of the yaml pkg.
-func (bs *ByteSize) UnmarshalYAML(unmarshal func(interface{}) error) error {
+// UnmarshalYAML the Unmarshaler interface of the yaml pkg.
+func (bs *ByteSize) UnmarshalYAML(value *yaml.Node) error {
 	var str string
-	err := unmarshal(&str)
+	err := value.Decode(&str)
 	if err != nil {
 		return err
 	}
@@ -48,7 +49,7 @@ func (bs *ByteSize) UnmarshalYAML(unmarshal func(interface{}) error) error {
 
 // MarshalYAML implements yaml.Marshaller.
 // Use a string representation for consistency
-func (bs *ByteSize) MarshalYAML() (interface{}, error) {
+func (bs ByteSize) MarshalYAML() (interface{}, error) {
 	return bs.String(), nil
 }
 
@@ -64,6 +65,6 @@ func (bs *ByteSize) UnmarshalJSON(val []byte) error {
 }
 
 // Use a string representation for consistency
-func (bs *ByteSize) MarshalJSON() ([]byte, error) {
+func (bs ByteSize) MarshalJSON() ([]byte, error) {
 	return json.Marshal(bs.String())
 }
